@@ -1,0 +1,93 @@
+{
+  "log_level": "normal",
+  "bookmark_file": "",
+  "bookmark_root_name": "账号",
+  "level_names": [
+    "第一层",
+    "第二层",
+    "第三层",
+    "第四层"
+  ],
+  "browser": "chromium",
+  "window_width": 960,
+  "window_height": 720,
+  "columns": 4,
+  "max_workers": 4,
+  "gap_x": 20,
+  "gap_y": 40,
+  "page_load_timeout_ms": 60000,
+  "after_goto_wait_ms": 2000,
+  "qr_login_page_wait_ms": 800,
+  "passport_extract_timeout_ms": 15000,
+  "after_passport_extract_wait_ms": 500,
+  "after_notice_wait_ms": 400,
+  "after_passport_button_wait_ms": 400,
+  "after_submit_wait_ms": 800,
+  "state_check_timeout_ms": 8000,
+  "passport_regex": "本次通行证\\s*[:：]\\s*([A-Za-z0-9_-]+)",
+  "enable_ocr_fallback": true,
+  "passport_ocr_region_ratio": [
+    0,
+    0.75,
+    1,
+    1
+  ],
+  "qr_passport_ocr_region_ratio": [
+    0,
+    0.65,
+    1,
+    1
+  ],
+  "qr_passport_ocr_scale": 3,
+  "qr_passport_ocr_threshold": 150,
+  "qr_passport_debug_dir": "debug_ocr",
+  "login_window_title_keyword": "",
+  "passport_region_x_margin": 20,
+  "passport_region_y_offset": 18,
+  "passport_region_height": 65,
+  "notice_selector": "",
+  "notice_visible_text": "公告",
+  "notice_template_path": "",
+  "notice_gone_template_path": "",
+  "passport_button_selector": "",
+  "passport_dialog_selector": "",
+  "passport_dialog_visible_text": "通行证登录",
+  "passport_dialog_template_path": "",
+  "passport_input_template_path": "",
+  "confirm_success_gone_template_path": "",
+  "passport_input_selector": "",
+  "confirm_button_selector": "",
+  "login_success_hidden_selector": "",
+  "login_success_hidden_text": "通行证登录",
+  "notice_close_outside_ratio": [
+    0.77,
+    0.94
+  ],
+  "notice_close_viewport": [740, 680],
+  "notice_close_retries": 3,
+  "dm_enabled": true,
+  "dm_prog_id": "dm.dmsoft",
+  "dm_bind_display": "normal",
+  "dm_bind_mouse": "windows",
+  "dm_bind_keypad": "windows",
+  "dm_bind_mode": 0,
+  "dm_findpic_delta_color": "000000",
+  "dm_findpic_sim": 0.85,
+  "dm_window_title_keyword": "",
+  "passport_button_ratio": [
+    0.9,
+    0.5
+  ],
+  "passport_input_ratio": [
+    0.5,
+    0.55
+  ],
+  "confirm_button_ratio": [
+    0.5,
+    0.7
+  ],
+  "passport_btn_template": "debug_ocr/template_passport_btn.png",
+  "passport_btn_viewport": [683, 290],
+  "passport_btn_region": [670, 272, 697, 308],
+  "passport_dialog_text": "通行证登录"
+}

@@ -1,0 +1,32 @@
+{
+  "roots": {
+    "bookmark_bar": {
+      "type": "folder",
+      "name": "收藏夹栏",
+      "children": [
+        {
+          "type": "folder",
+          "name": "账号",
+          "children": [
+            {
+              "type": "folder",
+              "name": "第一层",
+              "children": [
+                {"type": "url", "name": "1", "url": "https://example.com/game1"},
+                {"type": "url", "name": "2", "url": "https://example.com/game2"}
+              ]
+            },
+            {
+              "type": "folder",
+              "name": "第二层",
+              "children": [
+                {"type": "url", "name": "1", "url": "https://example.com/game9"},
+                {"type": "url", "name": "2", "url": "https://example.com/game10"}
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  }
+}
