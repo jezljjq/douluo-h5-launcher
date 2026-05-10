@@ -10,6 +10,8 @@
 
 文档整理任务请先阅读并遵守 [DOC_UPDATE_PROMPT.md](DOC_UPDATE_PROMPT.md)。
 
+打包发布任务请先阅读并遵守 [BUILD_RELEASE_PROMPT.md](BUILD_RELEASE_PROMPT.md)。
+
 - 用户要求"更新文档"时，只允许修改 `.md` 文件
 - 禁止修改 `.py`、`.bat`、`.json`、启动脚本、配置文件
 - 如发现代码 bug，必须先说明问题并等待用户确认后再修改

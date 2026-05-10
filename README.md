@@ -166,6 +166,7 @@ OpenCV: 4.13.0（模板匹配 + 视觉定位）
 13. [KNOWN_BUGS.md](KNOWN_BUGS.md) — 重复踩坑记录
 14. [DEVELOPMENT_RULES.md](DEVELOPMENT_RULES.md) — 项目开发规则
 15. [DOC_UPDATE_PROMPT.md](DOC_UPDATE_PROMPT.md) — 文档整理通用指令（每次整理文档前必读）
+16. [BUILD_RELEASE_PROMPT.md](BUILD_RELEASE_PROMPT.md) — 打包发布通用指令（每次打包前必读）
 
 ---
 
