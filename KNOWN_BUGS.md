@@ -97,10 +97,14 @@ print("[W" + str(cfg["game_window_no"]) + "] " + str(msg))
 
 ## 10. exe 调用 32 位 Python 弹黑框
 
-**场景**：exe 模式下 `subprocess.run(["py", "-3.14-32", ...])` 弹出 `C:\Windows\py.exe` 控制台窗口。
+**场景**：所有子进程调用（`py`、`python`、`tesseract`、`clip`、`taskkill`）均可能弹出控制台窗口。
 
-**症状**：每次 Dm 点击/输入时短暂黑框闪现，遮挡界面。
+**症状**：Dm 点击、OCR 识别、输入剪贴板、进程清理时短暂黑框闪现。
 
-**正确做法**：所有 `subprocess.run` 调用添加 `creationflags=subprocess.CREATE_NO_WINDOW`。
+**根因**：`pytesseract` 内部调用 `tesseract.exe` 时不传 `CREAT_NO_WINDOW`，是最后一次黑框的来源。
+
+**正确做法**：
+1. 所有显式 `subprocess.run`/`Popen` 加 `creationflags=CREATE_NO_WINDOW`（6 处：automation.py 4 + dm_click_helper.py 2 + dm_client.py 1 + gui.py 3 = 实际已全项目覆盖）
+2. `automation.py` 模块级 monkey-patch `subprocess.Popen`，默认注入 `CREAT_NO_WINDOW`，一劳永逸覆盖 pytesseract 等第三方库的内部子进程调用
 
 **出现次数**：1 次（打包 exe 后发现）

@@ -63,10 +63,21 @@ Dm 不需要 BindWindow 即可调用内核级屏幕操作：
 
 | 文件 | 说明 |
 |------|------|
-| `dm_click_helper.py` | 32 位 Dm 前台点击/输入脚本，支持 `click` 和 `type` 两种模式 |
+| `dm_click_helper.py` | 32 位 Dm 前台点击/输入脚本，支持 `click`、`type`、`chain` 三种模式 |
 | `debug_ocr/browser_pos.json` | 浏览器渲染窗口屏幕坐标缓存，含 `hwnd/cx/cy` |
 | `douluo_launcher/automation.py:_dm_click_viewport()` | 发起 Dm 前台点击 |
 | `douluo_launcher/automation.py:_dm_type_text()` | 发起 Dm 剪贴板粘贴输入 |
+| `douluo_launcher/automation.py:_dm_chain()` | 链式调用：一次子进程执行 click+type+click 多步操作 |
+
+### 链式调用（速度优化）
+
+为减少 32 位 Python 子进程冷启动开销（~1s/次），输入流程使用 `chain` 模式合并多步操作：
+
+```
+py -3.14-32 dm_click_helper.py chain "click,473,290,120|type,abc12345"
+```
+
+一次子进程调用完成点击输入框+输入文本，节省 ~1s。候选重试更进一步合并输入+确认为单链。`creationflags=CREATE_NO_WINDOW` 防止弹黑框。
 
 ### 坐标计算
 
@@ -151,7 +162,7 @@ Tesseract `chi_sim+eng` 无法识别 canvas 游戏渲染的中文字符。
 
 exe 打包后（PyInstaller --onedir --windowed），点击流程有以下调整：
 
-1. **Dm 子进程隐藏控制台**：所有 `subprocess.run(["py", "-3.14-32", ...])` 添加 `creationflags=subprocess.CREATE_NO_WINDOW`，避免弹出黑色命令行窗口。
+1. **全局子进程隐藏控制台**：所有显式子进程调用添加 `CREAT_NO_WINDOW`，且 `automation.py` 模块级 monkey-patch `subprocess.Popen` 覆盖 pytesseract→tesseract.exe 等第三方库内部调用。
 
 2. **模板读取兼容中文路径**：`cv2.imread()` 不支持中文路径，改用 `cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_COLOR)`。
 

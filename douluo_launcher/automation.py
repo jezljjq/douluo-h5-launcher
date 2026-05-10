@@ -2,12 +2,20 @@ from __future__ import annotations
 
 import re
 import shutil
+import subprocess as _subprocess
 import threading
 import time
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from tempfile import gettempdir
+
+# 全局：所有子进程默认不弹控制台窗口（覆盖 pytesseract→tesseract.exe 等）
+_original_popen = _subprocess.Popen
+def _no_console_popen(*args, **kwargs):
+    kwargs.setdefault("creationflags", _subprocess.CREATE_NO_WINDOW)
+    return _original_popen(*args, **kwargs)
+_subprocess.Popen = _no_console_popen
 
 from .config import AccountConfig, AutomationSettings, app_root
 from .dm_client import DmClient
@@ -83,6 +91,7 @@ class AccountRunner:
         self._debug_dir = app_root() / settings.qr_passport_debug_dir
         self._tmp_dir = self._debug_dir / "_tmp"
         self._tmp_dir.mkdir(parents=True, exist_ok=True)
+        self._save_screenshots = (settings.log_level == "debug")
 
     def run(self) -> bool:
         playwright = None
@@ -119,7 +128,7 @@ class AccountRunner:
             self.log(
                 f"[窗口{self.account.game_window_no}] 停留二维码登录页，等待 {self.settings.qr_login_page_wait_ms}ms 后立即 OCR"
             )
-            page.wait_for_timeout(self.settings.qr_login_page_wait_ms)
+            self._wait_or_stop(page,self.settings.qr_login_page_wait_ms)
             self._ensure_not_stopped()
 
             self.log(f"[窗口{self.account.game_window_no}] 尝试提取通行证")
@@ -136,11 +145,11 @@ class AccountRunner:
                 self.passport_found(self.account, passport)
             self.update_status(self.account, "已提取通行证")
             self.log(f"[窗口{self.account.game_window_no}] 通行证提取成功: {passport}")
-            page.wait_for_timeout(self.settings.after_passport_extract_wait_ms)
+            self._wait_or_stop(page,self.settings.after_passport_extract_wait_ms)
             self._ensure_not_stopped()
 
             self.log(f"[窗口{self.account.game_window_no}] 等待游戏页面加载")
-            page.wait_for_timeout(self.settings.after_goto_wait_ms)
+            self._wait_or_stop(page,self.settings.after_goto_wait_ms)
             if self.settings.dm_enabled:
                 self._run_game_steps_with_dm(page, passport)
                 keep_open = True
@@ -149,7 +158,7 @@ class AccountRunner:
 
             self._close_notice_by_outside_click(page)
             self.update_status(self.account, "已关闭公告")
-            page.wait_for_timeout(self.settings.after_notice_wait_ms)
+            self._wait_or_stop(page,self.settings.after_notice_wait_ms)
             self._ensure_not_stopped()
 
             self.log(f"[窗口{self.account.game_window_no}] 尝试点击通行证按钮")
@@ -158,7 +167,7 @@ class AccountRunner:
                 self.log(f"[窗口{self.account.game_window_no}] 通行证弹窗未出现")
                 raise RuntimeError("通行证弹窗未出现")
             self.log(f"[窗口{self.account.game_window_no}] 通行证弹窗已出现")
-            page.wait_for_timeout(self.settings.after_passport_button_wait_ms)
+            self._wait_or_stop(page,self.settings.after_passport_button_wait_ms)
             self._ensure_not_stopped()
 
             self.log(f"[窗口{self.account.game_window_no}] 尝试输入通行证")
@@ -169,7 +178,7 @@ class AccountRunner:
 
             self.log(f"[窗口{self.account.game_window_no}] 尝试点击确认")
             self._click_target(page, self.settings.confirm_button_selector, self.settings.confirm_button_ratio, "确认按钮")
-            page.wait_for_timeout(self.settings.after_submit_wait_ms)
+            self._wait_or_stop(page,self.settings.after_submit_wait_ms)
             if not self._wait_state(page, self._is_login_confirmed):
                 self.log(f"[窗口{self.account.game_window_no}] 确认失败")
                 raise RuntimeError("确认失败，通行证弹窗仍未关闭")
@@ -244,11 +253,16 @@ class AccountRunner:
         browser = None
         keep_open = True
         passport = None
+        import time as _time
+        _timings: dict[str, float] = {}
 
         for retry in range(2):
+            _t_start = _time.perf_counter()
+            _timings.clear()
             try:
                 self._clean_tmp()
                 # === 步骤1：OCR 提取通行证 ===
+                _t0 = _time.perf_counter()
                 self._ensure_not_stopped()
                 self.update_status(self.account, "OCR中")
                 if retry > 0:
@@ -264,8 +278,9 @@ class AccountRunner:
                             f"[窗口{self.account.game_window_no}] "
                             f"重试OCR未检测到通行证，等待后二次确认"
                         )
-                        import time as _t3
-                        _t3.sleep(2)
+                        for _ in range(5):
+                            self._ensure_not_stopped()
+                            _time.sleep(0.1)
                         new_passport2, _ = self._extract_passport_from_login_window()
                         if new_passport2 is None:
                             self.update_status(self.account, "成功")
@@ -276,13 +291,14 @@ class AccountRunner:
                         new_passport = new_passport2
                     elif retry == 0:
                         # 首次 OCR 返回空：已登录 / 窗口无QR码
-                        # 等 2 秒再确认一次
+                        # 短等待后二次确认（500ms × 4 = 2s 缩减到 500ms）
                         self.log(
                             f"[窗口{self.account.game_window_no}] "
-                            f"未检测到通行证，可能已登录，等待二次确认"
+                            f"未检测到通行证，可能已登录，等待确认"
                         )
-                        import time as _t3
-                        _t3.sleep(2)
+                        for _ in range(5):
+                            self._ensure_not_stopped()
+                            _time.sleep(0.1)
                         new_passport2, _ = self._extract_passport_from_login_window()
                         if new_passport2 is None:
                             self.update_status(self.account, "成功")
@@ -305,8 +321,10 @@ class AccountRunner:
                     self.passport_found(self.account, passport)
                 self.update_status(self.account, "已提取通行证")
                 self._clean_tmp()
+                _timings["OCR"] = _time.perf_counter() - _t0
 
                 # === 步骤2：打开浏览器游戏页 ===
+                _t_br = _time.perf_counter()
                 self._ensure_not_stopped()
                 self.update_status(self.account, "打开中")
                 self._vlog("debug", f"[窗口{self.account.game_window_no}] 打开链接: {self.account.url}")
@@ -325,41 +343,45 @@ class AccountRunner:
                 )
                 page.goto(self.account.url, wait_until="domcontentloaded", timeout=self.settings.page_load_timeout_ms)
                 self.log(f"[窗口{self.account.game_window_no}] 游戏页已打开: {page.title}")
-                page.wait_for_timeout(self.settings.after_goto_wait_ms)
+                self._wait_or_stop(page,self.settings.after_goto_wait_ms)
                 self._ensure_not_stopped()
+                _timings["打开页面"] = _time.perf_counter() - _t_br
 
                 # === 步骤3：关闭公告 ===
+                _t_notice = _time.perf_counter()
                 self.update_status(self.account, "关闭公告")
                 for _ in range(2):
                     page.mouse.click(740, 680)
-                    page.wait_for_timeout(300)
-                page.wait_for_timeout(600)
+                    self._wait_or_stop(page,200)
+                self._wait_or_stop(page,400)
                 self.update_status(self.account, "已关闭公告")
                 self.log(f"[窗口{self.account.game_window_no}] 公告已关闭（canvas 右下角点击）")
-                page.wait_for_timeout(self.settings.after_notice_wait_ms)
+                self._wait_or_stop(page,self.settings.after_notice_wait_ms)
                 self._ensure_not_stopped()
+                _timings["关闭公告"] = _time.perf_counter() - _t_notice
 
                 # === 步骤4：点击通行证按钮（带重试，容错鼠标干扰） ===
+                _t_btn = _time.perf_counter()
                 self.log(f"[窗口{self.account.game_window_no}] 定位并点击通行证按钮")
                 dialog_visible = False
                 for btn_retry in range(3):
                     browser_hwnd = self._find_game_browser_window()
                     if browser_hwnd is None:
                         self.log(f"[窗口{self.account.game_window_no}] 未找到浏览器窗口，等待后重试...")
-                        page.wait_for_timeout(1000)
+                        self._wait_or_stop(page,500)
                         continue
                     self._write_browser_pos(browser_hwnd)
                     _client = self._capture_browser_client(browser_hwnd, "flow_step4_button_match_source.png")
                     btn_pos = self._locate_passport_button(_client)
                     if btn_pos is None:
                         self.log(f"[窗口{self.account.game_window_no}] 模板匹配失败（可能被遮挡），重试截图定位...")
-                        page.wait_for_timeout(500)
+                        self._wait_or_stop(page,300)
                         continue
                     for click_i, (vx, vy) in enumerate(self._passport_button_click_points(btn_pos), start=1):
                         self.log(f"[窗口{self.account.game_window_no}] 点击通行证按钮（第{click_i}次）: viewport({vx},{vy})")
                         if not self._dm_click_viewport(vx, vy, "通行证按钮", hold_ms=150):
                             continue
-                        page.wait_for_timeout(500)
+                        self._wait_or_stop(page,300)
                         after_click = self._capture_browser_client(browser_hwnd, f"flow_step4_after_passport_click_{click_i}.png")
                         if self._is_passport_dialog_visible_by_ocr(after_click):
                             dialog_visible = True
@@ -371,11 +393,13 @@ class AccountRunner:
                 if not dialog_visible and not self._wait_state(page, self._is_passport_dialog_visible):
                     raise RuntimeError("通行证弹窗未出现（已重试3轮）")
                 self.log(f"[窗口{self.account.game_window_no}] 通行证弹窗已出现")
-                page.wait_for_timeout(self.settings.after_passport_button_wait_ms)
+                self._wait_or_stop(page,self.settings.after_passport_button_wait_ms)
                 self._ensure_not_stopped()
                 dialog_image = self._capture_browser_client(browser_hwnd, "flow_step4_dialog_visible.png")
+                _timings["点击按钮"] = _time.perf_counter() - _t_btn
 
                 # === 步骤5：输入通行证 ===
+                _t_input = _time.perf_counter()
                 self.update_status(self.account, "输入中")
                 self.log(f"[窗口{self.account.game_window_no}] 输入通行证: {passport}")
                 input_center = self._locate_passport_input_center(dialog_image)
@@ -386,17 +410,19 @@ class AccountRunner:
                     )
                     self.log(f"[窗口{self.account.game_window_no}] 未视觉定位到输入框，回退坐标: {input_center}")
                 input_x, input_y = input_center
-                if not self._dm_click_viewport(input_x, input_y, "通行证输入框", hold_ms=120):
-                    raise RuntimeError("Dm 点击通行证输入框失败")
-                page.wait_for_timeout(300)
-                if not self._dm_type_text(passport):
+                if not self._dm_chain(
+                    [f"click,{input_x},{input_y},120", f"type,{passport}"],
+                    "输入通行证"
+                ):
                     raise RuntimeError("Dm 输入通行证失败")
-                page.wait_for_timeout(800)
+                self._wait_or_stop(page,500)
                 self.update_status(self.account, "已输入通行证")
                 self.log(f"[窗口{self.account.game_window_no}] 输入通行证成功（Dm 剪贴板粘贴）")
                 self._ensure_not_stopped()
+                _timings["输入"] = _time.perf_counter() - _t_input
 
                 # === 步骤6：点击确认 ===
+                _t_confirm = _time.perf_counter()
                 self.log(f"[窗口{self.account.game_window_no}] 点击确认按钮")
                 input_check = self._capture_browser_client(browser_hwnd, "flow_step5_after_input.png")
                 confirm_center = self._locate_confirm_button_center(input_check)
@@ -409,14 +435,19 @@ class AccountRunner:
                 confirm_x, confirm_y = confirm_center
                 if not self._dm_click_viewport(confirm_x, confirm_y, "确认按钮", hold_ms=150):
                     raise RuntimeError("Dm 点击确认按钮失败")
-                page.wait_for_timeout(self.settings.after_submit_wait_ms)
+                self._wait_or_stop(page,self.settings.after_submit_wait_ms)
+                _timings["点击确认"] = _time.perf_counter() - _t_confirm
 
                 # === 步骤7：校验登录成功 ===
-                page.wait_for_timeout(2000)
+                _t_verify = _time.perf_counter()
+                self._wait_or_stop(page, 500)
                 self.log(f"[窗口{self.account.game_window_no}] 校验登录程序窗口：检测QR页面是否消失")
                 login_passport_after, _ = self._extract_passport_from_login_window()
                 if login_passport_after is None:
                     self.update_status(self.account, "成功")
+                    _timings["校验"] = _time.perf_counter() - _t_verify
+                    _timings["总计"] = _time.perf_counter() - _t_start
+                    self._log_timings(_timings)
                     self.log(f"[窗口{self.account.game_window_no}] 登录成功（QR码消失）")
                     keep_open = False
                     self._clean_tmp()
@@ -438,10 +469,13 @@ class AccountRunner:
                     f"[窗口{self.account.game_window_no}] 通行证未刷新({passport})，"
                     f"等待 {self.settings.after_submit_wait_ms}ms 后重新确认"
                 )
-                page.wait_for_timeout(self.settings.after_submit_wait_ms)
+                self._wait_or_stop(page,self.settings.after_submit_wait_ms)
                 login_passport_after2, _ = self._extract_passport_from_login_window()
                 if login_passport_after2 is None:
                     self.update_status(self.account, "成功")
+                    _timings["校验"] = _time.perf_counter() - _t_verify
+                    _timings["总计"] = _time.perf_counter() - _t_start
+                    self._log_timings(_timings)
                     self.log(f"[窗口{self.account.game_window_no}] 登录成功（二次确认QR码消失）")
                     keep_open = False
                     self._clean_tmp()
@@ -463,16 +497,20 @@ class AccountRunner:
                         f"[窗口{self.account.game_window_no}] "
                         f"OCR 可能误读，尝试候选: {', '.join(candidates[:3])}"
                     )
-                    for cand in candidates[:3]:
-                        self._dm_click_viewport(input_x, input_y, "输入框(候选)", hold_ms=120)
-                        page.wait_for_timeout(200)
-                        self._dm_type_text(cand)
-                        page.wait_for_timeout(800)
-                        self._dm_click_viewport(confirm_x, confirm_y, "确认(候选)", hold_ms=150)
-                        page.wait_for_timeout(3000)
+                    for cand in candidates[:2]:
+                        self._dm_chain(
+                            [f"click,{input_x},{input_y},120",
+                             f"type,{cand}",
+                             f"click,{confirm_x},{confirm_y},150"],
+                            f"候选{cand}"
+                        )
+                        self._wait_or_stop(page,1500)
                         cand_verify, _ = self._extract_passport_from_login_window()
                         if cand_verify is None:
                             self.update_status(self.account, "成功")
+                            _timings["校验"] = _time.perf_counter() - _t_verify
+                            _timings["总计"] = _time.perf_counter() - _t_start
+                            self._log_timings(_timings)
                             self.log(
                                 f"[窗口{self.account.game_window_no}] "
                                 f"候选 {cand} 登录成功"
@@ -539,6 +577,7 @@ class AccountRunner:
             "0": "o", "o": "0",
             "1": "l", "l": "1",
             "5": "s", "s": "5",
+            "7": "f", "f": "7",
             "8": "b", "6": "b", "b": ["8", "6"],
         }
         candidates = []
@@ -555,6 +594,12 @@ class AccountRunner:
                 break
         return candidates[:3]
 
+    def _log_timings(self, timings: dict) -> None:
+        parts = [f"[窗口{self.account.game_window_no}] 耗时统计: "]
+        for k, v in timings.items():
+            parts.append(f"{k}={v:.1f}s")
+        self.log(" ".join(parts))
+
     @staticmethod
     def _cleanup_for_retry(browser, playwright) -> None:
         import subprocess as _sp
@@ -570,8 +615,8 @@ class AccountRunner:
                 playwright.stop()
             except Exception:
                 pass
-        _sp.run(["taskkill", "/f", "/im", "chromium.exe"], capture_output=True)
-        _sp.run(["taskkill", "/f", "/im", "chrome.exe"], capture_output=True)
+        _sp.run(["taskkill", "/f", "/im", "chromium.exe"], capture_output=True, creationflags=_sp.CREATE_NO_WINDOW)
+        _sp.run(["taskkill", "/f", "/im", "chrome.exe"], capture_output=True, creationflags=_sp.CREATE_NO_WINDOW)
         _t2.sleep(2)
         _gc.collect()
 
@@ -634,6 +679,14 @@ class AccountRunner:
         if self.stop_event.is_set():
             raise InterruptedError()
 
+    def _wait_or_stop(self, page, ms: int) -> None:
+        """可中断等待：每 200ms 检查一次停止事件"""
+        while ms > 0:
+            self._ensure_not_stopped()
+            chunk = min(200, ms)
+            page.wait_for_timeout(chunk)
+            ms -= chunk
+
     def _extract_passport(self, page) -> str | None:
         deadline_ms = self.settings.passport_extract_timeout_ms
         step_ms = 500
@@ -645,7 +698,7 @@ class AccountRunner:
             passport = extract_passport_from_text(text, self.settings.passport_regex)
             if passport:
                 return passport
-            page.wait_for_timeout(step_ms)
+            self._wait_or_stop(page,step_ms)
             waited_ms += step_ms
         return None
 
@@ -1451,7 +1504,7 @@ class AccountRunner:
         expected_size = (self.settings.window_width, self.settings.window_height)
         if client.size != expected_size:
             client = client.resize(expected_size)
-        if file_name:
+        if file_name and self._save_screenshots:
             path = self._tmp_path(file_name)
             client.save(path)
             self.log(f"[窗口{self.account.game_window_no}] 临时截图已保存: _tmp/{file_name}")
@@ -1499,6 +1552,23 @@ class AccountRunner:
             self.log(f"[窗口{self.account.game_window_no}] Dm点击{label}: {output}")
             return True
         self.log(f"[窗口{self.account.game_window_no}] Dm点击{label}失败: {output}")
+        return False
+
+    def _dm_chain(self, steps: list[str], label: str = "链式操作") -> bool:
+        """一次子进程调用执行多个 Dm 操作（click/type），节省子进程启动开销。"""
+        import subprocess
+        helper = str(app_root() / "dm_click_helper.py")
+        result = subprocess.run(
+            ["py", "-3.14-32", helper, "chain", "|".join(steps)],
+            capture_output=True, text=True, timeout=20,
+            encoding="utf-8", errors="replace",
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        output = (result.stdout or result.stderr or "").strip()
+        if result.returncode == 0:
+            self.log(f"[窗口{self.account.game_window_no}] Dm{label}: {output}")
+            return True
+        self.log(f"[窗口{self.account.game_window_no}] Dm{label}失败: {output}")
         return False
 
     def _dm_type_text(self, text: str) -> bool:
@@ -1838,7 +1908,7 @@ class AccountRunner:
                     return True
             except Exception:
                 pass
-            page.wait_for_timeout(step_ms)
+            self._wait_or_stop(page,step_ms)
             waited_ms += step_ms
         return False
 

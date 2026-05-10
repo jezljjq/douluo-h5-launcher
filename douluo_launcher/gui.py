@@ -26,7 +26,12 @@ class LauncherApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("斗罗大陆H5上号器 — 前台串行模式")
-        self.geometry("1120x720")
+        w, h = 1120, 720
+        ws = self.winfo_screenwidth()
+        hs = self.winfo_screenheight()
+        x = (ws - w) // 2
+        y = (hs - h) // 2
+        self.geometry(f"{w}x{h}+{x}+{y}")
         self.minsize(980, 620)
 
         self.accounts: list[AccountConfig] = []
@@ -402,7 +407,7 @@ class LauncherApp(tk.Tk):
                 else:
                     fail_count += 1
                     self._queue_log(f"[{i}/{len(accounts)}] 失败: {account.display_name}")
-                _sp.run(["taskkill", "/f", "/im", "chromium.exe"], capture_output=True)
+                _sp.run(["taskkill", "/f", "/im", "chromium.exe"], capture_output=True, creationflags=_sp.CREATE_NO_WINDOW)
             else:
                 # === 源码模式：子进程隔离 Playwright asyncio ===
                 cfg = {
@@ -454,6 +459,7 @@ print("RESULT:" + str(flow_result), flush=True)
                     stdout=_sp.PIPE, stderr=_sp.PIPE,
                     text=True, encoding="utf-8", errors="replace",
                     cwd=project_root,
+                    creationflags=_sp.CREATE_NO_WINDOW,
                 )
                 result_seen = False
                 for line in proc.stdout:
@@ -490,7 +496,7 @@ print("RESULT:" + str(flow_result), flush=True)
 
                 try: cfg_file.unlink()
                 except Exception: pass
-                _sp.run(["taskkill", "/f", "/im", "chromium.exe"], capture_output=True)
+                _sp.run(["taskkill", "/f", "/im", "chromium.exe"], capture_output=True, creationflags=_sp.CREATE_NO_WINDOW)
 
         elapsed = _time.time() - start_time
         log_path = str(self._log_file_path) if self._log_file_path else ""

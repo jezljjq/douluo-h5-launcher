@@ -133,12 +133,15 @@ OCR 完整文本: "AURIBATIE: 4acaccal = EFUB ERAD HLM RDE"
 | 实际字符 | OCR 误读 | 示例 |
 |----------|----------|------|
 | d | 0 | `00d57777` → `00057777` |
+| f | 7 | `3f45f638` → `37457638` |
 | c | € / ¢ / C | `c4129354` → `€4129354` |
 | e | £ | `e2f5305a` → `£2f5305a` |
 | 1 | l / t | `1abc` → `labc` / `tabc` |
 | 0 | o / O | `0abc` → `oabc` |
 
-当前纠错管线（`extract_hex_passport`）已覆盖 l→1, o→0, s→5, i→1, g→9, z→2, t→1 以及 Unicode 符号 €→c, £→e, ¢→c, ¥→y, $→s。但 **d→0** 的混淆尚未加入纠错——因为 d 是合法 hex 字符，全局替换会导致误判。
+当前纠错管线（`extract_hex_passport`）已覆盖 l→1, o→0, s→5, i→1, g→9, z→2, t→1 以及 Unicode 符号 €→c, £→e, ¢→c, ¥→y, $→s。
+
+**d→0 和 f→7 的混淆**不加入全局纠错（d/f 是合法 hex 字符），但登录失败后通过 `_generate_passport_candidates` 生成互换候选（含 7↔f、d 暂未覆盖）。
 
 ---
 

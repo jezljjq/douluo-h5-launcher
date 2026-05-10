@@ -135,7 +135,7 @@ exe 模式下批量自动走同进程调用，无需额外 Python。
 
 ### exe 弹黑色命令行窗口
 
-已修复：所有 `py -3.14-32` 子进程调用添加 `creationflags=subprocess.CREATE_NO_WINDOW`（2026-05-10）。
+已修复：全项目显式子进程调用加 `CREAT_NO_WINDOW` + `automation.py` 模块级 monkey-patch `subprocess.Popen` 覆盖 pytesseract→tesseract.exe 等第三方库内部调用（2026-05-11）。
 
 ### 通行证按钮模板读不到
 

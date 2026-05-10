@@ -66,3 +66,49 @@
 ## 8. 每完成一个阶段必须更新文档
 
 代码与文档必须同步。详见 [README.md](README.md) 文档索引。
+
+---
+
+## 9. 同类问题全局排查规则
+
+修 bug 时不能只修当前看到的一处。必须先判断问题类型，然后全项目搜索同类风险点，避免修 A 漏 B。
+
+### 修复前必须全局搜索
+
+发现一个 bug 后，先搜索同类代码。例如：
+
+**子进程弹黑框类**：搜索 `subprocess.run`、`subprocess.Popen`、`py -3.14-32`、`dm_click_helper`、`CREATE_NO_WINDOW`、`shell=True`、`python` 子进程、`taskkill`
+
+**OCR 类**：搜索 `extract_passport`、`extract_hex`、`pytesseract`、`OCR`、`ocr`、`本次通行证`
+
+**Dm 点击类**：搜索 `DM_CLICK`、`dm_click`、`MoveTo`、`LeftClick`、`dm_click_helper`、`大漠`
+
+**日志类**：搜索 `log(`、`file_log`、`status_fn`、`print(`
+
+**Playwright 类**：搜索 `sync_playwright`、`browser`、`page`、`context`、`new_page`、`close`、`stop`
+
+### 修复前必须输出排查结果
+
+每次修复前必须先输出：
+
+1. 本次问题类型
+2. 全局搜索了哪些关键字
+3. 找到哪些相关位置
+4. 准备修改哪些文件/函数
+5. 哪些相关位置不修改，以及原因
+
+### 禁止只修一个点就说完成
+
+禁止：看到报错 → 修一个位置 → 不搜索其它 → 说修好了。
+
+必须是：看到报错 → 判断类型 → 全项目搜索 → 列出所有位置 → 一次性处理 → 验证。
+
+### 修复后必须验证同类场景
+
+- 当前 bug 是否修复
+- 同类场景是否也修复
+- 已稳定功能是否没有回退
+
+### 完成前必须汇报
+
+说"修好了"之前必须告知：搜索了哪些关键字、找到几处、修改几处、保留几处及原因、回归验证结果。

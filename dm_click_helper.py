@@ -32,7 +32,48 @@ def bring_to_front() -> None:
 
 dm = win32com.client.Dispatch("dm.dmsoft")
 
-if len(sys.argv) >= 2 and sys.argv[1] == "type":
+
+def _do_click(vx, vy, hold_ms):
+    sx, sy = cx + int(vx), cy + int(vy)
+    dm.MoveTo(sx, sy)
+    time.sleep(0.08)
+    try:
+        dm.LeftDown()
+        time.sleep(max(0, int(hold_ms)) / 1000)
+        dm.LeftUp()
+    except Exception:
+        dm.LeftClick()
+    return f"click({vx},{vy})"
+
+
+def _do_type(text):
+    import subprocess as _sp
+    _sp.run(["clip"], input=str(text), text=True, creationflags=_sp.CREATE_NO_WINDOW)
+    time.sleep(0.08)
+    dm.KeyDown(17)
+    time.sleep(0.03)
+    dm.KeyPress(86)
+    time.sleep(0.03)
+    dm.KeyUp(17)
+    return f"type({text})"
+
+
+if len(sys.argv) >= 2 and sys.argv[1] == "chain":
+    # 链式操作：click|type|click 合并为一次子进程调用
+    bring_to_front()
+    time.sleep(0.05)
+    results = []
+    for step in sys.argv[2].split("|"):
+        parts = step.split(",")
+        if parts[0] == "click":
+            r = _do_click(parts[1], parts[2], parts[3] if len(parts) > 3 else 120)
+        elif parts[0] == "type":
+            r = _do_type(parts[1])
+        else:
+            r = f"unknown:{step}"
+        results.append(r)
+    print("DM_CHAIN: " + " | ".join(results))
+elif len(sys.argv) >= 2 and sys.argv[1] == "type":
     text = sys.argv[2]
     bring_to_front()
     time.sleep(0.1)
