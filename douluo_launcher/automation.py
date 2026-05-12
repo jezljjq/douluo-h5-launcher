@@ -73,6 +73,12 @@ def _preview_text(text: str, limit: int) -> str:
 
 
 class AccountRunner:
+    # 坐标缓存（类级别，同尺寸窗口共享）
+    _cached_btn: tuple[int, int] | None = None
+    _cached_input: tuple[int, int] | None = None
+    _cached_confirm: tuple[int, int] | None = None
+    _cached_window_size: tuple[int, int] | None = None
+
     def __init__(
         self,
         account: AccountConfig,
@@ -355,7 +361,15 @@ class AccountRunner:
                 )
                 page.goto(self.account.url, wait_until="domcontentloaded", timeout=self.settings.page_load_timeout_ms)
                 self.log(f"[窗口{self.account.game_window_no}] 游戏页已打开: {page.title}")
-                self._wait_or_stop(page,self.settings.after_goto_wait_ms)
+                # 轮询 canvas 出现替代固定等待（最多 2s，200ms×10）
+                for _poll in range(10):
+                    self._ensure_not_stopped()
+                    _time.sleep(0.2)
+                    try:
+                        if page.locator("canvas").count() > 0:
+                            break
+                    except Exception:
+                        pass
                 self._ensure_not_stopped()
                 _timings["打开页面"] = _time.perf_counter() - _t_br
 
@@ -364,98 +378,141 @@ class AccountRunner:
                 self.update_status(self.account, "关闭公告")
                 for _ in range(2):
                     page.mouse.click(740, 680)
-                    self._wait_or_stop(page,200)
-                self._wait_or_stop(page,400)
+                    self._wait_or_stop(page,100)
+                self._wait_or_stop(page,200)
                 self.update_status(self.account, "已关闭公告")
                 self.log(f"[窗口{self.account.game_window_no}] 公告已关闭（canvas 右下角点击）")
                 self._wait_or_stop(page,self.settings.after_notice_wait_ms)
                 self._ensure_not_stopped()
                 _timings["关闭公告"] = _time.perf_counter() - _t_notice
 
-                # === 步骤4：点击通行证按钮（带重试，容错鼠标干扰） ===
+                # === 步骤4：点击通行证按钮 ===
                 _t_btn = _time.perf_counter()
-                self.log(f"[窗口{self.account.game_window_no}] 定位并点击通行证按钮")
-                dialog_visible = False
-                for btn_retry in range(3):
-                    browser_hwnd = self._find_game_browser_window()
-                    if browser_hwnd is None:
-                        self.log(f"[窗口{self.account.game_window_no}] 未找到浏览器窗口，等待后重试...")
-                        self._wait_or_stop(page,500)
-                        continue
-                    self._write_browser_pos(browser_hwnd)
+                self._ensure_not_stopped()
+                browser_hwnd = self._find_game_browser_window()
+                if browser_hwnd is None:
+                    raise RuntimeError("未找到浏览器窗口")
+                self._write_browser_pos(browser_hwnd)
+
+                # 坐标缓存：同一尺寸优先复用
+                cache_key = (self.settings.window_width, self.settings.window_height)
+                if AccountRunner._cached_window_size == cache_key and AccountRunner._cached_btn:
+                    btn_pos = AccountRunner._cached_btn
+                    self.log(f"[窗口{self.account.game_window_no}] 使用缓存按钮坐标: {btn_pos}")
+                else:
                     _client = self._capture_browser_client(browser_hwnd, "flow_step4_button_match_source.png")
                     btn_pos = self._locate_passport_button(_client)
-                    if btn_pos is None:
-                        self.log(f"[窗口{self.account.game_window_no}] 模板匹配失败（可能被遮挡），重试截图定位...")
-                        self._wait_or_stop(page,300)
+                    if btn_pos:
+                        AccountRunner._cached_btn = btn_pos
+                        AccountRunner._cached_window_size = cache_key
+                        self.log(f"[窗口{self.account.game_window_no}] 模板匹配定位按钮: {btn_pos}（已缓存）")
+                    else:
+                        self.log(f"[窗口{self.account.game_window_no}] 模板匹配失败，使用回退坐标")
+                        btn_pos = self.settings.passport_btn_viewport
+
+                # 点击按钮 + 短轮询弹窗
+                dialog_visible = False
+                for click_i, (vx, vy) in enumerate(self._passport_button_click_points(btn_pos), start=1):
+                    if not self._dm_click_viewport(vx, vy, "通行证按钮", hold_ms=100):
                         continue
-                    for click_i, (vx, vy) in enumerate(self._passport_button_click_points(btn_pos), start=1):
-                        self.log(f"[窗口{self.account.game_window_no}] 点击通行证按钮（第{click_i}次）: viewport({vx},{vy})")
-                        if not self._dm_click_viewport(vx, vy, "通行证按钮", hold_ms=150):
-                            continue
-                        self._wait_or_stop(page,300)
-                        after_click = self._capture_browser_client(browser_hwnd, f"flow_step4_after_passport_click_{click_i}.png")
+                    # 短轮询：每100ms检查弹窗，最多800ms
+                    for _poll in range(8):
+                        self._ensure_not_stopped()
+                        _time.sleep(0.1)
+                        after_click = self._capture_browser_client(browser_hwnd, None)
                         if self._is_passport_dialog_visible_by_ocr(after_click):
                             dialog_visible = True
                             break
-                        self.log(f"[窗口{self.account.game_window_no}] 弹窗未出现")
                     if dialog_visible:
+                        self.log(f"[窗口{self.account.game_window_no}] 通行证弹窗已出现（第{click_i}次点击）")
                         break
-                    self.log(f"[窗口{self.account.game_window_no}] 第{btn_retry+1}轮点击未触发弹窗，重新定位...")
-                if not dialog_visible and not self._wait_state(page, self._is_passport_dialog_visible):
-                    raise RuntimeError("通行证弹窗未出现（已重试3轮）")
-                self.log(f"[窗口{self.account.game_window_no}] 通行证弹窗已出现")
-                self._wait_or_stop(page,self.settings.after_passport_button_wait_ms)
+                    self.log(f"[窗口{self.account.game_window_no}] 弹窗未出现，尝试下一个坐标")
+                if not dialog_visible:
+                    raise RuntimeError("通行证弹窗未出现")
                 self._ensure_not_stopped()
-                dialog_image = self._capture_browser_client(browser_hwnd, "flow_step4_dialog_visible.png")
                 _timings["点击按钮"] = _time.perf_counter() - _t_btn
 
-                # === 步骤5：输入通行证 ===
+                # === 步骤5+6：输入通行证 + 点击确认（合并Dm调用） ===
                 _t_input = _time.perf_counter()
                 self.update_status(self.account, "输入中")
-                self.log(f"[窗口{self.account.game_window_no}] 输入通行证: {passport}")
-                input_center = self._locate_passport_input_center(dialog_image)
-                if input_center is None:
-                    input_center = (
-                        int(self.settings.window_width * self.settings.passport_input_ratio[0]),
-                        int(self.settings.window_height * self.settings.passport_input_ratio[1]),
-                    )
-                    self.log(f"[窗口{self.account.game_window_no}] 未视觉定位到输入框，回退坐标: {input_center}")
-                input_x, input_y = input_center
+                self.log(f"[窗口{self.account.game_window_no}] 输入通行证并点击确认: {passport}")
+
+                # 坐标缓存
+                if AccountRunner._cached_input and AccountRunner._cached_window_size == cache_key:
+                    input_x, input_y = AccountRunner._cached_input
+                else:
+                    dialog_image = self._capture_browser_client(browser_hwnd, None)
+                    input_center = self._locate_passport_input_center(dialog_image)
+                    if input_center:
+                        AccountRunner._cached_input = input_center
+                        AccountRunner._cached_window_size = cache_key
+                        input_x, input_y = input_center
+                    else:
+                        input_x = int(self.settings.window_width * self.settings.passport_input_ratio[0])
+                        input_y = int(self.settings.window_height * self.settings.passport_input_ratio[1])
+
+                if AccountRunner._cached_confirm and AccountRunner._cached_window_size == cache_key:
+                    confirm_x, confirm_y = AccountRunner._cached_confirm
+                else:
+                    confirm_image = self._capture_browser_client(browser_hwnd, None)
+                    confirm_center = self._locate_confirm_button_center(confirm_image)
+                    if confirm_center:
+                        AccountRunner._cached_confirm = confirm_center
+                        AccountRunner._cached_window_size = cache_key
+                        confirm_x, confirm_y = confirm_center
+                    else:
+                        confirm_x = int(self.settings.window_width * self.settings.confirm_button_ratio[0])
+                        confirm_y = int(self.settings.window_height * self.settings.confirm_button_ratio[1])
+
+                # 一次Dm链式调用：点击输入框 → 粘贴 → 点击确认
                 if not self._dm_chain(
-                    [f"click,{input_x},{input_y},120", f"type,{passport}"],
-                    "输入通行证"
+                    [f"click,{input_x},{input_y},80", f"type,{passport}", f"click,{confirm_x},{confirm_y},100"],
+                    "输入+确认"
                 ):
-                    raise RuntimeError("Dm 输入通行证失败")
-                self._wait_or_stop(page,500)
+                    raise RuntimeError("Dm 输入+确认失败")
                 self.update_status(self.account, "已输入通行证")
-                self.log(f"[窗口{self.account.game_window_no}] 输入通行证成功（Dm 剪贴板粘贴）")
+                self.log(f"[窗口{self.account.game_window_no}] 输入+确认完成（Dm 合并调用）")
                 self._ensure_not_stopped()
                 _timings["输入"] = _time.perf_counter() - _t_input
-
-                # === 步骤6：点击确认 ===
                 _t_confirm = _time.perf_counter()
-                self.log(f"[窗口{self.account.game_window_no}] 点击确认按钮")
-                input_check = self._capture_browser_client(browser_hwnd, "flow_step5_after_input.png")
-                confirm_center = self._locate_confirm_button_center(input_check)
-                if confirm_center is None:
-                    confirm_center = (
-                        int(self.settings.window_width * self.settings.confirm_button_ratio[0]),
-                        int(self.settings.window_height * self.settings.confirm_button_ratio[1]),
-                    )
-                    self.log(f"[窗口{self.account.game_window_no}] 未视觉定位到确认按钮，回退坐标: {confirm_center}")
-                confirm_x, confirm_y = confirm_center
-                if not self._dm_click_viewport(confirm_x, confirm_y, "确认按钮", hold_ms=150):
-                    raise RuntimeError("Dm 点击确认按钮失败")
-                self._wait_or_stop(page,self.settings.after_submit_wait_ms)
-                _timings["点击确认"] = _time.perf_counter() - _t_confirm
+                _timings["点击确认"] = 0  # 合并到输入计时
 
-                # === 步骤7：校验登录成功 ===
+                # === 步骤7：校验登录成功（轻量化：先判断 QR 是否消失） ===
                 _t_verify = _time.perf_counter()
-                self._wait_or_stop(page, 500)
                 self.log(f"[窗口{self.account.game_window_no}] 校验登录程序窗口：检测QR页面是否消失")
-                login_passport_after, _ = self._extract_passport_from_login_window()
+
+                # 短轮询：200ms快速状态检测，最多10s（含OCR开销）
+                verified_success = False
+                login_passport_after = None
+                login_source_after = ""
+                _verify_deadline = _time.perf_counter() + 10.0
+                _poll = 0
+                while _time.perf_counter() < _verify_deadline:
+                    self._ensure_not_stopped()
+                    _time.sleep(0.2)
+                    state = self._quick_login_state()
+                    if state == "logged_in":
+                        verified_success = True
+                        break
+                    # 仅第5轮起每15轮（~3s）做一次完整OCR，跳过第0轮避免OCR刚跑完又跑
+                    if _poll >= 5 and _poll % 15 == 0 and state == "qr_page":
+                        login_passport_after, login_source_after = self._extract_passport_from_login_window()
+                        if login_passport_after is not None and login_passport_after != passport:
+                            break
+                    _poll += 1
+
+                if verified_success:
+                    self.update_status(self.account, "成功")
+                    _timings["校验"] = _time.perf_counter() - _t_verify
+                    _timings["总计"] = _time.perf_counter() - _t_start
+                    self._log_timings(_timings)
+                    self.log(f"[窗口{self.account.game_window_no}] 登录成功（QR码消失）")
+                    keep_open = False
+                    self._clean_tmp()
+                    return True
+
                 if login_passport_after is None:
+                    # 确认成功但状态非logged_in（可能是unknown）
                     self.update_status(self.account, "成功")
                     _timings["校验"] = _time.perf_counter() - _t_verify
                     _timings["总计"] = _time.perf_counter() - _t_start
@@ -466,7 +523,7 @@ class AccountRunner:
                     return True
 
                 # QR页面仍存在 → 检查通行证是否刷新
-                if login_passport_after != passport and retry == 0:
+                if login_passport_after is not None and login_passport_after != passport and retry == 0:
                     self.log(
                         f"[窗口{self.account.game_window_no}] 通行证已刷新: "
                         f"{passport} → {login_passport_after}，重试"
@@ -476,66 +533,15 @@ class AccountRunner:
                     playwright = None
                     continue  # 重新OCR+登录
 
-                # 通行证相同 → 等待窗口刷新后再 OCR 一次确认
-                self.log(
-                    f"[窗口{self.account.game_window_no}] 通行证未刷新({passport})，"
-                    f"等待 {self.settings.after_submit_wait_ms}ms 后重新确认"
-                )
-                self._wait_or_stop(page,self.settings.after_submit_wait_ms)
-                login_passport_after2, _ = self._extract_passport_from_login_window()
-                if login_passport_after2 is None:
-                    self.update_status(self.account, "成功")
-                    _timings["校验"] = _time.perf_counter() - _t_verify
-                    _timings["总计"] = _time.perf_counter() - _t_start
-                    self._log_timings(_timings)
-                    self.log(f"[窗口{self.account.game_window_no}] 登录成功（二次确认QR码消失）")
-                    keep_open = False
-                    self._clean_tmp()
-                    return True
-                if login_passport_after2 != passport and retry == 0:
+                # QR页面仍存在且通行证相同 → 登录未完成，重试整流程
+                if retry == 0:
                     self.log(
-                        f"[窗口{self.account.game_window_no}] 通行证已刷新(二次确认): "
-                        f"{passport} → {login_passport_after2}，重试"
+                        f"[窗口{self.account.game_window_no}] 校验超时QR仍存在且通行证未变，重试整流程"
                     )
                     self._cleanup_for_retry(browser, playwright)
                     browser = None
                     playwright = None
                     continue
-
-                # 两次确认都是相同通行证 → 尝试 OCR 候选替换
-                candidates = self._generate_passport_candidates(passport)
-                if candidates:
-                    self.log(
-                        f"[窗口{self.account.game_window_no}] "
-                        f"OCR 可能误读，尝试候选: {', '.join(candidates[:3])}"
-                    )
-                    for cand in candidates[:2]:
-                        self._dm_chain(
-                            [f"click,{input_x},{input_y},120",
-                             f"type,{cand}",
-                             f"click,{confirm_x},{confirm_y},150"],
-                            f"候选{cand}"
-                        )
-                        self._wait_or_stop(page,1500)
-                        cand_verify, _ = self._extract_passport_from_login_window()
-                        if cand_verify is None:
-                            self.update_status(self.account, "成功")
-                            _timings["校验"] = _time.perf_counter() - _t_verify
-                            _timings["总计"] = _time.perf_counter() - _t_start
-                            self._log_timings(_timings)
-                            self.log(
-                                f"[窗口{self.account.game_window_no}] "
-                                f"候选 {cand} 登录成功"
-                            )
-                            keep_open = False
-                            self._clean_tmp()
-                            return True
-                        self.log(
-                            f"[窗口{self.account.game_window_no}] 候选 {cand} 未成功"
-                        )
-                raise RuntimeError(
-                    f"登录失败，登录程序窗口仍显示QR页面 (passport={login_passport_after2})"
-                )
 
             except TimeoutError as exc:
                 self.update_status(self.account, "失败")
@@ -586,7 +592,7 @@ class AccountRunner:
         """OCR 常见混淆字符的候选替换。最多返回 3 个。"""
         swaps = {
             "c": "e", "e": "c",
-            "0": ["o", "c"], "o": "0", "c": ["e", "0"],
+            "0": ["o", "c", "a"], "o": "0", "c": ["e", "0"], "a": "0",
             "1": "l", "l": "1",
             "5": "s", "s": "5",
             "7": "f", "f": ["7", "4"],
@@ -797,6 +803,16 @@ class AccountRunner:
         if passport:
             return passport, "ocr"
         return None, "unknown"
+
+    def _quick_login_state(self) -> str:
+        """轻量状态检测：截图 + 图像特征判断，不做 OCR。用于校验轮询。"""
+        selected, _ = select_login_window_by_game_no(self.account.game_window_no)
+        if selected is None:
+            return "unknown"
+        image = capture_window_background(selected).convert("RGB")
+        state, _ = self.detect_login_page_state(image)
+        self._vlog("debug", f"[窗口{self.account.game_window_no}] quick_state={state}")
+        return state
 
     def _log_iframe_info(self, page) -> None:
         try:
@@ -1120,7 +1136,7 @@ class AccountRunner:
 
         # 裁切底部文字区域（通行证文字在二维码下方）
         w, h = raw_image.size
-        text_crop = raw_image.crop((10, int(h * 0.65), w - 10, h - 10))
+        text_crop = raw_image.crop((10, int(h * 0.50), w - 10, h - 10))
         regex = self.settings.passport_regex
         results: dict[str, int] = {}
 
@@ -1149,6 +1165,9 @@ class AccountRunner:
                     results[hex_val] = results.get(hex_val, 0) + 1
 
         if not results:
+            self.log(
+                f"[窗口{self.account.game_window_no}] 文字区域OCR未提取到hex，回退全图OCR"
+            )
             return None
 
         total = sum(results.values())
@@ -1785,6 +1804,10 @@ class AccountRunner:
         return merged
 
     def _is_passport_dialog_visible_by_ocr(self, image) -> bool:
+        # 快速视觉校验（免OCR），大多数弹窗可直接检出
+        if self._looks_like_passport_dialog(image):
+            return True
+        # OCR 兜底
         text = self._ocr_image_text(image, "通行证弹窗")
         normalized = re.sub(r"\s+", "", text)
         targets = (
