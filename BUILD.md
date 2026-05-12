@@ -1,7 +1,7 @@
 # 打包发布说明
 
 **当前版本：斗罗大陆H5上号器 - 前台串行稳定版**
-**最后打包：2026-05-10，PyInstaller 6.20.0，11 tests OK**
+**最后打包：2026-05-13，PyInstaller 6.20.0，11 tests OK**
 
 ---
 
@@ -98,7 +98,7 @@ dist/斗罗大陆H5上号器/
 如需自定义 PyInstaller 参数：
 
 ```powershell
-pyinstaller --onedir --windowed --name "斗罗大陆H5上号器" ^
+pyinstaller --onedir --noconsole --name "斗罗大陆H5上号器" ^
     --add-data "automation_settings.json;." ^
     --add-data "debug_ocr\template_passport_btn.png;debug_ocr" ^
     --hidden-import PIL --hidden-import pytesseract --hidden-import cv2 ^
@@ -124,6 +124,14 @@ pyinstaller --onedir --windowed --name "斗罗大陆H5上号器" ^
 
 如果在源码模式下运行，请确认从项目根目录启动：`cd D:\Ai\codex\上号器 && python main.py`。
 exe 模式下批量自动走同进程调用，无需额外 Python。
+
+### 点"全部串行"报 `function() argument 'code' must be code, not str`
+
+已修复：模块级 `subprocess.Popen` monkey-patch 由 function 替换改为 class 继承（`_NoConsolePopen`），Playwright 导入前临时恢复原始 Popen 让 asyncio 正确子类化（2026-05-12）。
+
+### 重试时"通行证未刷新"跳过完整流程
+
+已修复：重试时不再因通行证相同而跳过，始终走完整浏览器流程（关旧浏览器→开新浏览器→公告→按钮→输入→确认→校验）（2026-05-12）。
 
 ### Tesseract OCR 报错
 

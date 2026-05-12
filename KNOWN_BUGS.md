@@ -108,3 +108,5 @@ print("[W" + str(cfg["game_window_no"]) + "] " + str(msg))
 2. `automation.py` 模块级 monkey-patch `subprocess.Popen`，默认注入 `CREAT_NO_WINDOW`，一劳永逸覆盖 pytesseract 等第三方库的内部子进程调用
 
 **出现次数**：1 次（打包 exe 后发现）
+
+**⚠ 2026-05-12 补充**：monkey-patch 必须用 **class 包装**，不能用 function 替换。因为 `asyncio.windows_utils.Popen` 继承自 `subprocess.Popen`，用 function 替换会导致 `TypeError: function() argument 'code' must be code, not str`（Playwright → asyncio → windows_utils 触发）。修复见 `automation.py` 中的 `_NoConsolePopen` 类。

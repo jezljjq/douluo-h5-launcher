@@ -63,13 +63,35 @@
 
 **前台串行稳定版**。优先级：稳定性 > 新功能。禁止大规模重构。
 
-## 8. 每完成一个阶段必须更新文档
+## 8. `subprocess.Popen` monkey-patch 规则
+
+`automation.py` 模块级 monkey-patch 覆盖 `subprocess.Popen` 用于注入 `CREATE_NO_WINDOW`（抑制 pytesseract 等第三方库子进程黑框）。
+
+**必须遵守**：
+- 必须用 **class 继承**，禁止用 function 替换
+- `from playwright.sync_api import sync_playwright` 前必须临时恢复原始 Popen，导入后恢复补丁
+- 违反此规则会导致 asyncio 子类化失败（`TypeError: function() argument 'code' must be code, not str`）
+
+```python
+# ✅ 正确：class 继承
+_original_popen = _subprocess.Popen
+class _NoConsolePopen(_original_popen):
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("creationflags", _subprocess.CREATE_NO_WINDOW)
+        super().__init__(*args, **kwargs)
+_subprocess.Popen = _NoConsolePopen
+
+# ❌ 错误：function 替换（会导致 asyncio 崩溃）
+_subprocess.Popen = lambda *a, **kw: _original_popen(*a, **{**kw, "creationflags": ...})
+```
+
+## 9. 每完成一个阶段必须更新文档
 
 代码与文档必须同步。详见 [README.md](README.md) 文档索引。
 
 ---
 
-## 9. 同类问题全局排查规则
+## 10. 同类问题全局排查规则
 
 修 bug 时不能只修当前看到的一处。必须先判断问题类型，然后全项目搜索同类风险点，避免修 A 漏 B。
 

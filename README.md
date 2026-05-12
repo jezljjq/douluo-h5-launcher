@@ -1,6 +1,8 @@
 # 斗罗大陆H5上号器（前台串行稳定版）
 
-**当前阶段：前台串行批量，已稳定可用。**
+**当前阶段：前台串行批量，已稳定可用。成功率 94%（29/31），31 账号约 6 分钟。**
+
+> 项目级开发规则见 [CLAUDE.md](CLAUDE.md)。
 
 ---
 
@@ -44,6 +46,17 @@
 
 ---
 
+## 2.5 最近修复（2026-05-12/13）
+
+| 问题 | 修复 |
+|------|------|
+| `subprocess.Popen` monkey-patch 导致 asyncio 崩溃 | function→class 继承（`_NoConsolePopen`），Playwright 导入前恢复原始 Popen |
+| 重试时相同通行证跳过完整流程 | 删除跳过逻辑，重试始终走完整浏览器流程 |
+| exe 启动有黑框 | 切换 `--noconsole` 引导器 |
+| 登录程序窗口状态判断不稳定 | 新增 `detect_login_page_state` 图像特征检测（black_ratio+edge_density+variance），区分 qr_page/logged_in/unknown |
+| 二维码页 OCR 被 QR 码干扰 | 确认 qr_page 后优先用底部文字区域 OCR，避开 QR 码密集图案 |
+| 日志路径不统一 | 新增 `project_root()`，exe 模式日志也落到项目根 `logs/` |
+
 ## 3. 当前架构
 
 ```
@@ -78,18 +91,19 @@
 
 ## 5. 两种上号方式
 
-### 方式一：收藏夹链接 + OCR 通行证
+### 方式一：收藏夹链接 + OCR 通行证（✅ 已开发，当前主流程）
 
 - 从浏览器收藏夹读取游戏入口链接
-- 从登录程序窗口 OCR 提取通行证
+- 从登录程序窗口 OCR/图像识别提取通行证
+- 支持单账号、当前层串行、全部串行
 
-### 方式二：CSV 配置文件 + OCR 通行证
+### 方式二：CSV 配置文件 + OCR 通行证（❌ 暂未开发）
 
-- 通过 CSV 文件配置账号（`name,url,username,password`）
+- 计划通过 CSV 文件配置账号（`name,url,username,password`）
 - 仍然需要先 OCR 通行证，不是只用账号密码
 - password 不打印到日志，GUI 仅显示"已填写/未填写"
-
-两种方式最终都走同一完整流程：OCR 通行证 → 打开游戏页 → 关闭公告 → 输入通行证 → 确认登录。
+- **开发前提**：方式一十分稳定后再启动，当前不要开发方式二
+- **密码.csv** 保留在本地用于后续开发，已配置 .gitignore 不提交
 
 ---
 
@@ -131,6 +145,14 @@ GUI 按钮：
 - [douluo_launcher/dm_client.py](douluo_launcher/dm_client.py) — 窗口管理和后台截图
 - [dm_click_helper.py](dm_click_helper.py) — 32 位 Dm 点击/输入脚本
 - [automation_settings.json](automation_settings.json) — 自动化参数
+
+**运行必要目录**：
+- `debug_ocr/` — 运行必须（含 `template_passport_btn.png`、`browser_pos.json`）
+- `logs/` — 日志目录（运行时自动创建）
+
+**临时目录**（可清理）：
+- `debug_ocr/_tmp/` — 临时截图（自动清理）
+- `_cleanup_pending/` — 归档待清理文件，确认无问题后可删除
 
 ---
 

@@ -16,6 +16,14 @@ def app_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def project_root() -> Path:
+    """返回项目根目录（始终为源码项目根，与是否打包无关）。"""
+    if getattr(sys, "frozen", False):
+        # exe在 dist/斗罗大陆H5上号器/ 下，上溯3级到项目根
+        return Path(sys.executable).parent.parent.parent
+    return Path(__file__).resolve().parent.parent
+
+
 LEVEL_OFFSETS = {
     "第一层": 0,
     "第二层": 8,
@@ -108,6 +116,13 @@ class AutomationSettings:
     passport_btn_viewport: tuple[int, int] = (683, 290)
     passport_btn_region: tuple[int, int, int, int] = (670, 272, 697, 308)
     passport_dialog_text: str = "通行证登录"
+    # 登录页面状态检测（图像特征，不用Tesseract）
+    login_state_roi: tuple[int, int, int, int] = (60, 150, 260, 350)
+    qr_black_ratio_min: float = 0.35
+    qr_edge_density_min: float = 0.08
+    qr_variance_min: float = 2500.0
+    logged_in_black_ratio_max: float = 0.28
+    logged_in_edge_density_max: float = 0.60
 
 
 def compute_game_window_no(level: str, bookmark_no: int) -> int:
@@ -217,6 +232,8 @@ def load_settings(path: str | Path) -> AutomationSettings:
             normalized[key] = _normalize_region_ratio(value, key) if key.endswith("_region_ratio") else _normalize_ratio(value, key)
         elif key == "level_names":
             normalized[key] = tuple(str(item) for item in value)
+        elif key in ("login_state_roi", "passport_btn_region", "passport_btn_viewport", "notice_close_viewport"):
+            normalized[key] = tuple(int(item) for item in value)
         else:
             normalized[key] = value
     return AutomationSettings(**normalized)

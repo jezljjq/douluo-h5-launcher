@@ -11,11 +11,13 @@ from pathlib import Path
 from tempfile import gettempdir
 
 # 全局：所有子进程默认不弹控制台窗口（覆盖 pytesseract→tesseract.exe 等）
+# 用 class 包装而非 function，避免破坏 asyncio 对 subprocess.Popen 的子类化
 _original_popen = _subprocess.Popen
-def _no_console_popen(*args, **kwargs):
-    kwargs.setdefault("creationflags", _subprocess.CREATE_NO_WINDOW)
-    return _original_popen(*args, **kwargs)
-_subprocess.Popen = _no_console_popen
+class _NoConsolePopen(_original_popen):
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("creationflags", _subprocess.CREATE_NO_WINDOW)
+        super().__init__(*args, **kwargs)
+_subprocess.Popen = _NoConsolePopen
 
 from .config import AccountConfig, AutomationSettings, app_root
 from .dm_client import DmClient
@@ -102,7 +104,12 @@ class AccountRunner:
             self.update_status(self.account, "打开中")
             self._vlog("debug", f"[窗口{self.account.game_window_no}] 打开链接: {self.account.url}")
 
-            from playwright.sync_api import sync_playwright
+            # 临时恢复原始 Popen 让 asyncio 正确子类化，导入后恢复补丁
+            _subprocess.Popen = _original_popen
+            try:
+                from playwright.sync_api import sync_playwright
+            finally:
+                _subprocess.Popen = _NoConsolePopen
 
             playwright = sync_playwright().start()
             launcher = getattr(playwright, self.settings.browser)
@@ -273,7 +280,6 @@ class AccountRunner:
                 if not new_passport:
                     if passport is not None:
                         # 重试时 OCR 返回空：窗口可能正处于黑屏/过渡态
-                        # 等 2 秒再试一次，仍无二维码则视为登录成功
                         self.log(
                             f"[窗口{self.account.game_window_no}] "
                             f"重试OCR未检测到通行证，等待后二次确认"
@@ -281,40 +287,41 @@ class AccountRunner:
                         for _ in range(5):
                             self._ensure_not_stopped()
                             _time.sleep(0.1)
-                        new_passport2, _ = self._extract_passport_from_login_window()
-                        if new_passport2 is None:
-                            self.update_status(self.account, "成功")
+                        new_passport2, new_source2 = self._extract_passport_from_login_window()
+                        if new_passport2 is None and new_source2 == "logged_in":
+                            self.update_status(self.account, "登录成功")
                             self.log(f"[窗口{self.account.game_window_no}] 登录成功（QR码消失）")
                             keep_open = False
                             self._clean_tmp()
                             return True
-                        new_passport = new_passport2
+                        if new_passport2 is not None:
+                            new_passport = new_passport2
+                            source = new_source2
                     elif retry == 0:
-                        # 首次 OCR 返回空：已登录 / 窗口无QR码
-                        # 短等待后二次确认（500ms × 4 = 2s 缩减到 500ms）
-                        self.log(
-                            f"[窗口{self.account.game_window_no}] "
-                            f"未检测到通行证，可能已登录，等待确认"
-                        )
-                        for _ in range(5):
-                            self._ensure_not_stopped()
-                            _time.sleep(0.1)
-                        new_passport2, _ = self._extract_passport_from_login_window()
-                        if new_passport2 is None:
-                            self.update_status(self.account, "成功")
-                            self.log(f"[窗口{self.account.game_window_no}] 已登录（无QR码）")
+                        if source == "logged_in":
+                            self.update_status(self.account, "已登录，跳过")
                             keep_open = False
                             self._clean_tmp()
                             return True
-                        new_passport = new_passport2
+                        elif source in ("qr_page", "unknown"):
+                            self.log(
+                                f"[窗口{self.account.game_window_no}] "
+                                f"页面状态={source}，OCR失败，等待后重试"
+                            )
+                            for _ in range(5):
+                                self._ensure_not_stopped()
+                                _time.sleep(0.1)
+                            new_passport2, new_source2 = self._extract_passport_from_login_window()
+                            if new_passport2 is not None:
+                                new_passport = new_passport2
+                                source = new_source2
+                            # 二次OCR仍失败：走手动输入或抛异常
                     elif self.request_passport is not None:
                         new_passport = self.request_passport(self.account)
                 if not new_passport:
+                    if source in ("qr_page", "unknown"):
+                        raise RuntimeError(f"通行证识别失败（页面状态={source}）")
                     raise RuntimeError("未能提取通行证")
-                if passport is not None and new_passport == passport:
-                    raise RuntimeError(
-                        f"登录失败，通行证未刷新 ({passport})，登录程序窗口仍显示QR页面"
-                    )
                 passport = new_passport
                 self.log(f"[窗口{self.account.game_window_no}] 通行证: {passport} (来源={source})")
                 if self.passport_found is not None:
@@ -328,7 +335,12 @@ class AccountRunner:
                 self._ensure_not_stopped()
                 self.update_status(self.account, "打开中")
                 self._vlog("debug", f"[窗口{self.account.game_window_no}] 打开链接: {self.account.url}")
-                from playwright.sync_api import sync_playwright
+                # 临时恢复原始 Popen 让 asyncio 正确子类化，导入后恢复补丁
+                _subprocess.Popen = _original_popen
+                try:
+                    from playwright.sync_api import sync_playwright
+                finally:
+                    _subprocess.Popen = _NoConsolePopen
                 playwright = sync_playwright().start()
                 launcher = getattr(playwright, self.settings.browser)
                 browser = launcher.launch(
@@ -574,11 +586,12 @@ class AccountRunner:
         """OCR 常见混淆字符的候选替换。最多返回 3 个。"""
         swaps = {
             "c": "e", "e": "c",
-            "0": "o", "o": "0",
+            "0": ["o", "c"], "o": "0", "c": ["e", "0"],
             "1": "l", "l": "1",
             "5": "s", "s": "5",
-            "7": "f", "f": "7",
+            "7": "f", "f": ["7", "4"],
             "8": "b", "6": "b", "b": ["8", "6"],
+            "4": "f",
         }
         candidates = []
         for i, ch in enumerate(passport):
@@ -756,10 +769,34 @@ class AccountRunner:
         self._vlog("debug", f"[窗口{self.account.game_window_no}] 后台截图 hwnd={selected.hwnd} title={selected.title}")
         self._vlog("debug", f"[窗口{self.account.game_window_no}] 临时截图已保存: _tmp/{raw_path.name}")
 
+        # === 图像状态判断（不用Tesseract，不依赖OCR） ===
+        state, metrics = self.detect_login_page_state(image)
+        self.log(
+            f"(black={metrics['black_ratio']}, edge={metrics['edge_density']}, var={metrics['local_variance']})"
+        )
+
+        if state == "logged_in":
+            self.log(f"[窗口{self.account.game_window_no}] 检测到已登录界面，跳过")
+            return None, "logged_in"
+
+        if state == "qr_page":
+            self.log(f"[窗口{self.account.game_window_no}] 检测到二维码登录界面")
+            # 聚焦底部文字区域做OCR（QR码密集图案干扰Tesseract全图识别）
+            passport = self._ocr_passport_from_text_region(image, prefix, raw_path)
+            if passport:
+                return passport, "ocr"
+            # 文字区域失败则回退全图OCR
+            passport = self._ocr_passport_from_login_image(image, prefix, raw_path)
+            if passport:
+                return passport, "ocr"
+            self.log(f"[窗口{self.account.game_window_no}] 检测到二维码登录界面，但未能识别通行证，判定失败")
+            return None, "qr_page"
+
+        # unknown: 保守策略，跑OCR
         passport = self._ocr_passport_from_login_image(image, prefix, raw_path)
         if passport:
             return passport, "ocr"
-        return None, ""
+        return None, "unknown"
 
     def _log_iframe_info(self, page) -> None:
         try:
@@ -1071,6 +1108,68 @@ class AccountRunner:
             return "".join(chars)
         return None
 
+    def _ocr_passport_from_text_region(self, raw_image, prefix: str, raw_path: Path) -> str | None:
+        """针对二维码页底部文字区域做OCR（避开QR码密集图案的干扰）。"""
+        import re as _re
+        try:
+            import pytesseract
+            from PIL import Image, ImageOps
+        except Exception as exc:
+            self.log(f"[窗口{self.account.game_window_no}] OCR 依赖不可用: {exc}")
+            return None
+
+        # 裁切底部文字区域（通行证文字在二维码下方）
+        w, h = raw_image.size
+        text_crop = raw_image.crop((10, int(h * 0.65), w - 10, h - 10))
+        regex = self.settings.passport_regex
+        results: dict[str, int] = {}
+
+        for scale in (2, 3, 4):
+            big = text_crop.resize((text_crop.width * scale, text_crop.height * scale), Image.LANCZOS)
+            for psm in (6, 7):
+                try:
+                    text = pytesseract.image_to_string(big, lang="chi_sim+eng", config=f"--psm {psm}")
+                except Exception:
+                    continue
+                # 方式1: 匹配"本次通行证"正则
+                passport = extract_passport_from_text(text, regex)
+                if passport:
+                    hex_val = extract_hex_passport(passport)
+                    if hex_val:
+                        results[hex_val] = results.get(hex_val, 0) + 1
+                # 方式2: 冒号模式双向匹配（hex可能在冒号前或后）
+                for pattern in (r":\s*(\S{7,10})(?:\s|$)", r"(\S{7,10})\s*:"):
+                    m = _re.search(pattern, text)
+                    if m:
+                        hex_val = extract_hex_passport(m.group(1))
+                        if hex_val:
+                            results[hex_val] = results.get(hex_val, 0) + 1
+                # 方式3: 直接在全文搜索hex（兜底）
+                for hex_val in _re.findall(r"[a-f0-9]{8}", text.lower()):
+                    results[hex_val] = results.get(hex_val, 0) + 1
+
+        if not results:
+            return None
+
+        total = sum(results.values())
+        mixed = {k: v for k, v in results.items() if any(c in "abcdef" for c in k)}
+        candidates = mixed if mixed else results
+        best = max(candidates, key=lambda k: candidates[k])
+        best_votes = candidates[best]
+
+        if total < 2 or best_votes * 2 <= total:
+            self.log(
+                f"[窗口{self.account.game_window_no}] 文字区域OCR票数不足"
+                f"（{best}={best_votes}/{total}），回退全图OCR"
+            )
+            return None
+
+        self.log(
+            f"[窗口{self.account.game_window_no}] 文字区域OCR: "
+            f"选择 {best} (票数={best_votes}/{total})"
+        )
+        return best
+
     def _ocr_passport_from_login_image(self, raw_image, prefix: str, raw_path: Path) -> str | None:
         import numpy as np
         try:
@@ -1116,12 +1215,14 @@ class AccountRunner:
                         self.log(f"[窗口{self.account.game_window_no}] 全图OCR成功: {hex_val}")
                         _add_result(hex_val, img.copy())
                 # 方式2: 冒号后捕获宽松文本，走纠错管线
-                m = re.search(r":\s*(\S{7,10})(?:\s|$)", text)
-                if m:
-                    hex_val = extract_hex_passport(m.group(1))
-                    if hex_val:
-                        self.log(f"[窗口{self.account.game_window_no}] 全图OCR成功(冒号模式): {hex_val}")
-                        _add_result(hex_val, img.copy())
+                # OCR 乱码时"本次通行证"可能被识别为乱码，QR检测可提供外部确认
+                if "通行证" in text:
+                    m = re.search(r":\s*(\S{7,10})(?:\s|$)", text)
+                    if m:
+                        hex_val = extract_hex_passport(m.group(1))
+                        if hex_val:
+                            self.log(f"[窗口{self.account.game_window_no}] 全图OCR成功(冒号模式): {hex_val}")
+                            _add_result(hex_val, img.copy())
 
             # 灰度图
             gray = ImageOps.autocontrast(img.convert("L"))
@@ -1141,12 +1242,13 @@ class AccountRunner:
                     if hex_val:
                         self.log(f"[窗口{self.account.game_window_no}] 全图OCR灰度成功: {hex_val}")
                         _add_result(hex_val, gray.copy())
-                m = re.search(r":\s*(\S{7,10})(?:\s|$)", text)
-                if m:
-                    hex_val = extract_hex_passport(m.group(1))
-                    if hex_val:
-                        self.log(f"[窗口{self.account.game_window_no}] 全图OCR灰度成功(冒号模式): {hex_val}")
-                        _add_result(hex_val, gray.copy())
+                if "通行证" in text:
+                    m = re.search(r":\s*(\S{7,10})(?:\s|$)", text)
+                    if m:
+                        hex_val = extract_hex_passport(m.group(1))
+                        if hex_val:
+                            self.log(f"[窗口{self.account.game_window_no}] 全图OCR灰度成功(冒号模式): {hex_val}")
+                            _add_result(hex_val, gray.copy())
 
         if not results:
             self.log(f"[窗口{self.account.game_window_no}] 全图OCR未能识别到8位hex通行证")
@@ -1197,6 +1299,78 @@ class AccountRunner:
             )
         if not matched:
             self.log(f"[窗口{self.account.game_window_no}] 未找到标题匹配当前 page 的系统窗口；截图仍使用 Playwright page.screenshot()")
+
+    def detect_login_page_state(self, image) -> tuple[str, dict]:
+        """用图像特征判断登录程序窗口状态（不用Tesseract，不用QRCodeDetector）。
+
+        返回 (state, metrics)，state ∈ {"qr_page", "logged_in", "unknown"}。
+        """
+        import cv2
+        import numpy as np
+
+        roi = self.settings.login_state_roi  # (left, top, right, bottom)
+        arr = np.array(image.convert("L"))
+        h, w = arr.shape[:2]
+        left = max(0, roi[0])
+        top = max(0, roi[1])
+        right = min(w, roi[2])
+        bottom = min(h, roi[3])
+        roi_arr = arr[top:bottom, left:right]
+        roi_h, roi_w = roi_arr.shape
+
+        # --- 指标1: 黑色像素占比 ---
+        black_pixels = int((roi_arr < 80).sum())
+        total_pixels = roi_w * roi_h
+        black_ratio = black_pixels / max(total_pixels, 1)
+
+        # --- 指标2: 边缘密度 (Sobel) ---
+        grad_x = cv2.Sobel(roi_arr, cv2.CV_64F, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(roi_arr, cv2.CV_64F, 0, 1, ksize=3)
+        edge_mag = np.sqrt(grad_x ** 2 + grad_y ** 2)
+        edge_pixels = int((edge_mag > 60).sum())
+        edge_density = edge_pixels / max(total_pixels, 1)
+
+        # --- 指标3: 局部方差 ---
+        block_size = 20
+        variances = []
+        for by in range(0, roi_h - block_size, block_size):
+            for bx in range(0, roi_w - block_size, block_size):
+                block = roi_arr[by:by + block_size, bx:bx + block_size]
+                variances.append(float(np.var(block)))
+        local_variance = float(np.mean(variances)) if variances else 0.0
+
+        # --- 判定 ---
+        qr_min = self.settings.qr_black_ratio_min
+        qr_edge = self.settings.qr_edge_density_min
+        qr_var = self.settings.qr_variance_min
+        logged_max = self.settings.logged_in_black_ratio_max
+        logged_edge = self.settings.logged_in_edge_density_max
+
+        if black_ratio >= qr_min and edge_density >= qr_edge and local_variance >= qr_var:
+            state = "qr_page"
+        elif black_ratio <= logged_max and edge_density <= logged_edge:
+            state = "logged_in"
+        else:
+            state = "unknown"
+
+        metrics = {
+            "black_ratio": round(black_ratio, 4),
+            "edge_density": round(edge_density, 4),
+            "local_variance": round(local_variance, 1),
+            "roi": roi,
+            "state": state,
+        }
+
+        # --- 调试：保存ROI截图 ---
+        try:
+            debug_dir = app_root() / "debug_ocr"
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            roi_img = image.crop((left, top, right, bottom))
+            roi_img.save(debug_dir / "latest_login_state_roi.png")
+        except Exception:
+            pass
+
+        return state, metrics
 
     def _locate_qr_box(self, image) -> tuple[int, int, int, int] | None:
         import cv2

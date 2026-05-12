@@ -55,10 +55,10 @@ echo   已清理
 echo.
 
 REM ---- PyInstaller 打包 ----
-echo [4/6] PyInstaller 打包（--console 模式，错误可见）
+echo [4/6] PyInstaller 打包（--noconsole 模式）
 pyinstaller ^
     --onedir ^
-    --console ^
+    --noconsole ^
     --name "斗罗大陆H5上号器" ^
     --add-data "automation_settings.json;." ^
     --add-data "debug_ocr\template_passport_btn.png;debug_ocr" ^

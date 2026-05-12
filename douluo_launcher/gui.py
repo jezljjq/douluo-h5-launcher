@@ -14,6 +14,7 @@ from .config import (
     LEVELS,
     STATUSES,
     app_root,
+    project_root,
     filter_accounts,
     find_default_bookmark_file,
     load_accounts_from_bookmarks,
@@ -310,7 +311,7 @@ class LauncherApp(tk.Tk):
 
     def _setup_log_file(self) -> None:
         import time as _time
-        log_dir = app_root() / "logs"
+        log_dir = project_root() / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         ts = _time.strftime("%Y%m%d_%H%M%S")
         self._log_file_path = log_dir / f"run_{ts}.log"
@@ -330,7 +331,7 @@ class LauncherApp(tk.Tk):
 
     def _open_log_dir(self) -> None:
         import os
-        log_dir = str(app_root() / "logs")
+        log_dir = str(project_root() / "logs")
         os.makedirs(log_dir, exist_ok=True)
         os.startfile(log_dir)
 

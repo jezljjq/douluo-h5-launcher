@@ -89,5 +89,11 @@
   "passport_btn_template": "debug_ocr/template_passport_btn.png",
   "passport_btn_viewport": [683, 290],
   "passport_btn_region": [670, 272, 697, 308],
-  "passport_dialog_text": "通行证登录"
+  "passport_dialog_text": "通行证登录",
+  "login_state_roi": [60, 150, 260, 350],
+  "qr_black_ratio_min": 0.35,
+  "qr_edge_density_min": 0.08,
+  "qr_variance_min": 2500.0,
+  "logged_in_black_ratio_max": 0.28,
+  "logged_in_edge_density_max": 0.60
 }

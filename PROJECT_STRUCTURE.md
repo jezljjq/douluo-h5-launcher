@@ -1,6 +1,6 @@
 # 项目结构说明
 
-**日期：2026-05-09**
+**日期：2026-05-13**
 
 ---
 
@@ -10,9 +10,12 @@
 
 - [main.py](main.py) — 程序入口，创建并运行 `LauncherApp`
 - [automation_settings.json](automation_settings.json) — 自动化参数（窗口大小、OCR 参数、点击坐标、Dm 参数）
+- [_cleanup_pending/](_cleanup_pending/) — 归档待清理文件（确认可删除）
+
 ### 工程化
 
 - [scripts/build_exe.bat](scripts/build_exe.bat) — 自动打包脚本（测试→打包→验证）
+- [scripts/test_qr_decode.py](scripts/test_qr_decode.py) — QR 解码验证脚本
 - [requirements.txt](requirements.txt) — Python 依赖
 
 ### 核心业务代码

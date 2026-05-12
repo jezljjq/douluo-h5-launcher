@@ -14,6 +14,9 @@ venv/
 logs/
 *.log
 
+# 调试截图 - 自动生成
+debug_ocr/latest_*
+
 # 调试截图 - 临时和错误现场
 debug_ocr/_tmp/
 debug_ocr/_error/
@@ -22,6 +25,9 @@ debug_ocr/_archive*/
 debug_ocr/browser_pos.json
 debug_ocr/_test_*
 debug_ocr/_debug_*
+
+# 归档待清理
+_cleanup_pending/
 
 # IDE
 .vscode/
