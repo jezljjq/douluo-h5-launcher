@@ -11,6 +11,7 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 from .automation import AccountRunner
 from .config import (
     AccountConfig,
+    CSVAccount,
     LEVELS,
     STATUSES,
     app_root,
@@ -18,6 +19,7 @@ from .config import (
     filter_accounts,
     find_default_bookmark_file,
     load_accounts_from_bookmarks,
+    load_csv_accounts,
     load_settings,
 )
 from .dm_client import diagnose_dm_environment_with_32bit_python
@@ -53,6 +55,11 @@ class LauncherApp(tk.Tk):
         self.max_workers_var = tk.IntVar(value=4)
         self.notice_outside_x_var = tk.DoubleVar(value=0.08)
         self.notice_outside_y_var = tk.DoubleVar(value=0.08)
+        self.method_var = tk.StringVar(value="method1")
+        self.csv_path = tk.StringVar(value="")
+        self.csv_accounts: list[CSVAccount] = []
+        self.csv_status_by_key: dict[str, str] = {}
+        self.csv_passport_by_key: dict[str, str] = {}
 
         self._apply_settings_defaults()
         self._build_widgets()
@@ -81,17 +88,51 @@ class LauncherApp(tk.Tk):
         config_frame.pack(fill=tk.X, pady=(0, 8))
         config_frame.columnconfigure(1, weight=1)
 
-        ttk.Label(config_frame, text="收藏文件", width=12, anchor="e").grid(row=0, column=0, sticky="e", padx=(4, 6), pady=3)
-        ttk.Entry(config_frame, textvariable=self.bookmark_path).grid(row=0, column=1, sticky="ew", padx=4, pady=3)
-        ttk.Button(config_frame, text="选择", width=6, command=self._pick_bookmark_file).grid(row=0, column=2, padx=4, pady=3)
-        ttk.Button(config_frame, text="读取收藏夹", command=self._load_accounts).grid(row=0, column=3, padx=4, pady=3)
+        # 上号方式选择
+        method_row = ttk.Frame(config_frame)
+        method_row.grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 6))
+        ttk.Label(method_row, text="上号方式").pack(side=tk.LEFT, padx=(4, 8))
+        ttk.Radiobutton(method_row, text="方式一：通行证上号", variable=self.method_var, value="method1",
+                        command=self._on_method_changed).pack(side=tk.LEFT, padx=(0, 16))
+        ttk.Radiobutton(method_row, text="方式二：账号密码 + 通行证上号", variable=self.method_var, value="method2",
+                        command=self._on_method_changed).pack(side=tk.LEFT)
 
-        ttk.Label(config_frame, text="根目录名", width=12, anchor="e").grid(row=1, column=0, sticky="e", padx=(4, 6), pady=3)
-        ttk.Entry(config_frame, textvariable=self.bookmark_root_name).grid(row=1, column=1, sticky="ew", padx=4, pady=3)
+        # 方式一控件（收藏夹相关）
+        self._method1_row1 = ttk.Label(config_frame, text="收藏文件", width=12, anchor="e")
+        self._method1_row1.grid(row=1, column=0, sticky="e", padx=(4, 6), pady=3)
+        self._method1_bookmark_entry = ttk.Entry(config_frame, textvariable=self.bookmark_path)
+        self._method1_bookmark_entry.grid(row=1, column=1, sticky="ew", padx=4, pady=3)
+        self._method1_btn_pick = ttk.Button(config_frame, text="选择", width=6, command=self._pick_bookmark_file)
+        self._method1_btn_pick.grid(row=1, column=2, padx=4, pady=3)
+        self._method1_btn_load = ttk.Button(config_frame, text="读取收藏夹", command=self._load_accounts)
+        self._method1_btn_load.grid(row=1, column=3, padx=4, pady=3)
 
-        ttk.Label(config_frame, text="自动化设置", width=12, anchor="e").grid(row=2, column=0, sticky="e", padx=(4, 6), pady=3)
-        ttk.Entry(config_frame, textvariable=self.settings_path).grid(row=2, column=1, sticky="ew", padx=4, pady=3)
-        ttk.Button(config_frame, text="选择", width=6, command=self._pick_settings).grid(row=2, column=2, padx=4, pady=3)
+        self._method1_row2a = ttk.Label(config_frame, text="根目录名", width=12, anchor="e")
+        self._method1_row2a.grid(row=2, column=0, sticky="e", padx=(4, 6), pady=3)
+        self._method1_root_entry = ttk.Entry(config_frame, textvariable=self.bookmark_root_name)
+        self._method1_root_entry.grid(row=2, column=1, sticky="ew", padx=4, pady=3)
+
+        self._method1_row3a = ttk.Label(config_frame, text="自动化设置", width=12, anchor="e")
+        self._method1_row3a.grid(row=3, column=0, sticky="e", padx=(4, 6), pady=3)
+        self._method1_settings_entry = ttk.Entry(config_frame, textvariable=self.settings_path)
+        self._method1_settings_entry.grid(row=3, column=1, sticky="ew", padx=4, pady=3)
+        self._method1_btn_settings = ttk.Button(config_frame, text="选择", width=6, command=self._pick_settings)
+        self._method1_btn_settings.grid(row=3, column=2, padx=4, pady=3)
+
+        # 方式二控件（CSV 导入）
+        self._method2_row1 = ttk.Label(config_frame, text="CSV文件", width=12, anchor="e")
+        self._method2_csv_entry = ttk.Entry(config_frame, textvariable=self.csv_path)
+        self._method2_btn_pick = ttk.Button(config_frame, text="选择", width=6, command=self._pick_csv_file)
+        self._method2_btn_import = ttk.Button(config_frame, text="导入CSV", command=self._import_csv)
+        # 方式二控件网格位置（初始隐藏）
+        self._method2_row1.grid(row=1, column=0, sticky="e", padx=(4, 6), pady=3)
+        self._method2_csv_entry.grid(row=1, column=1, sticky="ew", padx=4, pady=3)
+        self._method2_btn_pick.grid(row=1, column=2, padx=4, pady=3)
+        self._method2_btn_import.grid(row=1, column=3, padx=4, pady=3)
+        self._method2_row1.grid_remove()
+        self._method2_csv_entry.grid_remove()
+        self._method2_btn_pick.grid_remove()
+        self._method2_btn_import.grid_remove()
 
         # ===== 2. 运行区 =====
         run_frame = ttk.LabelFrame(root, text="运行", padding=6)
@@ -145,12 +186,10 @@ class LauncherApp(tk.Tk):
                                              command=self._toggle_debug)
         self._debug_toggle_btn.pack(anchor="w", pady=(0, 4))
 
-        # ===== 4. 账号列表区 =====
-        table_outer = ttk.LabelFrame(root, text="账号列表", padding=2)
-        table_outer.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
-
+        # ===== 4. 账号列表区（方式一） =====
+        self._table_frame_m1 = ttk.LabelFrame(root, text="账号列表（方式一）", padding=2)
         columns = ("level", "bookmark", "window", "passport", "url", "status")
-        self.tree = ttk.Treeview(table_outer, columns=columns, show="headings", height=10)
+        self.tree = ttk.Treeview(self._table_frame_m1, columns=columns, show="headings", height=10)
         self.tree.heading("level", text="层级")
         self.tree.heading("bookmark", text="收藏编号")
         self.tree.heading("window", text="窗口号")
@@ -164,7 +203,7 @@ class LauncherApp(tk.Tk):
         self.tree.column("url", width=500)
         self.tree.column("status", width=130, anchor=tk.CENTER)
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar = ttk.Scrollbar(table_outer, command=self.tree.yview)
+        scrollbar = ttk.Scrollbar(self._table_frame_m1, command=self.tree.yview)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.tree.configure(yscrollcommand=scrollbar.set)
 
@@ -173,6 +212,38 @@ class LauncherApp(tk.Tk):
         self.tree.tag_configure("failed", foreground="#cc0000")
         self.tree.tag_configure("retry", foreground="#cc6600")
         self.tree.tag_configure("skip", foreground="#888888")
+
+        # ===== 4b. 账号列表区（方式二） =====
+        self._table_frame_m2 = ttk.LabelFrame(root, text="CSV账号列表（方式二）", padding=2)
+        csv_columns = ("name", "url", "username", "password_status", "window", "passport", "status")
+        self.csv_tree = ttk.Treeview(self._table_frame_m2, columns=csv_columns, show="headings", height=10)
+        self.csv_tree.heading("name", text="名称")
+        self.csv_tree.heading("url", text="链接")
+        self.csv_tree.heading("username", text="账号")
+        self.csv_tree.heading("password_status", text="密码")
+        self.csv_tree.heading("window", text="窗口号")
+        self.csv_tree.heading("passport", text="本次通行证")
+        self.csv_tree.heading("status", text="状态")
+        self.csv_tree.column("name", width=100)
+        self.csv_tree.column("url", width=280)
+        self.csv_tree.column("username", width=100, anchor=tk.CENTER)
+        self.csv_tree.column("password_status", width=60, anchor=tk.CENTER)
+        self.csv_tree.column("window", width=60, anchor=tk.CENTER)
+        self.csv_tree.column("passport", width=110, anchor=tk.CENTER)
+        self.csv_tree.column("status", width=100, anchor=tk.CENTER)
+        self.csv_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        csv_scrollbar = ttk.Scrollbar(self._table_frame_m2, command=self.csv_tree.yview)
+        csv_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.csv_tree.configure(yscrollcommand=csv_scrollbar.set)
+
+        self.csv_tree.tag_configure("running", foreground="#0066cc")
+        self.csv_tree.tag_configure("success", foreground="#008800")
+        self.csv_tree.tag_configure("failed", foreground="#cc0000")
+        self.csv_tree.tag_configure("retry", foreground="#cc6600")
+        self.csv_tree.tag_configure("skip", foreground="#888888")
+
+        # 初始显示方式一表格
+        self._table_frame_m1.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
 
         # ===== 5. 日志区 =====
         log_outer = ttk.LabelFrame(root, text="日志", padding=2)
@@ -235,6 +306,76 @@ class LauncherApp(tk.Tk):
             messagebox.showerror("读取收藏夹失败", str(exc))
             self._log(f"读取收藏夹失败: {exc}")
 
+    # ===== 方式二：CSV 导入 =====
+
+    def _on_method_changed(self) -> None:
+        mode = self.method_var.get()
+        is_m1 = (mode == "method1")
+        # 方式一控件
+        for w in (self._method1_row1, self._method1_bookmark_entry, self._method1_btn_pick,
+                  self._method1_btn_load, self._method1_row2a, self._method1_root_entry,
+                  self._method1_row3a, self._method1_settings_entry, self._method1_btn_settings):
+            w.grid() if is_m1 else w.grid_remove()
+        # 方式二控件
+        for w in (self._method2_row1, self._method2_csv_entry, self._method2_btn_pick,
+                  self._method2_btn_import):
+            w.grid() if not is_m1 else w.grid_remove()
+        # 表格
+        if is_m1:
+            self._table_frame_m2.pack_forget()
+            self._table_frame_m1.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+        else:
+            self._table_frame_m1.pack_forget()
+            self._table_frame_m2.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+        # 账号下拉框
+        if is_m1:
+            self._refresh_account_choices()
+
+    def _pick_csv_file(self) -> None:
+        path = filedialog.askopenfilename(
+            title="选择CSV文件",
+            filetypes=[("CSV文件", "*.csv"), ("所有文件", "*.*")],
+        )
+        if path:
+            self.csv_path.set(path)
+
+    def _import_csv(self) -> None:
+        path = self.csv_path.get().strip()
+        if not path:
+            messagebox.showwarning("提示", "请先选择CSV文件")
+            return
+        accounts, error = load_csv_accounts(path)
+        if error:
+            messagebox.showerror("导入失败", error)
+            self._log(f"CSV导入失败: {error}")
+            return
+        self.csv_accounts = accounts
+        self.csv_status_by_key = {a.key: a.status for a in accounts}
+        self.csv_passport_by_key = {a.key: a.passport for a in accounts}
+        self._refresh_csv_table()
+        valid_count = sum(1 for a in accounts if "配置缺失" not in a.status)
+        self._log(f"已从CSV导入 {len(accounts)} 个账号（有效 {valid_count} 个）。")
+
+    def _refresh_csv_table(self) -> None:
+        for item in self.csv_tree.get_children():
+            self.csv_tree.delete(item)
+        for acc in self.csv_accounts:
+            pwd_display = "已填写" if acc.password else "未填写"
+            self.csv_tree.insert(
+                "",
+                tk.END,
+                iid=acc.key,
+                values=(
+                    acc.name,
+                    acc.url,
+                    acc.username,
+                    pwd_display,
+                    acc.game_window_no,
+                    self.csv_passport_by_key.get(acc.key, acc.passport),
+                    self.csv_status_by_key.get(acc.key, acc.status),
+                ),
+            )
+
     def _refresh_table(self) -> None:
         for item in self.tree.get_children():
             self.tree.delete(item)
@@ -266,6 +407,9 @@ class LauncherApp(tk.Tk):
         self._start_run([account])
 
     def _run_selected_account(self) -> None:
+        if self.method_var.get() == "method2":
+            self._run_method2_single()
+            return
         account = self._selected_account()
         if account is None:
             messagebox.showwarning("未选择账号", "请先在表格或下拉框中选择一个账号。")
@@ -289,11 +433,89 @@ class LauncherApp(tk.Tk):
         self._start_serial_run(accounts)
 
     def _run_all_serial(self) -> None:
+        if self.method_var.get() == "method2":
+            self._run_method2_all()
+            return
         if not self.accounts:
             messagebox.showwarning("无账号", "请先读取收藏夹。")
             return
         self._log(f"全部串行: 共 {len(self.accounts)} 个账号，严格逐个执行。")
         self._start_serial_run(self.accounts)
+
+    # ===== 方式二运行 =====
+
+    def _run_method2_single(self) -> None:
+        """方式二：单账号测试（阶段3：只测账号密码登录）"""
+        if not self.csv_accounts:
+            messagebox.showwarning("无账号", "请先导入CSV文件。")
+            return
+        # 取 CSV 列表中第一个有效账号
+        valid = [a for a in self.csv_accounts if "配置缺失" not in a.status]
+        if not valid:
+            messagebox.showwarning("无有效账号", "CSV中没有有效的账号。")
+            return
+        acc = valid[0]
+        self._log(f"[方式二] 单账号测试: {acc.display_name}")
+        self._start_method2_run(acc)
+
+    def _run_method2_all(self) -> None:
+        """方式二：CSV列表串行（阶段5实现）"""
+        messagebox.showinfo("提示", "方式二全部串行将在阶段5实现")
+
+    def _start_method2_run(self, csv_account: CSVAccount) -> None:
+        """在后台线程执行方式二单账号登录。"""
+        if self.worker_thread is not None and self.worker_thread.is_alive():
+            messagebox.showwarning("任务进行中", "当前有任务正在执行。")
+            return
+        self._setup_log_file()
+        self.stop_event.clear()
+        self.csv_status_by_key[csv_account.key] = "OCR中"
+        self._refresh_csv_table()
+
+        def _run():
+            try:
+                settings = load_settings(self.settings_path.get())
+            except Exception as exc:
+                self._queue_log(f"[方式二] 读取设置失败: {exc}")
+                self._queue_status_csv(csv_account, "失败")
+                return
+            from .config import AccountConfig as _AC
+            runner = AccountRunner(
+                account=_AC(level="方式二", bookmark_no=0, game_window_no=csv_account.game_window_no, url=csv_account.url),
+                settings=settings,
+                stop_event=self.stop_event,
+                log=self._queue_log,
+                update_status=lambda a, s: self._queue_status_csv(csv_account, s),
+                request_passport=lambda a: self._request_passport(a),
+            )
+            result = runner.run_method2(csv_account)
+            self._queue_status_csv(csv_account, "成功" if result else "失败")
+            self.ui_queue.put(("status_bar", "就绪"))
+            self.worker_thread = None
+            if self._log_file:
+                self._log_file.close()
+                self._log_file = None
+
+        self.worker_thread = threading.Thread(target=_run, daemon=True)
+        self.worker_thread.start()
+
+    def _queue_status_csv(self, account: CSVAccount, status: str) -> None:
+        self.csv_status_by_key[account.key] = status
+        self.ui_queue.put(("csv_status", (account, status)))
+
+    def _set_csv_status(self, account: CSVAccount, status: str) -> None:
+        self.csv_status_by_key[account.key] = status
+        if self.csv_tree.exists(account.key):
+            values = list(self.csv_tree.item(account.key, "values"))
+            values[-1] = status
+            tag = ""
+            if "成功" in status:
+                tag = "success"
+            elif "失败" in status:
+                tag = "failed"
+            elif status not in ("未开始",):
+                tag = "running"
+            self.csv_tree.item(account.key, values=values, tags=(tag,))
 
     def _run_first_account_dm_test(self) -> None:
         messagebox.showinfo("已暂停", "当前不执行大漠点击流程，只测试大漠环境是否可用。")
@@ -571,6 +793,9 @@ print("RESULT:" + str(flow_result), flush=True)
                     parent=self,
                 )
                 done.set()
+            elif kind == "csv_status":
+                account, status = payload
+                self._set_csv_status(account, status)
         self.after(100, self._drain_ui_queue)
 
     def _set_status(self, account: AccountConfig, status: str) -> None:

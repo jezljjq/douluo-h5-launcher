@@ -51,6 +51,34 @@ class AccountConfig:
         return f"{self.level}-{self.bookmark_no} → 窗口{self.game_window_no}"
 
 
+@dataclass
+class CSVAccount:
+    """方式二：账号密码 + 通行证上号 的账号数据。
+
+    password 仅存在内存中，禁止打印日志、写入文件、传入子进程。
+    """
+    name: str
+    url: str
+    username: str
+    password: str
+    game_window_no: int
+    passport: str = ""
+    status: str = "未开始"
+
+    @property
+    def key(self) -> str:
+        return self.name
+
+    @property
+    def display_name(self) -> str:
+        return f"{self.name} → 窗口{self.game_window_no}"
+
+    def __repr__(self) -> str:
+        return (f"CSVAccount(name={self.name!r}, url={self.url!r}, "
+                f"username={self.username!r}, password='***', "
+                f"game_window_no={self.game_window_no})")
+
+
 @dataclass(frozen=True)
 class AutomationSettings:
     bookmark_file: str = ""
@@ -354,4 +382,62 @@ def _parse_bookmark_no(name: str) -> int | None:
     number = int(normalized)
     if 1 <= number <= 8:
         return number
+
+
+def load_csv_accounts(path: str | Path) -> tuple[list[CSVAccount], str | None]:
+    """从 CSV 文件加载方式二账号列表。
+
+    CSV 表头必须为: name,url,username,password
+    行号 = game_window_no（第1行→窗口1）。
+
+    返回 (accounts, error_message)。成功时 error_message 为 None。
+    """
+    path = Path(path)
+    if not path.exists():
+        return [], f"文件不存在: {path}"
+
+    # 尝试常见编码（Windows 中文环境常用 GBK）
+    for encoding in ("utf-8-sig", "gbk", "gb2312", "utf-8"):
+        try:
+            with path.open("r", encoding=encoding, newline="") as f:
+                reader = csv.DictReader(f)
+                fieldnames = reader.fieldnames
+                if fieldnames is None:
+                    return [], "CSV文件为空"
+                expected = ["name", "url", "username", "password"]
+                actual = [h.strip().lower() for h in fieldnames]
+                if actual != expected:
+                    return [], (
+                        "CSV格式错误，第一行必须是 name,url,username,password\n"
+                        f"当前表头: {', '.join(fieldnames)}"
+                    )
+                accounts: list[CSVAccount] = []
+                for idx, row in enumerate(reader, start=1):
+                    name = (row.get("name") or "").strip()
+                    url = (row.get("url") or "").strip()
+                    username = (row.get("username") or "").strip()
+                    password = (row.get("password") or "").strip()
+                    if not name:
+                        continue
+                    missing = []
+                    if not username:
+                        missing.append("username")
+                    if not password:
+                        missing.append("password")
+                    if missing:
+                        accounts.append(CSVAccount(
+                            name=name, url=url, username=username, password=password,
+                            game_window_no=idx, status=f"配置缺失: {', '.join(missing)}"
+                        ))
+                    else:
+                        accounts.append(CSVAccount(
+                            name=name, url=url, username=username, password=password,
+                            game_window_no=idx
+                        ))
+                return accounts, None
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+        except Exception as exc:
+            return [], f"读取CSV失败: {exc}"
+    return [], "CSV编码无法识别，请保存为 UTF-8 或 GBK 编码"
     return None

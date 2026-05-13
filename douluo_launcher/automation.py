@@ -75,6 +75,7 @@ def _preview_text(text: str, limit: int) -> str:
 class AccountRunner:
     # 坐标缓存（类级别，同尺寸窗口共享）
     _cached_btn: tuple[int, int] | None = None
+    _cached_btn_m2: tuple[int, int] | None = None  # 方式二独立缓存
     _cached_input: tuple[int, int] | None = None
     _cached_confirm: tuple[int, int] | None = None
     _cached_window_size: tuple[int, int] | None = None
@@ -550,6 +551,303 @@ class AccountRunner:
                         try: playwright.stop()
                         except Exception: pass
         self._clean_tmp()
+        return False
+
+    # ===== 方式二：账号密码 + 通行证上号 =====
+
+    def run_method2(self, csv_account) -> bool:
+        """方式二入口：账号密码登录 + 通行证上号。"""
+        from .config import AccountConfig
+        _saved_account = self.account
+        self.account = AccountConfig(
+            level="方式二", bookmark_no=0,
+            game_window_no=csv_account.game_window_no, url=csv_account.url
+        )
+
+        playwright = None
+        browser = None
+        try:
+            # === 步骤1：OCR 提取通行证 ===
+            self._ensure_not_stopped()
+            self.update_status(self.account, "OCR中")
+            self.log(f"[方式二] 从登录程序窗口提取通行证 (窗口{csv_account.game_window_no})")
+            passport, source = self._extract_passport_from_login_window()
+            if not passport:
+                if source == "logged_in":
+                    self.update_status(self.account, "已登录，跳过")
+                    self.log("[方式二] 检测到已登录界面，跳过")
+                    return True
+                # 二次确认
+                time.sleep(0.5)
+                passport2, source2 = self._extract_passport_from_login_window()
+                if passport2:
+                    passport = passport2
+                    source = source2
+                elif source2 == "logged_in":
+                    self.update_status(self.account, "已登录，跳过")
+                    return True
+            if not passport:
+                if self.request_passport is not None:
+                    passport = self.request_passport(self.account)
+            if not passport:
+                raise RuntimeError(f"通行证识别失败（页面状态={source}）")
+            self.log(f"[方式二] 通行证: {passport} (来源=OCR/manual)")
+            self.update_status(self.account, "已提取通行证")
+
+            # === 步骤2：打开浏览器 + 账号密码登录 ===
+            self.update_status(self.account, "打开中")
+            self.log(f"[方式二] 打开链接: {csv_account.url}")
+            _subprocess.Popen = _original_popen
+            try:
+                from playwright.sync_api import sync_playwright
+            finally:
+                _subprocess.Popen = _NoConsolePopen
+
+            playwright = sync_playwright().start()
+            launcher = getattr(playwright, self.settings.browser)
+            browser = launcher.launch(
+                headless=False,
+                args=[
+                    f"--window-size={self.settings.window_width},{self.settings.window_height}",
+                    "--window-position=100,100",
+                ],
+            )
+            page = browser.new_page(
+                viewport={"width": self.settings.window_width, "height": self.settings.window_height}
+            )
+            page.goto(csv_account.url, wait_until="domcontentloaded", timeout=self.settings.page_load_timeout_ms)
+            self.log(f"[方式二] 页面已打开: {page.title}")
+
+            if not self._detect_login_form(page):
+                raise RuntimeError("未检测到账号密码登录界面")
+            self.update_status(self.account, "输入中")
+            self._fill_and_submit_login(page, csv_account.username, csv_account.password)
+            self.log(f"[方式二] 账号密码已提交 (username={csv_account.username}, password=已填写)")
+
+            if not self._wait_game_page_ready(page):
+                raise RuntimeError("登录后未进入正式游戏页")
+            self.log("[方式二] 已进入游戏页面")
+
+            # === 步骤3：关闭公告（多点几次确保公告消失） ===
+            self.update_status(self.account, "关闭公告")
+            for _ in range(4):
+                page.mouse.click(740, 680)
+                self._wait_or_stop(page, 150)
+                # 也尝试点 canvas 中央关公告
+                page.mouse.click(480, 360)
+                self._wait_or_stop(page, 100)
+            self._wait_or_stop(page, 300)
+            self.update_status(self.account, "已关闭公告")
+            self.log("[方式二] 公告已关闭")
+            self._wait_or_stop(page, self.settings.after_notice_wait_ms)
+            self._ensure_not_stopped()
+
+            # === 步骤4+5+6：按钮+输入+确认（方式二独立模板匹配，不套用方式一坐标） ===
+            browser_hwnd = self._find_game_browser_window()
+            if browser_hwnd is None:
+                raise RuntimeError("未找到浏览器窗口")
+            self._write_browser_pos(browser_hwnd)
+
+            cache_key = (self.settings.window_width, self.settings.window_height)
+            # 方式二通行证按钮位置不同，必须独立模板匹配
+            if AccountRunner._cached_window_size == cache_key and AccountRunner._cached_btn_m2:
+                btn_pos = AccountRunner._cached_btn_m2
+                self.log(f"[方式二] 使用方式二缓存按钮坐标: {btn_pos}")
+            else:
+                _client = self._capture_browser_client(browser_hwnd, "m2_button_match.png")
+                # 保存方式二浏览器截图供手动分析（不清理）
+                try:
+                    _ref_path = self._debug_dir / "m2_browser_screenshot.png"
+                    _client.save(str(_ref_path))
+                    self.log(f"[方式二] 浏览器截图已保存: {_ref_path}")
+                except Exception:
+                    pass
+                btn_pos = self._locate_passport_button(_client, use_fallback=False)
+                if btn_pos:
+                    AccountRunner._cached_btn_m2 = btn_pos
+                    AccountRunner._cached_window_size = cache_key
+                    self.log(f"[方式二] 模板匹配定位按钮: {btn_pos}（已缓存到方式二）")
+                else:
+                    raise RuntimeError("方式二通行证按钮模板匹配失败，请检查模板文件")
+            btn_vx, btn_vy = btn_pos
+
+            if AccountRunner._cached_input and AccountRunner._cached_window_size == cache_key:
+                input_x, input_y = AccountRunner._cached_input
+            else:
+                input_x = int(self.settings.window_width * self.settings.passport_input_ratio[0])
+                input_y = int(self.settings.window_height * self.settings.passport_input_ratio[1])
+            if AccountRunner._cached_confirm and AccountRunner._cached_window_size == cache_key:
+                confirm_x, confirm_y = AccountRunner._cached_confirm
+            else:
+                confirm_x = int(self.settings.window_width * self.settings.confirm_button_ratio[0])
+                confirm_y = int(self.settings.window_height * self.settings.confirm_button_ratio[1])
+
+            self.update_status(self.account, "输入中")
+            self.log(f"[方式二] 输入通行证并点击确认: {passport}")
+            if not self._dm_chain(
+                [f"click,{btn_vx},{btn_vy},100",
+                 "wait,1000",
+                 f"click,{input_x},{input_y},80",
+                 f"type,{passport}",
+                 f"click,{confirm_x},{confirm_y},100"],
+                "按钮+输入+确认"
+            ):
+                raise RuntimeError("Dm 按钮+输入+确认失败")
+            self.update_status(self.account, "已输入通行证")
+            self.log("[方式二] 输入+确认完成（Dm 合并调用）")
+
+            # === 步骤7：校验 ===
+            self.log("[方式二] 校验登录程序窗口：检测QR页面是否消失")
+            verified_success = False
+            _verify_deadline = time.perf_counter() + 10.0
+            _poll = 0
+            while time.perf_counter() < _verify_deadline:
+                self._ensure_not_stopped()
+                time.sleep(0.2)
+                state = self._quick_login_state()
+                if state == "logged_in":
+                    verified_success = True
+                    break
+                if _poll >= 5 and _poll % 15 == 0 and state == "qr_page":
+                    p_after, _ = self._extract_passport_from_login_window()
+                    if p_after is not None and p_after != passport:
+                        break
+                _poll += 1
+
+            if verified_success:
+                self.update_status(self.account, "成功")
+                self.log("[方式二] 登录成功（QR码消失）")
+                self._clean_tmp()
+                return True
+            raise RuntimeError("校验超时，QR页面未消失")
+
+        except Exception as exc:
+            self.update_status(self.account, "失败")
+            self.log(f"[方式二] 失败: {exc}")
+            self._save_error_snapshots()
+            return False
+        finally:
+            self.account = _saved_account
+            time.sleep(3)
+            if browser is not None:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+            if playwright is not None:
+                try:
+                    playwright.stop()
+                except Exception:
+                    pass
+
+    def _detect_login_form(self, page) -> bool:
+        """检测页面是否包含账号密码登录表单。返回 True/False。"""
+        import time as _time
+        deadline = _time.perf_counter() + 15
+        while _time.perf_counter() < deadline:
+            self._ensure_not_stopped()
+            try:
+                # 至少有一个 password 输入框才算登录表单
+                pwd_count = page.locator("input[type=password]").count()
+                if pwd_count > 0:
+                    return True
+                # 也尝试常见的选择器
+                if page.locator("input[name=password]").count() > 0:
+                    return True
+            except Exception:
+                pass
+            _time.sleep(0.5)
+        return False
+
+    def _fill_and_submit_login(self, page, username: str, password: str) -> None:
+        """填写登录表单并提交。password 仅内存使用，不打印日志。
+
+        页面结构：白色面板，placeholder"账号"/"密码"，右侧橙色"立即登录"按钮。
+        """
+        import time as _time
+
+        # 1. 定位账号输入框（placeholder="账号" 或页面第一个可见文本input）
+        username_input = None
+        try:
+            username_input = page.get_by_placeholder("账号").first
+        except Exception:
+            pass
+        if username_input is None:
+            try:
+                username_input = page.locator("input:visible").first
+            except Exception:
+                pass
+        if username_input is None:
+            raise RuntimeError("账号输入框未找到")
+        username_input.click()
+        _time.sleep(0.15)
+        username_input.fill(username)
+        self.log(f"[方式二] 账号已输入 (username={username})")
+
+        # 2. 定位密码输入框（placeholder="密码" 或 input[type=password]）
+        password_input = None
+        try:
+            password_input = page.get_by_placeholder("密码").first
+        except Exception:
+            pass
+        if password_input is None:
+            try:
+                password_input = page.locator("input[type=password]").first
+            except Exception:
+                pass
+        if password_input is None:
+            raise RuntimeError("密码输入框未找到")
+        password_input.click()
+        _time.sleep(0.15)
+        password_input.fill(password)
+        self.log("[方式二] 密码已输入 (password=已填写)")
+
+        # 3. 点击"立即登录"按钮（右侧橙色按钮，不要点"手机注册"）
+        _time.sleep(0.2)
+        login_btn = None
+        # 优先精确匹配"立即登录"文本
+        try:
+            login_btn = page.get_by_text("立即登录", exact=True).first
+        except Exception:
+            pass
+        if login_btn is None:
+            # 备选：包含"登录"但不包含"注册"的按钮
+            try:
+                buttons = page.locator("button, a, span, div")
+                count = buttons.count()
+                for i in range(min(count, 50)):
+                    btn = buttons.nth(i)
+                    try:
+                        text = (btn.inner_text() or "").strip()
+                    except Exception:
+                        continue
+                    if "立即登录" in text and "注册" not in text:
+                        login_btn = btn
+                        break
+            except Exception:
+                pass
+        if login_btn is None:
+            raise RuntimeError("未找到\"立即登录\"按钮")
+        login_btn.click()
+        self.log("[方式二] 已点击\"立即登录\"")
+
+    def _wait_game_page_ready(self, page) -> bool:
+        """等待登录成功后进入正式游戏页。返回 True/False。"""
+        import time as _time
+        deadline = _time.perf_counter() + 30
+        while _time.perf_counter() < deadline:
+            self._ensure_not_stopped()
+            try:
+                # 检测游戏 canvas 或页面变化
+                if page.locator("canvas").count() > 0:
+                    return True
+                # URL 不再包含 login 字样
+                url = page.url
+                if "login" not in url.lower():
+                    return True
+            except Exception:
+                pass
+            _time.sleep(0.5)
         return False
 
     _LOG_LEVELS = {"quiet": 0, "normal": 1, "debug": 2}
@@ -1643,8 +1941,8 @@ class AccountRunner:
             win32gui.SetForegroundWindow(browser_hwnd)
         except Exception:
             pass
-        import time as _t
-        _t.sleep(0.1)
+        import time as _t2
+        _t2.sleep(0.1)
 
         full = capture_window_background(window).convert("RGB")
         if render_rect is not None:
@@ -1935,7 +2233,7 @@ class AccountRunner:
             )
         return center
 
-    def _locate_passport_button(self, screenshot) -> tuple[int, int] | None:
+    def _locate_passport_button(self, screenshot, use_fallback: bool = True) -> tuple[int, int] | None:
         """模板匹配定位通行证按钮，返回 viewport 中心坐标 (vx, vy) 或 None"""
         template_path = app_root() / self.settings.passport_btn_template
         if not template_path.exists():
@@ -1950,18 +2248,25 @@ class AccountRunner:
             return None
         result = cv2.matchTemplate(screen_arr, template, cv2.TM_CCOEFF_NORMED)
         _, max_val, _, max_loc = cv2.minMaxLoc(result)
-        if max_val < 0.6:
-            self.log(
-                f"[窗口{self.account.game_window_no}] 模板匹配得分过低: {max_val:.3f}，"
-                f"回退已知坐标"
-            )
-            known = self.settings.passport_btn_viewport
-            if known and known[0] > 0:
-                return (known[0], known[1])
-            return None
         th, tw = template.shape[:2]
         center_x = max_loc[0] + tw // 2
         center_y = max_loc[1] + th // 2
+        if max_val < 0.6:
+            self.log(
+                f"[窗口{self.account.game_window_no}] 模板匹配得分偏低: {max_val:.3f}"
+            )
+            if use_fallback:
+                self.log(f"[窗口{self.account.game_window_no}] 回退已知坐标")
+                known = self.settings.passport_btn_viewport
+                if known and known[0] > 0:
+                    return (known[0], known[1])
+                return None
+            # 不用回退时，返回最佳匹配位置（低分也比错误坐标强）
+            self.log(
+                f"[窗口{self.account.game_window_no}] 使用最佳匹配位置: "
+                f"({center_x},{center_y})"
+            )
+            return (center_x, center_y)
         self.log(
             f"[窗口{self.account.game_window_no}] 模板匹配成功: "
             f"({center_x},{center_y}) score={max_val:.3f}"

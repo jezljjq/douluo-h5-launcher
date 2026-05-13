@@ -38,3 +38,5 @@ _cleanup_pending/
 credentials*
 *secret*
 密码.csv
+*密码*.csv
+debug_ocr/m2_browser_screenshot.png
