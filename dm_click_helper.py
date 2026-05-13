@@ -69,6 +69,9 @@ if len(sys.argv) >= 2 and sys.argv[1] == "chain":
             r = _do_click(parts[1], parts[2], parts[3] if len(parts) > 3 else 120)
         elif parts[0] == "type":
             r = _do_type(parts[1])
+        elif parts[0] == "wait":
+            time.sleep(max(0, int(parts[1])) / 1000)
+            r = f"wait({parts[1]}ms)"
         else:
             r = f"unknown:{step}"
         results.append(r)

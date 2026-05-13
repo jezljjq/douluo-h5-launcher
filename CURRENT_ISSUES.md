@@ -8,22 +8,24 @@
 
 ### 优化成果
 
-单账号 QR 登录耗时从 ~17.8s → 10.5s → **7.5s**（-58%）。
+单账号 QR 登录耗时从 ~17.8s → 10.5s → **7.5s**（-58%，warm start）。冷启动 ~9.5s。
 
 | 步骤 | 优化前 | 优化后 | 手段 |
 |------|--------|--------|------|
 | 打开页面 | 2.9s | 0.9s | canvas 轮询替代固定 2s 等待 |
 | 关闭公告 | 1.3s | 0.6s | 减少固定 sleep |
-| 点击按钮 | 2.5s | 1.9s | 视觉优先弹窗检测 + hold/轮询压缩 |
-| 输入 | 2.4s | 2.3s | hold 值下调（Dm 子进程硬约束） |
-| 校验 | 0.2s | 0.4s | 快速状态检测 + 10s 时间预算 |
+| 点击+输入 | 2.5+2.4=4.9s | 4.1s | Dm 合并链式调用（按钮+输入一次子进程） |
+| 校验 | 0.2s | 0.2-0.4s | 快速状态检测 + 10s 时间预算 |
 
 ### 关键改动
-- `_quick_login_state()`：仅截图+图像特征，不做 OCR，用于校验轮询
-- `_is_passport_dialog_visible_by_ocr`：视觉检测在前，OCR 兜底在后
-- `run_game_flow()` 校验循环：前 1s 不跑 OCR，之后每 3s 一次
-- `after_goto_wait_ms` 2s 固定等待改为 canvas 元素轮询
-- OCR 票数阈值保持 >50%（低票数走手动输入，不用错误值登录）
+- `dm_click_helper.py` 链式调用支持 `wait` 步骤
+- 按钮点击+输入合并为一次 `_dm_chain` 调用（省一次 32位Python 子进程启动）
+- `detect_login_page_state`：else 分支改为 `logged_in`（非二维码即已登录）
+- `_quick_login_state()`：仅截图+图像特征，不做 OCR
+- `_is_passport_dialog_visible_by_ocr`：视觉检测在前 + gray_ratio<0.10 快速排除
+- `passport_btn_viewport` 回退坐标修正为 `(683,234)`
+- `passport_input_ratio` / `confirm_button_ratio` 根据实际位置校准
+- OCR 失败二次确认后弹窗手动输入（首次失败也会触发）
 
 ---
 
