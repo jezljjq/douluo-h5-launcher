@@ -47,9 +47,15 @@ def _do_click(vx, vy, hold_ms):
 
 
 def _do_type(text):
-    import subprocess as _sp
-    _sp.run(["clip"], input=str(text), text=True, creationflags=_sp.CREATE_NO_WINDOW)
-    time.sleep(0.08)
+    # 用 win32clipboard 直接设置剪贴板（避免 clip.exe 编码问题）
+    import win32clipboard
+    win32clipboard.OpenClipboard()
+    try:
+        win32clipboard.EmptyClipboard()
+        win32clipboard.SetClipboardText(str(text), win32clipboard.CF_UNICODETEXT)
+    finally:
+        win32clipboard.CloseClipboard()
+    time.sleep(0.10)
     dm.KeyDown(17)
     time.sleep(0.03)
     dm.KeyPress(86)

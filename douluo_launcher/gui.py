@@ -421,6 +421,9 @@ class LauncherApp(tk.Tk):
         self._start_serial_run([account])
 
     def _run_level_serial(self) -> None:
+        if self.method_var.get() == "method2":
+            messagebox.showinfo("提示", "方式二没有层级概念，请使用\"单账号运行\"或\"全部串行\"。")
+            return
         level = self.level_var.get()
         if level == "全部":
             messagebox.showwarning("请选择层级", "当前层串行需要选择一个具体层级。")
@@ -445,31 +448,48 @@ class LauncherApp(tk.Tk):
     # ===== 方式二运行 =====
 
     def _run_method2_single(self) -> None:
-        """方式二：单账号测试（阶段3：只测账号密码登录）"""
+        """方式二：单账号运行（选中的CSV账号）"""
         if not self.csv_accounts:
             messagebox.showwarning("无账号", "请先导入CSV文件。")
             return
-        # 取 CSV 列表中第一个有效账号
+        acc = self._selected_csv_account()
+        if acc is None:
+            messagebox.showwarning("未选择账号", "请先在CSV表格中选择一个账号。")
+            return
+        if "配置缺失" in acc.status:
+            messagebox.showwarning("配置缺失", f"账号 {acc.name} 配置不完整，无法执行。")
+            return
+        self._log(f"[方式二] 单账号运行: {acc.display_name}")
+        self._start_method2_serial([acc])
+
+    def _run_method2_all(self) -> None:
+        """方式二：CSV列表全部串行"""
         valid = [a for a in self.csv_accounts if "配置缺失" not in a.status]
         if not valid:
             messagebox.showwarning("无有效账号", "CSV中没有有效的账号。")
             return
-        acc = valid[0]
-        self._log(f"[方式二] 单账号测试: {acc.display_name}")
-        self._start_method2_run(acc)
+        self._log(f"[方式二] 全部串行: 共 {len(valid)} 个账号，严格逐个执行。")
+        self._start_method2_serial(valid)
 
-    def _run_method2_all(self) -> None:
-        """方式二：CSV列表串行（阶段5实现）"""
-        messagebox.showinfo("提示", "方式二全部串行将在阶段5实现")
+    def _selected_csv_account(self) -> CSVAccount | None:
+        sel = self.csv_tree.selection()
+        if not sel:
+            return None
+        key = sel[0]
+        for a in self.csv_accounts:
+            if a.key == key:
+                return a
+        return None
 
-    def _start_method2_run(self, csv_account: CSVAccount) -> None:
-        """在后台线程执行方式二单账号登录。"""
+    def _start_method2_serial(self, accounts: list[CSVAccount]) -> None:
+        """在后台线程串行执行方式二账号列表。"""
         if self.worker_thread is not None and self.worker_thread.is_alive():
             messagebox.showwarning("任务进行中", "当前有任务正在执行。")
             return
         self._setup_log_file()
         self.stop_event.clear()
-        self.csv_status_by_key[csv_account.key] = "OCR中"
+        for a in accounts:
+            self.csv_status_by_key[a.key] = "未开始"
         self._refresh_csv_table()
 
         def _run():
@@ -477,26 +497,43 @@ class LauncherApp(tk.Tk):
                 settings = load_settings(self.settings_path.get())
             except Exception as exc:
                 self._queue_log(f"[方式二] 读取设置失败: {exc}")
-                self._queue_status_csv(csv_account, "失败")
                 return
             from .config import AccountConfig as _AC
-            runner = AccountRunner(
-                account=_AC(level="方式二", bookmark_no=0, game_window_no=csv_account.game_window_no, url=csv_account.url),
-                settings=settings,
-                stop_event=self.stop_event,
-                log=self._queue_log,
-                update_status=lambda a, s: self._queue_status_csv(csv_account, s),
-                request_passport=lambda a: self._request_passport(a),
-            )
-            result = runner.run_method2(csv_account)
-            self._queue_status_csv(csv_account, "成功" if result else "失败")
-            self.ui_queue.put(("status_bar", "就绪"))
+            import subprocess as _sp
+            success_count = 0
+            fail_count = 0
+            total = len(accounts)
+            for i, acc in enumerate(accounts, start=1):
+                if self.stop_event.is_set():
+                    self._queue_log("[方式二] 已停止")
+                    break
+                self._queue_log(f"[{i}/{total}] {acc.display_name}")
+                self._queue_status_csv(acc, "OCR中")
+
+                runner = AccountRunner(
+                    account=_AC(level="方式二", bookmark_no=0, game_window_no=acc.game_window_no, url=acc.url),
+                    settings=settings,
+                    stop_event=self.stop_event,
+                    log=self._queue_log,
+                    update_status=lambda a, s, _acc=acc: self._queue_status_csv(_acc, s),
+                )
+                result = runner.run_method2(acc)
+                if result:
+                    success_count += 1
+                    self._queue_status_csv(acc, "成功")
+                else:
+                    fail_count += 1
+                    self._queue_status_csv(acc, "失败")
+                _sp.run(["taskkill", "/f", "/im", "chromium.exe"], capture_output=True, creationflags=_sp.CREATE_NO_WINDOW)
+            self.ui_queue.put(("status_bar", f"任务完成：成功{success_count}，失败{fail_count}"))
+            self._queue_log(f"[方式二] 任务完成：总{total} 成功{success_count} 失败{fail_count}")
             self.worker_thread = None
             if self._log_file:
                 self._log_file.close()
                 self._log_file = None
 
         self.worker_thread = threading.Thread(target=_run, daemon=True)
+        self.worker_thread.start()
         self.worker_thread.start()
 
     def _queue_status_csv(self, account: CSVAccount, status: str) -> None:

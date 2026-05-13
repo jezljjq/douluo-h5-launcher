@@ -587,11 +587,8 @@ class AccountRunner:
                     self.update_status(self.account, "已登录，跳过")
                     return True
             if not passport:
-                if self.request_passport is not None:
-                    passport = self.request_passport(self.account)
-            if not passport:
                 raise RuntimeError(f"通行证识别失败（页面状态={source}）")
-            self.log(f"[方式二] 通行证: {passport} (来源=OCR/manual)")
+            self.log(f"[方式二] 通行证: {passport} (来源=OCR)")
             self.update_status(self.account, "已提取通行证")
 
             # === 步骤2：打开浏览器 + 账号密码登录 ===
@@ -686,7 +683,7 @@ class AccountRunner:
             self.log(f"[方式二] 输入通行证并点击确认: {passport}")
             if not self._dm_chain(
                 [f"click,{btn_vx},{btn_vy},100",
-                 "wait,1000",
+                 "wait,1500",
                  f"click,{input_x},{input_y},80",
                  f"type,{passport}",
                  f"click,{confirm_x},{confirm_y},100"],
@@ -1444,10 +1441,9 @@ class AccountRunner:
 
         if total < 2 or best_votes * 2 <= total:
             self.log(
-                f"[窗口{self.account.game_window_no}] 文字区域OCR票数不足"
-                f"（{best}={best_votes}/{total}），回退全图OCR"
+                f"[窗口{self.account.game_window_no}] 文字区域OCR票数偏低"
+                f"（{best}={best_votes}/{total}），接受最佳候选"
             )
-            return None
 
         self.log(
             f"[窗口{self.account.game_window_no}] 文字区域OCR: "
