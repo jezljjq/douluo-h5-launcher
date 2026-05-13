@@ -798,11 +798,8 @@ class AccountRunner:
             self.log(f"[窗口{self.account.game_window_no}] 检测到二维码登录界面，但未能识别通行证，判定失败")
             return None, "qr_page"
 
-        # unknown: 保守策略，跑OCR
-        passport = self._ocr_passport_from_login_image(image, prefix, raw_path)
-        if passport:
-            return passport, "ocr"
-        return None, "unknown"
+        # 兜底：非 qr_page 即已登录，不跑OCR
+        return None, "logged_in"
 
     def _quick_login_state(self) -> str:
         """轻量状态检测：截图 + 图像特征判断，不做 OCR。用于校验轮询。"""
@@ -1370,7 +1367,8 @@ class AccountRunner:
         elif black_ratio <= logged_max and edge_density <= logged_edge:
             state = "logged_in"
         else:
-            state = "unknown"
+            # 不满足 qr_page 三条件（尤其方差不够）→ 不是二维码页，按已登录处理
+            state = "logged_in"
 
         metrics = {
             "black_ratio": round(black_ratio, 4),
@@ -1807,6 +1805,19 @@ class AccountRunner:
         # 快速视觉校验（免OCR），大多数弹窗可直接检出
         if self._looks_like_passport_dialog(image):
             return True
+        # 快速排除：gray_ratio 极低说明肯定不是弹窗，跳过 OCR
+        try:
+            import numpy as np
+            arr = np.array(image.convert("RGB"))
+            h, w = arr.shape[:2]
+            region = arr[int(h*0.18):int(h*0.72), int(w*0.22):int(w*0.80)]
+            if region.size > 0:
+                r, g, b = region[:,:,0].astype(int), region[:,:,1].astype(int), region[:,:,2].astype(int)
+                gray_panel = (r>135)&(r<235)&(g>135)&(g<235)&(b>135)&(b<235)&(abs(r-g)<22)&(abs(g-b)<22)
+                if float(gray_panel.mean()) < 0.10:
+                    return False
+        except Exception:
+            pass
         # OCR 兜底
         text = self._ocr_image_text(image, "通行证弹窗")
         normalized = re.sub(r"\s+", "", text)
