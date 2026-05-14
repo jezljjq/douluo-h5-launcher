@@ -2361,6 +2361,7 @@ class AccountRunner:
         result = subprocess.run(
             ["py", "-3.14-32", helper, str(vx), str(vy)],
             capture_output=True, text=True, timeout=10,
+            encoding="utf-8", errors="replace",
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
         if result.returncode == 0:

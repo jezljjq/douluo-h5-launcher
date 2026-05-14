@@ -13,7 +13,7 @@ import win32com.client
 import win32con
 import win32gui
 
-info = json.loads(Path("debug_ocr/browser_pos.json").read_text())
+info = json.loads(Path("debug_ocr/browser_pos.json").read_text(encoding="utf-8"))
 cx, cy = int(info["cx"]), int(info["cy"])
 hwnd = int(info.get("hwnd", 0) or 0)
 
@@ -81,13 +81,13 @@ if len(sys.argv) >= 2 and sys.argv[1] == "chain":
         else:
             r = f"unknown:{step}"
         results.append(r)
-    print("DM_CHAIN: " + " | ".join(results))
+    print("DM_CHAIN: " + " | ".join(results), flush=True)
 elif len(sys.argv) >= 2 and sys.argv[1] == "type":
     text = sys.argv[2]
     bring_to_front()
     time.sleep(0.1)
     # 用 clip.exe 设置剪贴板（避免 OpenClipboard 冲突）
-    _sp.run(["clip"], input=text, text=True)
+    _sp.run(["clip"], input=text, text=True, encoding="utf-8", errors="replace")
     time.sleep(0.1)
     # Dm 发送 Ctrl+V 粘贴
     dm.KeyDown(17)
@@ -95,7 +95,7 @@ elif len(sys.argv) >= 2 and sys.argv[1] == "type":
     dm.KeyPress(86)
     time.sleep(0.03)
     dm.KeyUp(17)
-    print(f"DM_TYPE: {text}")
+    print(f"DM_TYPE: {text}", flush=True)
 else:
     if len(sys.argv) >= 2 and sys.argv[1] == "click":
         vx, vy = int(sys.argv[2]), int(sys.argv[3])
@@ -114,4 +114,4 @@ else:
         dm.LeftUp()
     except Exception:
         dm.LeftClick()
-    print(f"DM_CLICK: viewport({vx},{vy}) screen({sx},{sy}) hold_ms={hold_ms}")
+    print(f"DM_CLICK: viewport({vx},{vy}) screen({sx},{sy}) hold_ms={hold_ms}", flush=True)
