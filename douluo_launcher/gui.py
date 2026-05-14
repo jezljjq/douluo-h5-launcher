@@ -40,6 +40,7 @@ class LauncherApp(tk.Tk):
         self.accounts: list[AccountConfig] = []
         self.status_by_key: dict[str, str] = {}
         self.passport_by_key: dict[str, str] = {}
+        self.timing_by_key: dict[str, str] = {}
         self.manual_passport_cache: dict[str, str] = {}
         self.ui_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.stop_event = threading.Event()
@@ -60,9 +61,11 @@ class LauncherApp(tk.Tk):
         self.csv_accounts: list[CSVAccount] = []
         self.csv_status_by_key: dict[str, str] = {}
         self.csv_passport_by_key: dict[str, str] = {}
+        self.csv_timing_by_key: dict[str, str] = {}
 
         self._apply_settings_defaults()
         self._build_widgets()
+        self._auto_load_csv()
         self.after(100, self._drain_ui_queue)
         self._load_default_config_if_present()
         self._log_startup_dm_environment()
@@ -188,7 +191,7 @@ class LauncherApp(tk.Tk):
 
         # ===== 4. 账号列表区（方式一） =====
         self._table_frame_m1 = ttk.LabelFrame(root, text="账号列表（方式一）", padding=2)
-        columns = ("level", "bookmark", "window", "passport", "url", "status")
+        columns = ("level", "bookmark", "window", "passport", "url", "status", "timing")
         self.tree = ttk.Treeview(self._table_frame_m1, columns=columns, show="headings", height=10)
         self.tree.heading("level", text="层级")
         self.tree.heading("bookmark", text="收藏编号")
@@ -196,12 +199,14 @@ class LauncherApp(tk.Tk):
         self.tree.heading("passport", text="本次通行证")
         self.tree.heading("url", text="链接")
         self.tree.heading("status", text="状态")
+        self.tree.heading("timing", text="耗时")
         self.tree.column("level", width=70, anchor=tk.CENTER)
         self.tree.column("bookmark", width=70, anchor=tk.CENTER)
         self.tree.column("window", width=65, anchor=tk.CENTER)
         self.tree.column("passport", width=110, anchor=tk.CENTER)
-        self.tree.column("url", width=500)
+        self.tree.column("url", width=450)
         self.tree.column("status", width=130, anchor=tk.CENTER)
+        self.tree.column("timing", width=70, anchor=tk.CENTER)
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar = ttk.Scrollbar(self._table_frame_m1, command=self.tree.yview)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
@@ -215,7 +220,7 @@ class LauncherApp(tk.Tk):
 
         # ===== 4b. 账号列表区（方式二） =====
         self._table_frame_m2 = ttk.LabelFrame(root, text="CSV账号列表（方式二）", padding=2)
-        csv_columns = ("name", "url", "username", "password_status", "window", "passport", "status")
+        csv_columns = ("name", "url", "username", "password_status", "window", "passport", "status", "timing")
         self.csv_tree = ttk.Treeview(self._table_frame_m2, columns=csv_columns, show="headings", height=10)
         self.csv_tree.heading("name", text="名称")
         self.csv_tree.heading("url", text="链接")
@@ -224,6 +229,7 @@ class LauncherApp(tk.Tk):
         self.csv_tree.heading("window", text="窗口号")
         self.csv_tree.heading("passport", text="本次通行证")
         self.csv_tree.heading("status", text="状态")
+        self.csv_tree.heading("timing", text="耗时")
         self.csv_tree.column("name", width=100)
         self.csv_tree.column("url", width=280)
         self.csv_tree.column("username", width=100, anchor=tk.CENTER)
@@ -231,6 +237,7 @@ class LauncherApp(tk.Tk):
         self.csv_tree.column("window", width=60, anchor=tk.CENTER)
         self.csv_tree.column("passport", width=110, anchor=tk.CENTER)
         self.csv_tree.column("status", width=100, anchor=tk.CENTER)
+        self.csv_tree.column("timing", width=70, anchor=tk.CENTER)
         self.csv_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         csv_scrollbar = ttk.Scrollbar(self._table_frame_m2, command=self.csv_tree.yview)
         csv_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
@@ -355,6 +362,40 @@ class LauncherApp(tk.Tk):
         self._refresh_csv_table()
         valid_count = sum(1 for a in accounts if "配置缺失" not in a.status)
         self._log(f"已从CSV导入 {len(accounts)} 个账号（有效 {valid_count} 个）。")
+        # 记住CSV路径，下次启动自动加载
+        self._save_csv_path_memory(path)
+
+    def _save_csv_path_memory(self, path: str) -> None:
+        """保存CSV路径到记忆文件，下次启动自动加载"""
+        try:
+            memory_file = project_root() / "csv_last_path.txt"
+            memory_file.write_text(path, encoding="utf-8")
+        except Exception:
+            pass
+
+    def _auto_load_csv(self) -> None:
+        """启动时自动加载上次导入的CSV"""
+        try:
+            memory_file = project_root() / "csv_last_path.txt"
+            if not memory_file.exists():
+                return
+            path = memory_file.read_text(encoding="utf-8").strip()
+            if not path or not Path(path).exists():
+                return
+            self.csv_path.set(path)
+            # 直接调用导入（绕过路径空检查）
+            accounts, error = load_csv_accounts(path)
+            if error:
+                self._log(f"自动加载CSV失败: {error}")
+                return
+            self.csv_accounts = accounts
+            self.csv_status_by_key = {a.key: a.status for a in accounts}
+            self.csv_passport_by_key = {a.key: a.passport for a in accounts}
+            self._refresh_csv_table()
+            valid_count = sum(1 for a in accounts if "配置缺失" not in a.status)
+            self._log(f"已自动加载上次CSV: {len(accounts)} 个账号（有效 {valid_count} 个）")
+        except Exception:
+            pass
 
     def _refresh_csv_table(self) -> None:
         for item in self.csv_tree.get_children():
@@ -373,6 +414,7 @@ class LauncherApp(tk.Tk):
                     acc.game_window_no,
                     self.csv_passport_by_key.get(acc.key, acc.passport),
                     self.csv_status_by_key.get(acc.key, acc.status),
+                    self.csv_timing_by_key.get(acc.key, ""),
                 ),
             )
 
@@ -391,6 +433,7 @@ class LauncherApp(tk.Tk):
                     self.passport_by_key.get(account.key, ""),
                     account.url,
                     self.status_by_key.get(account.key, "未开始"),
+                    self.timing_by_key.get(account.key, ""),
                 ),
             )
 
@@ -488,11 +531,14 @@ class LauncherApp(tk.Tk):
             return
         self._setup_log_file()
         self.stop_event.clear()
+        self.csv_passport_by_key.clear()
+        self.csv_timing_by_key.clear()
         for a in accounts:
             self.csv_status_by_key[a.key] = "未开始"
         self._refresh_csv_table()
 
         def _run():
+            import time as _time
             try:
                 settings = load_settings(self.settings_path.get())
             except Exception as exc:
@@ -503,6 +549,7 @@ class LauncherApp(tk.Tk):
             success_count = 0
             fail_count = 0
             total = len(accounts)
+            start_time = _time.time()
             for i, acc in enumerate(accounts, start=1):
                 if self.stop_event.is_set():
                     self._queue_log("[方式二] 已停止")
@@ -516,24 +563,27 @@ class LauncherApp(tk.Tk):
                     stop_event=self.stop_event,
                     log=self._queue_log,
                     update_status=lambda a, s, _acc=acc: self._queue_status_csv(_acc, s),
+                    passport_found=lambda a, p, _acc=acc: self._queue_passport_csv(_acc, p),
                 )
                 result = runner.run_method2(acc)
                 if result:
                     success_count += 1
                     self._queue_status_csv(acc, "成功")
+                    self._queue_timing_csv(acc, runner.last_timings.get("总计", 0))
                 else:
                     fail_count += 1
                     self._queue_status_csv(acc, "失败")
                 _sp.run(["taskkill", "/f", "/im", "chromium.exe"], capture_output=True, creationflags=_sp.CREATE_NO_WINDOW)
+            elapsed = _time.time() - start_time
             self.ui_queue.put(("status_bar", f"任务完成：成功{success_count}，失败{fail_count}"))
-            self._queue_log(f"[方式二] 任务完成：总{total} 成功{success_count} 失败{fail_count}")
+            self._queue_log(f"[方式二] 任务完成：总{total} 成功{success_count} 失败{fail_count} 耗时{elapsed:.0f}秒")
+            self._write_file_log(f"任务完成：总{total} 成功{success_count} 失败{fail_count} 耗时{elapsed:.0f}秒")
             self.worker_thread = None
             if self._log_file:
                 self._log_file.close()
                 self._log_file = None
 
         self.worker_thread = threading.Thread(target=_run, daemon=True)
-        self.worker_thread.start()
         self.worker_thread.start()
 
     def _queue_status_csv(self, account: CSVAccount, status: str) -> None:
@@ -544,7 +594,7 @@ class LauncherApp(tk.Tk):
         self.csv_status_by_key[account.key] = status
         if self.csv_tree.exists(account.key):
             values = list(self.csv_tree.item(account.key, "values"))
-            values[-1] = status
+            values[6] = status
             tag = ""
             if "成功" in status:
                 tag = "success"
@@ -553,6 +603,28 @@ class LauncherApp(tk.Tk):
             elif status not in ("未开始",):
                 tag = "running"
             self.csv_tree.item(account.key, values=values, tags=(tag,))
+
+    def _queue_passport_csv(self, account: CSVAccount, passport: str) -> None:
+        self.csv_passport_by_key[account.key] = passport
+        self.ui_queue.put(("csv_passport", (account, passport)))
+
+    def _set_csv_passport(self, account: CSVAccount, passport: str) -> None:
+        self.csv_passport_by_key[account.key] = passport
+        if self.csv_tree.exists(account.key):
+            values = list(self.csv_tree.item(account.key, "values"))
+            values[5] = passport
+            self.csv_tree.item(account.key, values=values)
+
+    def _queue_timing_csv(self, account: CSVAccount, seconds: float) -> None:
+        self.csv_timing_by_key[account.key] = f"{seconds:.1f}s"
+        self.ui_queue.put(("csv_timing", (account, f"{seconds:.1f}s")))
+
+    def _set_csv_timing(self, account: CSVAccount, timing: str) -> None:
+        self.csv_timing_by_key[account.key] = timing
+        if self.csv_tree.exists(account.key):
+            values = list(self.csv_tree.item(account.key, "values"))
+            values[7] = timing
+            self.csv_tree.item(account.key, values=values)
 
     def _run_first_account_dm_test(self) -> None:
         messagebox.showinfo("已暂停", "当前不执行大漠点击流程，只测试大漠环境是否可用。")
@@ -572,6 +644,13 @@ class LauncherApp(tk.Tk):
         import time as _time
         log_dir = project_root() / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
+        # 清理旧日志，仅保留最新2份
+        existing_logs = sorted(log_dir.glob("run_*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for old in existing_logs[2:]:
+            try:
+                old.unlink()
+            except Exception:
+                pass
         ts = _time.strftime("%Y%m%d_%H%M%S")
         self._log_file_path = log_dir / f"run_{ts}.log"
         self._log_file = open(str(self._log_file_path), "w", encoding="utf-8")
@@ -663,6 +742,7 @@ class LauncherApp(tk.Tk):
                 flow_result = runner.run_game_flow()
                 if flow_result:
                     success_count += 1
+                    self._queue_timing(account, runner.last_timings.get("总计", 0))
                     self._queue_log(f"[{i}/{len(accounts)}] 成功: {account.display_name}")
                 else:
                     fail_count += 1
@@ -715,6 +795,7 @@ def passport_found(acct, p):
 runner = AccountRunner(account, settings, stop, log, status, passport_found=passport_found)
 flow_result = runner.run_game_flow()
 print("RESULT:" + str(flow_result), flush=True)
+print("TIMING:" + str(runner.last_timings.get("总计", 0)), flush=True)
 """],
                     stdout=_sp.PIPE, stderr=_sp.PIPE,
                     text=True, encoding="utf-8", errors="replace",
@@ -728,6 +809,12 @@ print("RESULT:" + str(flow_result), flush=True)
                         continue
                     if line.startswith("PASSPORT:"):
                         self._queue_passport(account, line[9:])
+                        self._write_file_log(line)
+                    elif line.startswith("TIMING:"):
+                        try:
+                            self._queue_timing(account, float(line[7:]))
+                        except ValueError:
+                            pass
                         self._write_file_log(line)
                     elif line.startswith("STATUS:"):
                         self._queue_status(account, line[7:])
@@ -793,6 +880,10 @@ print("RESULT:" + str(flow_result), flush=True)
     def _queue_passport(self, account: AccountConfig, passport: str) -> None:
         self.ui_queue.put(("passport", (account, passport)))
 
+    def _queue_timing(self, account: AccountConfig, seconds: float) -> None:
+        self.timing_by_key[account.key] = f"{seconds:.1f}s"
+        self.ui_queue.put(("timing", (account, f"{seconds:.1f}s")))
+
     def _request_passport(self, account: AccountConfig) -> str | None:
         cached = self.manual_passport_cache.get(account.key)
         if cached:
@@ -820,6 +911,9 @@ print("RESULT:" + str(flow_result), flush=True)
             elif kind == "passport":
                 account, passport = payload
                 self._set_passport(account, passport)
+            elif kind == "timing":
+                account, timing = payload
+                self._set_timing(account, timing)
             elif kind == "status_bar":
                 self._status_left.set(str(payload))
             elif kind == "passport_prompt":
@@ -833,13 +927,19 @@ print("RESULT:" + str(flow_result), flush=True)
             elif kind == "csv_status":
                 account, status = payload
                 self._set_csv_status(account, status)
+            elif kind == "csv_passport":
+                account, passport = payload
+                self._set_csv_passport(account, passport)
+            elif kind == "csv_timing":
+                account, timing = payload
+                self._set_csv_timing(account, timing)
         self.after(100, self._drain_ui_queue)
 
     def _set_status(self, account: AccountConfig, status: str) -> None:
         self.status_by_key[account.key] = status
         if self.tree.exists(account.key):
             values = list(self.tree.item(account.key, "values"))
-            values[-1] = status
+            values[5] = status
             # 颜色标签
             tag = ""
             if "成功" in status:
@@ -859,6 +959,13 @@ print("RESULT:" + str(flow_result), flush=True)
         if self.tree.exists(account.key):
             values = list(self.tree.item(account.key, "values"))
             values[3] = passport
+            self.tree.item(account.key, values=values)
+
+    def _set_timing(self, account: AccountConfig, timing: str) -> None:
+        self.timing_by_key[account.key] = timing
+        if self.tree.exists(account.key):
+            values = list(self.tree.item(account.key, "values"))
+            values[6] = timing
             self.tree.item(account.key, values=values)
 
     def _log(self, message: str) -> None:

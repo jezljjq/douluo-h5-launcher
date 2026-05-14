@@ -40,3 +40,4 @@ credentials*
 密码.csv
 *密码*.csv
 debug_ocr/m2_browser_screenshot.png
+csv_last_path.txt

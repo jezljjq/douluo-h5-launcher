@@ -1,6 +1,6 @@
 # 斗罗大陆H5上号器（前台串行稳定版）
 
-**当前阶段：前台串行批量，已稳定可用。成功率 94%（29/31），31 账号约 6 分钟。**
+**当前阶段：方式一+方式二双模式，均已稳定可用。方式一成功率 ~83%，方式二支持 CSV 批量导入。**
 
 > 项目级开发规则见 [CLAUDE.md](CLAUDE.md)。
 
@@ -43,19 +43,27 @@
 | 调试截图管理 | ✅ 已整理 | _tmp / history / latest_* 三级管理 | [DEBUG_IMAGE_POLICY.md](DEBUG_IMAGE_POLICY.md) |
 | 失败重试 | ✅ 已实现 | 任意失败自动重试 1 次 | — |
 | 收藏夹映射 | ✅ 稳定 | 4层×8编号→游戏窗口号1-32 | — |
+| 方式二（账号密码+通行证） | ✅ 稳定 | CSV导入+Playwright DOM登录+Dm输入 | [DESIGN_METHOD2.md](DESIGN_METHOD2.md) |
+| CSV 导入 | ✅ 稳定 | encoding 自动检测 + 路径记忆 | — |
+| 耗时统计 | ✅ 已实现 | 分阶段计时 + 日志+表格双显示 | — |
+| 截图/日志清理 | ✅ 已实现 | _error/ 保留10张，logs/ 保留2份 | — |
 
 ---
 
-## 2.5 最近修复（2026-05-12/13）
+## 2.5 最近修复（2026-05-12/13/14）
 
 | 问题 | 修复 |
 |------|------|
 | `subprocess.Popen` monkey-patch 导致 asyncio 崩溃 | function→class 继承（`_NoConsolePopen`），Playwright 导入前恢复原始 Popen |
 | 重试时相同通行证跳过完整流程 | 删除跳过逻辑，重试始终走完整浏览器流程 |
 | exe 启动有黑框 | 切换 `--noconsole` 引导器 |
-| 登录程序窗口状态判断不稳定 | 新增 `detect_login_page_state` 图像特征检测（black_ratio+edge_density+variance），区分 qr_page/logged_in/unknown |
-| 二维码页 OCR 被 QR 码干扰 | 确认 qr_page 后优先用底部文字区域 OCR，避开 QR 码密集图案 |
+| 登录程序窗口状态判断不稳定 | 新增 `detect_login_page_state` 图像特征检测 |
+| 二维码页 OCR 被 QR 码干扰 | 确认 qr_page 后优先用底部文字区域 OCR |
 | 日志路径不统一 | 新增 `project_root()`，exe 模式日志也落到项目根 `logs/` |
+| 方式一失败状态不更新 | `run_game_flow` retry=1 缺少 `raise RuntimeError` |
+| 方式二 finally 固定 sleep(3) | 已登录账号不打开浏览器也等3s → 有浏览器才等2s |
+| CSV 耗时列偏移 | `values[-1]` 指向 timing 列 → 改为显式 `values[6]` |
+| OCR hex 字符混淆 c↔0/e | 已编写模板匹配备选方案，待后续集成 |
 
 ## 3. 当前架构
 

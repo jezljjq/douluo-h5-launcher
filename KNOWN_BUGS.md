@@ -110,3 +110,39 @@ print("[W" + str(cfg["game_window_no"]) + "] " + str(msg))
 **出现次数**：1 次（打包 exe 后发现）
 
 **⚠ 2026-05-12 补充**：monkey-patch 必须用 **class 包装**，不能用 function 替换。因为 `asyncio.windows_utils.Popen` 继承自 `subprocess.Popen`，用 function 替换会导致 `TypeError: function() argument 'code' must be code, not str`（Playwright → asyncio → windows_utils 触发）。修复见 `automation.py` 中的 `_NoConsolePopen` 类。
+
+---
+
+## 11. Treeview 新增列后 `values[-1]` 指向错误列
+
+**场景**：在 CSV Treeview 增加 `timing` 列后，`_set_csv_status` 用 `values[-1]` 写入状态，但 `-1` 变成 `timing`（第7列）而非 `status`（第6列）。
+
+**症状**：失败时状态栏显示"已输入通行证"而非"失败"。
+
+**正确做法**：用显式索引 `values[6]` 代替 `values[-1]`。`_set_status` 同理改 `values[5]`。
+
+**出现次数**：1 次
+
+---
+
+## 12. 方式二 `finally` 固定 `sleep(3)` 浪费
+
+**场景**：`run_method2` 的 `finally` 块无条件 `time.sleep(3)`，已登录账号不打开浏览器也白等3秒。
+
+**症状**：31个已登录账号串行，浪费 93s。
+
+**正确做法**：只在 `browser is not None` 时 sleep，改为 2s。
+
+**出现次数**：1 次
+
+---
+
+## 13. 方式一 retry=1 缺少 `raise RuntimeError`
+
+**场景**：`run_game_flow` 中 retry=1 校验超时后 `if retry == 0: continue` 穿透到 `except`，无异常则直接 `return False`，`STATUS:失败` 从未发出。
+
+**症状**：方式一失败时状态栏不更新为"失败"。
+
+**正确做法**：`if retry == 0:` 后加 `raise RuntimeError(...)`。
+
+**出现次数**：1 次
