@@ -1,8 +1,10 @@
-# OCR 通行证提取：最终稳定方案
+# 通行证获取与 OCR 兜底方案
 
 **日期：2026-05-08**
-**最近更新：2026-05-09**
-**状态：已稳定，禁止回退**
+**最近更新：2026-05-15**
+**状态：复制优先，OCR 兜底；OCR 不再低置信度放行**
+
+> 重要更新：OCR 不再作为第一优先级。当前通行证获取先尝试从登录程序窗口双击选中 8 位通行证并 `Ctrl+C` 复制，复制失败后才进入 OCR 兜底。
 
 ---
 
@@ -29,21 +31,35 @@
 
 ---
 
-## 2. 最终正式方案
+## 2. 当前正式方案
 
 ### 核心流程
 
 ```
 登录程序窗口完整截图（BitBlt 后台截图 + ImageGrab 回退）
-→ 多尺度全图 OCR（Tesseract chi_sim+eng, --psm 6/3）
-→ 三层正则匹配提取 8 位 hex 通行证
+→ 判断为二维码登录页
+→ 双击底部通行证文本区域并 Ctrl+C
+→ 读取剪贴板中的 8 位 hex 通行证
+→ 复制失败时进入 OCR 兜底
+→ OCR 通过候选票数、字符级投票和混淆字符检查后才可接受
 ```
 
 ### 关键特性
 
-- **不定位二维码** — 不依赖任何视觉元素位置
-- **不裁剪图像** — OCR 直接处理整张图
-- **不猜区域** — 固定业务文本"本次通行证"是唯一锚点
+- **复制优先** — 成功复制时直接采用剪贴板结果
+- **OCR 兜底** — 仅在复制失败时启用
+- **宁可失败，不假成功** — OCR 不确定时不得继续输入通行证
+- **混淆字符强拦截** — 同一位置出现 `c/e` 竞争时必须失败或进入人工处理
+
+### OCR 风险背景
+
+OCR 存在单字符误识别风险，例如：
+
+| 真实通行证 | 错误结果 | 错误位置 |
+|------------|----------|----------|
+| `4425cbaa` | `4425ebaa` | `c` 被识别为 `e` |
+
+因此 OCR 不再作为第一优先级。复制成功时直接使用复制结果；复制失败时才进入 OCR。OCR 低置信度、候选不一致、字符级投票不一致或出现 `c/e` 竞争时，必须失败，不能继续输入。
 
 ### OCR 参数
 
@@ -101,14 +117,26 @@ OCR 完整文本: "AURIBATIE: 4acaccal = EFUB ERAD HLM RDE"
 
 ---
 
-## 4. OCR 投票机制（2026-05-11 新增）
+## 4. OCR 兜底规则（2026-05-15 更新）
 
-全图 OCR 不再第一个成功就返回。改为收集所有变体（8 种 scale×psm×灰度组合）的结果后投票：
+OCR 兜底不再第一个成功就返回，也不再低票数接受最佳候选。当前规则：
 
-1. 收集所有变体的 OCR 结果，统计每个 hex 值的出现次数
-2. **优先选包含 a-f 字母的结果**（避免全数字的 d→0 误判）
-3. 同条件下取出现次数最多的值
-4. 日志输出投票详情：共 N 种结果，选择 xxx（票数 m/total）
+1. 收集所有 OCR 变体的候选结果。
+2. 输出每个候选结果和候选票数。
+3. 对 8 位通行证逐位做字符级投票。
+4. 输出每一位字符投票结果。
+5. 输出存疑位置。
+6. 输出是否接受。
+7. 输出失败类型。
+
+新增失败类型：
+
+| 失败类型 | 触发条件 |
+|----------|----------|
+| `OCR_LOW_CONFIDENCE` | 总票数不足、候选不一致、逐位投票不一致 |
+| `OCR_AMBIGUOUS_CHAR` | 某一位同时出现 `c` 和 `e` 竞争 |
+
+原则：**宁可真实失败，也不要错误输入通行证。**
 
 ### 成功率
 
@@ -139,9 +167,7 @@ OCR 完整文本: "AURIBATIE: 4acaccal = EFUB ERAD HLM RDE"
 | 1 | l / t | `1abc` → `labc` / `tabc` |
 | 0 | o / O | `0abc` → `oabc` |
 
-当前纠错管线（`extract_hex_passport`）已覆盖 l→1, o→0, s→5, i→1, g→9, z→2, t→1 以及 Unicode 符号 €→c, £→e, ¢→c, ¥→y, $→s。
-
-**d→0 和 f→7 的混淆**不加入全局纠错（d/f 是合法 hex 字符），但登录失败后通过 `_generate_passport_candidates` 生成互换候选（含 7↔f、d 暂未覆盖）。
+当前纠错管线仍可用于 OCR 候选提取，但最终是否接受必须经过候选投票和字符级投票。`c/e` 竞争属于高风险误识别，必须判定为 `OCR_AMBIGUOUS_CHAR`，不能自动选择其中一个。
 
 ---
 
@@ -150,6 +176,8 @@ OCR 完整文本: "AURIBATIE: 4acaccal = EFUB ERAD HLM RDE"
 | 文件 | 函数/方法 | 说明 |
 |------|-----------|------|
 | `douluo_launcher/automation.py` | `_extract_passport_from_login_window()` | 后台截图 + OCR 入口 |
+| `douluo_launcher/automation.py` | `_copy_passport_from_login_window()` | 复制优先获取通行证 |
+| `douluo_launcher/automation.py` | `_decide_ocr_candidate()` | OCR 候选票数、字符级投票、失败类型判定 |
 | `douluo_launcher/automation.py` | `_ocr_passport_from_login_image()` | 全图 OCR 核心（多尺度+灰度） |
 | `douluo_launcher/automation.py` | `extract_passport_from_text()` | 方式1 正则匹配 |
 | `douluo_launcher/automation.py` | `extract_hex_passport()` | 方式3 hex 提取 + 字符纠错 |
@@ -192,3 +220,5 @@ OCR 完整文本: "AURIBATIE: 4acaccal = EFUB ERAD HLM RDE"
 - ❌ 从 Playwright page 截图 OCR 通行证
 - ❌ 从 URL/DOM/iframe 提取通行证
 - ❌ 使用任何需要二维码位置的裁剪逻辑
+- ❌ OCR 低置信度时继续输入通行证
+- ❌ `c/e` 混淆时自动猜测一个结果

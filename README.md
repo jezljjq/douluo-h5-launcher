@@ -1,6 +1,6 @@
 # 斗罗大陆H5上号器（前台串行稳定版）
 
-**当前阶段：方式一+方式二双模式，均已稳定可用。方式一成功率 ~83%，方式二支持 CSV 批量导入。**
+**当前阶段：前台串行模式，方式一和方式二均已接入；窗口管理区已接入。部分新功能代码层面已实现，但仍需现场实机验证。**
 
 > 项目级开发规则见 [CLAUDE.md](CLAUDE.md)。
 
@@ -13,7 +13,7 @@
 ### 核心流程
 
 ```
-登录程序窗口 OCR 提取通行证
+登录程序窗口复制优先获取通行证（OCR 兜底）
 → 浏览器打开游戏页
 → 关闭公告
 → 模板匹配定位通行证按钮
@@ -30,7 +30,7 @@
 
 | 模块 | 状态 | 方案 | 文档 |
 |------|------|------|------|
-| 登录程序 OCR | ✅ 稳定 | 全图 OCR + "本次通行证"匹配 + hex 纠错 | [OCR_SUCCESS.md](OCR_SUCCESS.md) |
+| 通行证获取 | ✅ 已调整 | 复制优先，OCR 兜底；OCR 不再低置信度放行 | [OCR_SUCCESS.md](OCR_SUCCESS.md) |
 | 后台截图 | ✅ 稳定 | BitBlt + ImageGrab 回退 | [OCR_SUCCESS.md](OCR_SUCCESS.md) |
 | 通行证按钮定位 | ✅ 稳定 | OpenCV 模板匹配 | [CLICK_SOLUTION.md](CLICK_SOLUTION.md) |
 | Dm 前台点击 | ✅ 稳定 | Dm 无绑定 MoveTo + LeftDown/LeftUp | [CLICK_SOLUTION.md](CLICK_SOLUTION.md) |
@@ -47,6 +47,35 @@
 | CSV 导入 | ✅ 稳定 | encoding 自动检测 + 路径记忆 | — |
 | 耗时统计 | ✅ 已实现 | 分阶段计时 + 日志+表格双显示 | — |
 | 截图/日志清理 | ✅ 已实现 | _error/ 保留10张，logs/ 保留2份 | — |
+| 窗口管理区 | ✅ 已接入 | 批量启动、识别、排列、关闭、重命名、参数记忆 | [docs/WINDOW_MANAGER_AND_PASSPORT_MILESTONE.md](docs/WINDOW_MANAGER_AND_PASSPORT_MILESTONE.md) |
+| 停止任务/关闭清理 | ✅ 已验证 | 停止时终止账号子进程、清理 dm_click_helper.py 和 Chromium | [CLICK_SOLUTION.md](CLICK_SOLUTION.md) |
+
+### 2.1 当前窗口管理区能力
+
+窗口管理功能已经从独立工具迁入上号器内部模块。上号器不应依赖独立项目 `DLH5WindowManager` 的本地路径；即使独立项目移动或删除，上号器内部窗口管理功能理论上也不应受影响。
+
+当前窗口管理区支持：
+
+- 游戏路径
+- 打开数量
+- 启动间隔(ms)
+- 启动后自动排列
+- 排列后自动编号标题
+- 标题模板
+- 重命名
+- 窗口宽度
+- 窗口高度
+- 每行数量
+- 起点 X
+- 起点 Y
+- 横向偏移
+- 纵向偏移
+- 批量启动窗口
+- 识别窗口
+- 排列窗口
+- 关闭窗口
+
+窗口管理参数记忆保存到上号器项目内部独立配置文件 `window_manager_settings.json`。该能力已代码实现，但暂未现场验证，不能写作“实机验证通过”。
 
 ---
 
@@ -63,7 +92,9 @@
 | 方式一失败状态不更新 | `run_game_flow` retry=1 缺少 `raise RuntimeError` |
 | 方式二 finally 固定 sleep(3) | 已登录账号不打开浏览器也等3s → 有浏览器才等2s |
 | CSV 耗时列偏移 | `values[-1]` 指向 timing 列 → 改为显式 `values[6]` |
-| OCR hex 字符混淆 c↔0/e | 已编写模板匹配备选方案，待后续集成 |
+| OCR hex 字符混淆 c↔0/e | 通行证获取已改为复制优先；OCR 兜底遇到低置信度或 c/e 竞争必须失败 |
+| 停止任务后仍可能继续移动鼠标 | 已修复：停止按钮会强制终止当前账号子进程、清理 `dm_click_helper.py` 和 `chromium.exe` |
+| 关闭 GUI 后仍可能残留子进程 | 已修复：窗口关闭会先执行停止和清理，并避免 `_drain_ui_queue` 继续 after 回调 |
 
 ## 3. 当前架构
 
@@ -99,19 +130,26 @@
 
 ## 5. 两种上号方式
 
-### 方式一：收藏夹链接 + OCR 通行证（✅ 已开发，当前主流程）
+### 方式一：收藏夹链接 + 通行证上号（✅ 已开发，当前主流程）
 
 - 从浏览器收藏夹读取游戏入口链接
-- 从登录程序窗口 OCR/图像识别提取通行证
+- 从登录程序窗口优先复制 8 位通行证，复制失败才进入 OCR 兜底
 - 支持单账号、当前层串行、全部串行
 
-### 方式二：CSV 配置文件 + OCR 通行证（❌ 暂未开发）
+### 方式二：CSV 配置文件 + 账号密码 + 通行证上号（✅ 已开发）
 
-- 计划通过 CSV 文件配置账号（`name,url,username,password`）
-- 仍然需要先 OCR 通行证，不是只用账号密码
+- 通过 CSV 文件配置账号（`name,url,username,password`）
+- 仍然需要先从登录程序窗口获取通行证，不是只用账号密码
+- 通行证获取同样遵循复制优先、OCR 兜底
 - password 不打印到日志，GUI 仅显示"已填写/未填写"
-- **开发前提**：方式一十分稳定后再启动，当前不要开发方式二
-- **密码.csv** 保留在本地用于后续开发，已配置 .gitignore 不提交
+- 支持单账号和串行批量
+
+### 通行证获取优先级
+
+1. 第一优先级：双击选中登录窗口中的 8 位通行证，`Ctrl+C` 复制，读取剪贴板。
+2. 第二优先级：复制失败后才进入 OCR 兜底。
+
+OCR 不再作为第一优先级。原因是 OCR 存在单字符误识别风险，例如真实值 `4425cbaa` 可能被识别为 `4425ebaa`，错误位置为 `c` 被识别为 `e`。复制成功时直接使用复制结果；复制失败时才进入 OCR。OCR 低置信度时不得继续输入通行证，存在 `c/e` 等混淆时必须失败或进入人工处理，不能假成功。
 
 ---
 
@@ -151,6 +189,8 @@ GUI 按钮：
 - [douluo_launcher/automation.py](douluo_launcher/automation.py) — 账号运行流程
 - [douluo_launcher/config.py](douluo_launcher/config.py) — 配置和收藏夹读取
 - [douluo_launcher/dm_client.py](douluo_launcher/dm_client.py) — 窗口管理和后台截图
+- [douluo_launcher/window_manager.py](douluo_launcher/window_manager.py) — 登录窗口批量启动、识别、排列、关闭、重命名
+- [douluo_launcher/window_manager_settings.py](douluo_launcher/window_manager_settings.py) — 窗口管理参数记忆
 - [dm_click_helper.py](dm_click_helper.py) — 32 位 Dm 点击/输入脚本
 - [automation_settings.json](automation_settings.json) — 自动化参数
 
@@ -197,6 +237,7 @@ OpenCV: 4.13.0（模板匹配 + 视觉定位）
 14. [DEVELOPMENT_RULES.md](DEVELOPMENT_RULES.md) — 项目开发规则
 15. [DOC_UPDATE_PROMPT.md](DOC_UPDATE_PROMPT.md) — 文档整理通用指令（每次整理文档前必读）
 16. [BUILD_RELEASE_PROMPT.md](BUILD_RELEASE_PROMPT.md) — 打包发布通用指令（每次打包前必读）
+17. [docs/WINDOW_MANAGER_AND_PASSPORT_MILESTONE.md](docs/WINDOW_MANAGER_AND_PASSPORT_MILESTONE.md) — 窗口管理与通行证阶段总结
 
 ---
 
@@ -207,3 +248,7 @@ OpenCV: 4.13.0（模板匹配 + 视觉定位）
 - 不要用 Dm 7.2607 BindWindow（全模式崩溃）
 - 不要使用 Playwright/CDP/PostMessage/SendMessage 点击 canvas
 - 不要开启真并发（前台模式下不支持）
+- 文档任务只允许改文档，不要顺手改业务代码
+- 打包必须单独确认，不得在普通开发任务中自动打包
+- 停止任务不能只设置 `stop_event`，必须同步清理当前账号子进程、`dm_click_helper.py` 和本次 Playwright/Chromium 相关进程
+- 禁止误杀所有 `python.exe`，只能清理本项目记录的子进程或命令行明确包含 `dm_click_helper.py` 的进程

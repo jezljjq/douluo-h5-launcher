@@ -423,14 +423,15 @@ def diagnose_dm_environment_with_32bit_python(prog_id: str = "dm.dmsoft") -> lis
             f"print('\\n'.join(diagnose_dm_environment({prog_id!r})))"
         ),
     ]
+    env = os.environ.copy()
+    env.setdefault("PYTHONIOENCODING", "utf-8")
     try:
         result = subprocess.run(
             command,
             cwd=project_root,
             capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
+            text=False,
+            env=env,
             timeout=30,
             check=False,
             creationflags=subprocess.CREATE_NO_WINDOW,
@@ -443,8 +444,8 @@ def diagnose_dm_environment_with_32bit_python(prog_id: str = "dm.dmsoft") -> lis
     except subprocess.TimeoutExpired:
         return ["32 位 Python 大漠诊断超时。"]
 
-    output = (result.stdout or "").strip()
-    error = (result.stderr or "").strip()
+    output = _decode_subprocess_output(result.stdout).strip()
+    error = _decode_subprocess_output(result.stderr).strip()
     lines = ["方案A：使用 32 位 Python 诊断大漠环境", "命令: py -3.14-32"]
     if output:
         lines.extend(output.splitlines())
@@ -454,6 +455,22 @@ def diagnose_dm_environment_with_32bit_python(prog_id: str = "dm.dmsoft") -> lis
     if result.returncode != 0:
         lines.append(f"32 位 Python 诊断命令失败，退出码: {result.returncode}")
     return lines
+
+
+def _decode_subprocess_output(data: bytes | str | None) -> str:
+    if not data:
+        return ""
+    if isinstance(data, str):
+        return data
+
+    for encoding in ("utf-8", "utf-8-sig", "gbk", "mbcs"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        except LookupError:
+            continue
+    return data.decode("utf-8", errors="replace")
 
 
 def _read_prog_id_clsid(prog_id: str, access_flag: int) -> str | None:

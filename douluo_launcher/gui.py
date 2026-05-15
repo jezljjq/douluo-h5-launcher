@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import queue
 import json
+import os
 import threading
+import time
 import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -23,19 +25,38 @@ from .config import (
     load_settings,
 )
 from .dm_client import diagnose_dm_environment_with_32bit_python
+from .window_manager import (
+    TileConfig,
+    close_game_windows,
+    launch_game_process,
+    list_game_windows,
+    rename_game_windows,
+    tile_game_windows,
+)
+from .window_manager_settings import (
+    WindowManagerSettings,
+    load_window_manager_settings,
+    save_window_manager_settings,
+    window_manager_settings_path,
+)
+
+WM_WAIT_TIMEOUT_SECONDS = 60
+WM_STABLE_CHECKS = 3
+WM_POLL_INTERVAL_SECONDS = 0.5
+WM_FINAL_DELAY_SECONDS = 1
 
 
 class LauncherApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("斗罗大陆H5上号器 — 前台串行模式")
-        w, h = 1120, 720
+        self.title("上号器 — 前台串行模式")
+        w, h = 1160, 820
         ws = self.winfo_screenwidth()
         hs = self.winfo_screenheight()
         x = (ws - w) // 2
         y = (hs - h) // 2
         self.geometry(f"{w}x{h}+{x}+{y}")
-        self.minsize(980, 620)
+        self.minsize(1080, 760)
 
         self.accounts: list[AccountConfig] = []
         self.status_by_key: dict[str, str] = {}
@@ -47,6 +68,10 @@ class LauncherApp(tk.Tk):
         self.worker_thread: threading.Thread | None = None
         self._log_file = None
         self._log_file_path: Path | None = None
+        self.wm_launch_thread: threading.Thread | None = None
+        self.running_processes: list[object] = []
+        self.running_processes_lock = threading.Lock()
+        self.is_closing = False
 
         self.settings_path = tk.StringVar(value=str(app_root() / "automation_settings.json"))
         self.bookmark_path = tk.StringVar(value=find_default_bookmark_file())
@@ -58,6 +83,19 @@ class LauncherApp(tk.Tk):
         self.notice_outside_y_var = tk.DoubleVar(value=0.08)
         self.method_var = tk.StringVar(value="method1")
         self.csv_path = tk.StringVar(value="")
+        self.wm_game_path_var = tk.StringVar(value="")
+        self.wm_launch_count_var = tk.IntVar(value=31)
+        self.wm_launch_interval_var = tk.IntVar(value=300)
+        self.wm_auto_tile_after_launch_var = tk.BooleanVar(value=True)
+        self.wm_auto_rename_after_tile_var = tk.BooleanVar(value=True)
+        self.wm_title_template_var = tk.StringVar(value="斗罗大陆H5-{index}号")
+        self.wm_window_width_var = tk.IntVar(value=320)
+        self.wm_window_height_var = tk.IntVar(value=540)
+        self.wm_start_x_var = tk.IntVar(value=250)
+        self.wm_start_y_var = tk.IntVar(value=0)
+        self.wm_offset_x_var = tk.IntVar(value=320)
+        self.wm_offset_y_var = tk.IntVar(value=525)
+        self.wm_per_row_var = tk.IntVar(value=8)
         self.csv_accounts: list[CSVAccount] = []
         self.csv_status_by_key: dict[str, str] = {}
         self.csv_passport_by_key: dict[str, str] = {}
@@ -65,10 +103,13 @@ class LauncherApp(tk.Tk):
 
         self._apply_settings_defaults()
         self._build_widgets()
+        self._load_window_manager_settings()
         self._auto_load_csv()
         self.after(100, self._drain_ui_queue)
         self._load_default_config_if_present()
+        self._log_admin_status_warning()
         self._log_startup_dm_environment()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _apply_settings_defaults(self) -> None:
         try:
@@ -86,26 +127,92 @@ class LauncherApp(tk.Tk):
         root = ttk.Frame(self, padding=(12, 8, 12, 4))
         root.pack(fill=tk.BOTH, expand=True)
 
-        # ===== 1. 配置区 =====
-        config_frame = ttk.LabelFrame(root, text="配置", padding=6)
+        # ===== 1. 窗口管理 =====
+        window_frame = ttk.LabelFrame(root, text="窗口管理", padding=6)
+        window_frame.pack(fill=tk.X, pady=(0, 8))
+        window_frame.columnconfigure(1, weight=1)
+
+        # 第1行：游戏路径
+        ttk.Label(window_frame, text="游戏路径", width=10, anchor="e").grid(
+            row=0, column=0, sticky="e", padx=(4, 6), pady=3
+        )
+        ttk.Entry(window_frame, textvariable=self.wm_game_path_var).grid(
+            row=0, column=1, columnspan=12, sticky="ew", padx=4, pady=3
+        )
+        ttk.Button(window_frame, text="选择", width=8, command=self._pick_game_path).grid(
+            row=0, column=13, sticky="ew", padx=4, pady=3
+        )
+
+        # 第2行：启动参数、自动编号、标题模板、重命名
+        ttk.Label(window_frame, text="打开数量").grid(row=1, column=0, sticky="e", padx=(4, 6), pady=3)
+        ttk.Spinbox(window_frame, from_=1, to=99, increment=1,
+                    textvariable=self.wm_launch_count_var, width=6).grid(row=1, column=1, sticky="w", padx=(0, 12), pady=3)
+        ttk.Label(window_frame, text="启动间隔(ms)").grid(row=1, column=2, sticky="e", padx=(0, 6), pady=3)
+        ttk.Spinbox(window_frame, from_=0, to=60000, increment=100,
+                    textvariable=self.wm_launch_interval_var, width=6).grid(row=1, column=3, sticky="w", padx=(0, 12), pady=3)
+        ttk.Checkbutton(window_frame, text="启动后自动排列",
+                        variable=self.wm_auto_tile_after_launch_var).grid(row=1, column=4, sticky="w", padx=(0, 12), pady=3)
+        ttk.Checkbutton(window_frame, text="排列后自动编号标题",
+                        variable=self.wm_auto_rename_after_tile_var).grid(row=1, column=5, sticky="w", padx=(0, 12), pady=3)
+        ttk.Label(window_frame, text="标题模板").grid(row=1, column=6, sticky="e", padx=(0, 6), pady=3)
+        ttk.Entry(window_frame, textvariable=self.wm_title_template_var, width=24).grid(
+            row=1, column=7, columnspan=5, sticky="ew", padx=(0, 8), pady=3
+        )
+        ttk.Button(window_frame, text="重命名", width=8,
+                   command=self._wm_rename_windows).grid(row=1, column=12, sticky="ew", padx=(0, 6), pady=3)
+
+        # 第3行：窗口尺寸和排列参数
+        third_row_fields = (
+            ("窗口宽度", self.wm_window_width_var, 1, 3000),
+            ("窗口高度", self.wm_window_height_var, 1, 3000),
+            ("每行数量", self.wm_per_row_var, 1, 99),
+            ("起点X", self.wm_start_x_var, -5000, 5000),
+            ("起点Y", self.wm_start_y_var, -5000, 5000),
+            ("横向偏移", self.wm_offset_x_var, -5000, 5000),
+            ("纵向偏移", self.wm_offset_y_var, -5000, 5000),
+        )
+        for index, (label, variable, min_value, max_value) in enumerate(third_row_fields):
+            label_column = index * 2
+            input_column = label_column + 1
+            ttk.Label(window_frame, text=label).grid(
+                row=2, column=label_column, sticky="e", padx=(4 if index == 0 else 8, 4), pady=3
+            )
+            ttk.Spinbox(window_frame, from_=min_value, to=max_value, increment=1,
+                        textvariable=variable, width=6).grid(
+                row=2, column=input_column, sticky="w", padx=(0, 4), pady=3
+            )
+
+        # 第4行：窗口操作按钮
+        window_action_row = ttk.Frame(window_frame)
+        window_action_row.grid(row=3, column=0, columnspan=14, sticky="w", pady=(6, 0))
+        self.wm_launch_btn = ttk.Button(window_action_row, text="批量启动窗口", width=18,
+                                        command=self._wm_launch_windows)
+        self.wm_launch_btn.pack(side=tk.LEFT, padx=(4, 10))
+        ttk.Button(window_action_row, text="识别窗口", width=18,
+                   command=self._wm_identify_windows).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Button(window_action_row, text="排列窗口", width=18,
+                   command=self._wm_tile_windows).pack(side=tk.LEFT, padx=(0, 10))
+        tk.Button(window_action_row, text="关闭窗口", width=18, fg="#cc0000",
+                  command=self._wm_close_windows, font=("", 9, "bold")).pack(side=tk.LEFT, padx=(0, 10))
+
+        # ===== 2. 配置上号器 =====
+        config_frame = ttk.LabelFrame(root, text="配置上号器", padding=6)
         config_frame.pack(fill=tk.X, pady=(0, 8))
         config_frame.columnconfigure(1, weight=1)
 
-        # 上号方式选择
         method_row = ttk.Frame(config_frame)
         method_row.grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 6))
         ttk.Label(method_row, text="上号方式").pack(side=tk.LEFT, padx=(4, 8))
         ttk.Radiobutton(method_row, text="方式一：通行证上号", variable=self.method_var, value="method1",
-                        command=self._on_method_changed).pack(side=tk.LEFT, padx=(0, 16))
+                        command=self._on_method_changed).pack(side=tk.LEFT, padx=(0, 24))
         ttk.Radiobutton(method_row, text="方式二：账号密码 + 通行证上号", variable=self.method_var, value="method2",
                         command=self._on_method_changed).pack(side=tk.LEFT)
 
-        # 方式一控件（收藏夹相关）
         self._method1_row1 = ttk.Label(config_frame, text="收藏文件", width=12, anchor="e")
         self._method1_row1.grid(row=1, column=0, sticky="e", padx=(4, 6), pady=3)
         self._method1_bookmark_entry = ttk.Entry(config_frame, textvariable=self.bookmark_path)
         self._method1_bookmark_entry.grid(row=1, column=1, sticky="ew", padx=4, pady=3)
-        self._method1_btn_pick = ttk.Button(config_frame, text="选择", width=6, command=self._pick_bookmark_file)
+        self._method1_btn_pick = ttk.Button(config_frame, text="选择", width=8, command=self._pick_bookmark_file)
         self._method1_btn_pick.grid(row=1, column=2, padx=4, pady=3)
         self._method1_btn_load = ttk.Button(config_frame, text="读取收藏夹", command=self._load_accounts)
         self._method1_btn_load.grid(row=1, column=3, padx=4, pady=3)
@@ -119,15 +226,13 @@ class LauncherApp(tk.Tk):
         self._method1_row3a.grid(row=3, column=0, sticky="e", padx=(4, 6), pady=3)
         self._method1_settings_entry = ttk.Entry(config_frame, textvariable=self.settings_path)
         self._method1_settings_entry.grid(row=3, column=1, sticky="ew", padx=4, pady=3)
-        self._method1_btn_settings = ttk.Button(config_frame, text="选择", width=6, command=self._pick_settings)
+        self._method1_btn_settings = ttk.Button(config_frame, text="选择", width=8, command=self._pick_settings)
         self._method1_btn_settings.grid(row=3, column=2, padx=4, pady=3)
 
-        # 方式二控件（CSV 导入）
         self._method2_row1 = ttk.Label(config_frame, text="CSV文件", width=12, anchor="e")
         self._method2_csv_entry = ttk.Entry(config_frame, textvariable=self.csv_path)
-        self._method2_btn_pick = ttk.Button(config_frame, text="选择", width=6, command=self._pick_csv_file)
+        self._method2_btn_pick = ttk.Button(config_frame, text="选择", width=8, command=self._pick_csv_file)
         self._method2_btn_import = ttk.Button(config_frame, text="导入CSV", command=self._import_csv)
-        # 方式二控件网格位置（初始隐藏）
         self._method2_row1.grid(row=1, column=0, sticky="e", padx=(4, 6), pady=3)
         self._method2_csv_entry.grid(row=1, column=1, sticky="ew", padx=4, pady=3)
         self._method2_btn_pick.grid(row=1, column=2, padx=4, pady=3)
@@ -137,7 +242,7 @@ class LauncherApp(tk.Tk):
         self._method2_btn_pick.grid_remove()
         self._method2_btn_import.grid_remove()
 
-        # ===== 2. 运行区 =====
+        # ===== 3. 运行 =====
         run_frame = ttk.LabelFrame(root, text="运行", padding=6)
         run_frame.pack(fill=tk.X, pady=(0, 8))
 
@@ -172,27 +277,10 @@ class LauncherApp(tk.Tk):
                                    command=self._stop_tasks, font=("", 9, "bold"))
         self.stop_btn.pack(side=tk.LEFT, padx=2)
 
-        # ===== 3. 调试区 =====
-        self.debug_frame = ttk.LabelFrame(root, text="调试", padding=4)
-        self.debug_frame.pack(fill=tk.X, pady=(0, 8))
-        debug_row = ttk.Frame(self.debug_frame)
-        debug_row.pack(fill=tk.X)
-        ttk.Label(debug_row, text="公告外点击坐标 X").pack(side=tk.LEFT, padx=(2, 4))
-        ttk.Spinbox(debug_row, from_=0, to=1, increment=0.01, textvariable=self.notice_outside_x_var, width=6).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Label(debug_row, text="Y").pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Spinbox(debug_row, from_=0, to=1, increment=0.01, textvariable=self.notice_outside_y_var, width=6).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(debug_row, text="保存坐标", command=self._save_notice_outside_ratio).pack(side=tk.LEFT, padx=2)
-
-        # 折叠按钮
-        self._debug_visible = tk.BooleanVar(value=True)
-        self._debug_toggle_btn = ttk.Button(root, text="▾ 调试", width=8,
-                                             command=self._toggle_debug)
-        self._debug_toggle_btn.pack(anchor="w", pady=(0, 4))
-
-        # ===== 4. 账号列表区（方式一） =====
+        # ===== 4. 账号列表 =====
         self._table_frame_m1 = ttk.LabelFrame(root, text="账号列表（方式一）", padding=2)
         columns = ("level", "bookmark", "window", "passport", "url", "status", "timing")
-        self.tree = ttk.Treeview(self._table_frame_m1, columns=columns, show="headings", height=10)
+        self.tree = ttk.Treeview(self._table_frame_m1, columns=columns, show="headings", height=7)
         self.tree.heading("level", text="层级")
         self.tree.heading("bookmark", text="收藏编号")
         self.tree.heading("window", text="窗口号")
@@ -218,10 +306,10 @@ class LauncherApp(tk.Tk):
         self.tree.tag_configure("retry", foreground="#cc6600")
         self.tree.tag_configure("skip", foreground="#888888")
 
-        # ===== 4b. 账号列表区（方式二） =====
+        # 账号列表（方式二）
         self._table_frame_m2 = ttk.LabelFrame(root, text="CSV账号列表（方式二）", padding=2)
         csv_columns = ("name", "url", "username", "password_status", "window", "passport", "status", "timing")
-        self.csv_tree = ttk.Treeview(self._table_frame_m2, columns=csv_columns, show="headings", height=10)
+        self.csv_tree = ttk.Treeview(self._table_frame_m2, columns=csv_columns, show="headings", height=7)
         self.csv_tree.heading("name", text="名称")
         self.csv_tree.heading("url", text="链接")
         self.csv_tree.heading("username", text="账号")
@@ -252,14 +340,14 @@ class LauncherApp(tk.Tk):
         # 初始显示方式一表格
         self._table_frame_m1.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
 
-        # ===== 5. 日志区 =====
-        log_outer = ttk.LabelFrame(root, text="日志", padding=2)
-        log_outer.pack(fill=tk.X, pady=(0, 4))
-        log_header = ttk.Frame(log_outer)
+        # ===== 5. 日志 =====
+        self._log_outer = ttk.LabelFrame(root, text="日志", padding=2)
+        self._log_outer.pack(fill=tk.X, pady=(0, 4))
+        log_header = ttk.Frame(self._log_outer)
         log_header.pack(fill=tk.X, pady=(0, 2))
         ttk.Button(log_header, text="打开日志目录", command=self._open_log_dir).pack(side=tk.RIGHT, padx=2)
 
-        self.log_text = tk.Text(log_outer, height=8, wrap=tk.WORD, font=("Consolas", 9))
+        self.log_text = tk.Text(self._log_outer, height=6, wrap=tk.WORD, font=("Consolas", 9))
         self.log_text.pack(fill=tk.BOTH, expand=True)
 
         # ===== 6. 底部状态栏 =====
@@ -273,6 +361,8 @@ class LauncherApp(tk.Tk):
         ttk.Label(status_frame, textvariable=self._status_right).pack(side=tk.RIGHT)
 
     def _toggle_debug(self) -> None:
+        if not hasattr(self, "debug_frame") or not hasattr(self, "_debug_visible"):
+            return
         if self._debug_visible.get():
             self.debug_frame.pack_forget()
             self._debug_visible.set(False)
@@ -281,6 +371,529 @@ class LauncherApp(tk.Tk):
             self.debug_frame.pack(fill=tk.X, pady=(0, 8), before=self._debug_toggle_btn)
             self._debug_visible.set(True)
             self._debug_toggle_btn.configure(text="▾ 调试")
+
+    def _pick_game_path(self) -> None:
+        path = filedialog.askopenfilename(
+            title="选择游戏程序或快捷方式",
+            filetypes=[("程序或快捷方式", "*.exe *.lnk"), ("EXE", "*.exe"), ("Shortcut", "*.lnk"), ("All files", "*.*")],
+        )
+        if path:
+            self.wm_game_path_var.set(path)
+            self._save_window_manager_settings()
+
+    def _load_window_manager_settings(self) -> None:
+        settings, error = load_window_manager_settings()
+        self.wm_game_path_var.set(settings.game_path)
+        self.wm_launch_count_var.set(settings.launch_count)
+        self.wm_launch_interval_var.set(settings.launch_interval)
+        self.wm_auto_tile_after_launch_var.set(settings.auto_tile_after_launch)
+        self.wm_auto_rename_after_tile_var.set(settings.auto_rename_after_tile)
+        self.wm_title_template_var.set(settings.title_template)
+        self.wm_window_width_var.set(settings.window_width)
+        self.wm_window_height_var.set(settings.window_height)
+        self.wm_start_x_var.set(settings.start_x)
+        self.wm_start_y_var.set(settings.start_y)
+        self.wm_offset_x_var.set(settings.offset_x)
+        self.wm_offset_y_var.set(settings.offset_y)
+        self.wm_per_row_var.set(settings.per_row)
+
+        if error:
+            self._log(f"[窗口管理] 读取参数配置失败，已使用默认值：{error}")
+        elif window_manager_settings_path().exists():
+            self._log(f"[窗口管理] 已加载参数配置：{window_manager_settings_path()}")
+
+    def _current_window_manager_settings(self) -> WindowManagerSettings | None:
+        try:
+            return WindowManagerSettings(
+                game_path=self.wm_game_path_var.get().strip().strip('"'),
+                launch_count=int(self.wm_launch_count_var.get()),
+                launch_interval=int(self.wm_launch_interval_var.get()),
+                auto_tile_after_launch=bool(self.wm_auto_tile_after_launch_var.get()),
+                auto_rename_after_tile=bool(self.wm_auto_rename_after_tile_var.get()),
+                title_template=self.wm_title_template_var.get().strip(),
+                window_width=int(self.wm_window_width_var.get()),
+                window_height=int(self.wm_window_height_var.get()),
+                start_x=int(self.wm_start_x_var.get()),
+                start_y=int(self.wm_start_y_var.get()),
+                offset_x=int(self.wm_offset_x_var.get()),
+                offset_y=int(self.wm_offset_y_var.get()),
+                per_row=int(self.wm_per_row_var.get()),
+            )
+        except Exception as exc:
+            self._log(f"[窗口管理] 当前参数读取失败，未保存配置：{exc}")
+            return None
+
+    def _save_window_manager_settings(self) -> bool:
+        settings = self._current_window_manager_settings()
+        if settings is None:
+            return False
+        try:
+            save_window_manager_settings(settings)
+            return True
+        except Exception as exc:
+            self._log(f"[窗口管理] 保存参数配置失败：{exc}")
+            return False
+
+    def _wm_excluded_hwnds(self) -> list[int]:
+        try:
+            return [int(self.winfo_id())]
+        except Exception:
+            return []
+
+    def _wm_read_tile_config(self) -> TileConfig | None:
+        try:
+            config = TileConfig(
+                width=int(self.wm_window_width_var.get()),
+                height=int(self.wm_window_height_var.get()),
+                start_x=int(self.wm_start_x_var.get()),
+                start_y=int(self.wm_start_y_var.get()),
+                offset_x=int(self.wm_offset_x_var.get()),
+                offset_y=int(self.wm_offset_y_var.get()),
+                per_row=int(self.wm_per_row_var.get()),
+            )
+        except Exception as exc:
+            self._log(f"窗口管理：参数读取失败：{exc}")
+            messagebox.showerror("窗口管理参数错误", str(exc))
+            return None
+
+        if config.width <= 0 or config.height <= 0 or config.per_row <= 0:
+            message = "窗口宽度、窗口高度、每行数量必须大于 0。"
+            self._log(f"窗口管理：参数无效：{message}")
+            messagebox.showerror("窗口管理参数错误", message)
+            return None
+        return config
+
+    def _wm_read_title_template(self) -> str | None:
+        title_template = self.wm_title_template_var.get().strip()
+        if not title_template:
+            message = "标题模板不能为空。"
+            self._log(f"[窗口管理] {message}")
+            messagebox.showwarning("窗口标题模板", message)
+            return None
+        return title_template
+
+    def _wm_launch_windows(self) -> None:
+        if self.wm_launch_thread and self.wm_launch_thread.is_alive():
+            self._log("[窗口管理] 批量启动正在进行中。")
+            return
+
+        game_path = self.wm_game_path_var.get().strip().strip('"')
+        if not game_path:
+            message = "请先填写游戏路径。"
+            self._log(f"[窗口管理] {message}")
+            messagebox.showwarning("批量启动窗口", message)
+            return
+        if not Path(game_path).exists():
+            message = f"游戏路径不存在：{game_path}"
+            self._log(f"[窗口管理] {message}")
+            messagebox.showwarning("批量启动窗口", message)
+            return
+
+        try:
+            launch_count = int(self.wm_launch_count_var.get())
+            launch_interval = int(self.wm_launch_interval_var.get())
+        except Exception as exc:
+            self._log(f"[窗口管理] 启动参数读取失败：{exc}")
+            messagebox.showwarning("批量启动窗口", str(exc))
+            return
+
+        if launch_count < 1:
+            message = "打开数量必须大于等于 1。"
+            self._log(f"[窗口管理] {message}")
+            messagebox.showwarning("批量启动窗口", message)
+            return
+        if launch_interval < 0:
+            message = "启动间隔不能小于 0。"
+            self._log(f"[窗口管理] {message}")
+            messagebox.showwarning("批量启动窗口", message)
+            return
+
+        self._save_window_manager_settings()
+        auto_tile = bool(self.wm_auto_tile_after_launch_var.get())
+        auto_rename = bool(self.wm_auto_rename_after_tile_var.get())
+        tile_config = self._wm_read_tile_config() if auto_tile else None
+        if auto_tile and tile_config is None:
+            return
+        title_template = None
+        if auto_tile and auto_rename:
+            title_template = self._wm_read_title_template()
+            if title_template is None:
+                return
+
+        excluded_hwnds = self._wm_excluded_hwnds()
+        self.wm_launch_btn.configure(state=tk.DISABLED)
+        self.wm_launch_thread = threading.Thread(
+            target=self._wm_launch_windows_worker,
+            args=(
+                game_path,
+                launch_count,
+                launch_interval,
+                auto_tile,
+                auto_rename,
+                tile_config,
+                title_template,
+                excluded_hwnds,
+            ),
+            daemon=True,
+        )
+        self.wm_launch_thread.start()
+
+    def _wm_launch_windows_worker(
+        self,
+        game_path: str,
+        launch_count: int,
+        launch_interval: int,
+        auto_tile: bool,
+        auto_rename: bool,
+        tile_config: TileConfig | None,
+        title_template: str | None,
+        excluded_hwnds: list[int],
+    ) -> None:
+        def log(message: str) -> None:
+            self._queue_log(f"[窗口管理] {message}")
+
+        try:
+            log(f"准备批量启动：路径={game_path}，数量={launch_count}，间隔={launch_interval}ms")
+            try:
+                before_windows = list_game_windows(exclude_hwnds=excluded_hwnds)
+                before_count = len(before_windows)
+                log(f"启动前识别到 {before_count} 个 H5 窗口")
+            except Exception as exc:
+                before_count = 0
+                log(f"启动前识别窗口失败：{exc}")
+
+            for index in range(1, launch_count + 1):
+                log(f"正在启动第 {index}/{launch_count} 个窗口")
+                result = launch_game_process(game_path)
+                if result.success:
+                    log(f"第 {index} 个窗口启动命令已发送")
+                else:
+                    log(f"第 {index} 个窗口启动命令发送失败：{result.error}")
+
+                if launch_interval > 0:
+                    time.sleep(launch_interval / 1000)
+
+                try:
+                    current_windows = list_game_windows(exclude_hwnds=excluded_hwnds)
+                    current_count = len(current_windows)
+                    expected_count = before_count + index
+                    log(f"当前识别到 {current_count} 个 H5 窗口")
+                    if current_count >= expected_count:
+                        log(f"已达到当前目标数量：{current_count}/{expected_count}")
+                    else:
+                        log(f"尚未达到当前目标数量：{current_count}/{expected_count}")
+                except Exception as exc:
+                    log(f"启动后识别窗口失败：{exc}")
+
+            try:
+                final_count = len(list_game_windows(exclude_hwnds=excluded_hwnds))
+            except Exception as exc:
+                final_count = -1
+                log(f"批量启动完成后识别窗口失败：{exc}")
+
+            target_count = before_count + launch_count
+            if final_count >= 0:
+                log(f"批量启动完成，目标 {target_count} 个，当前识别到 {final_count} 个")
+
+            if auto_tile and tile_config is not None:
+                is_stable, stable_count = self._wm_wait_for_windows_stable(
+                    target_count=target_count,
+                    excluded_hwnds=excluded_hwnds,
+                    log=log,
+                )
+                if not is_stable:
+                    if stable_count < target_count:
+                        log(
+                            f"目标 {target_count} 个，当前识别到 {stable_count} 个，"
+                            "未达到目标数量，已跳过自动排列，请手动点击“排列窗口”。"
+                        )
+                    else:
+                        log(
+                            f"目标 {target_count} 个，当前识别到 {stable_count} 个，"
+                            "但窗口数量未连续稳定，已跳过自动排列，请手动点击“排列窗口”。"
+                        )
+                    return
+
+                log("已勾选启动后自动排列，开始排列窗口")
+                try:
+                    results = tile_game_windows(tile_config, exclude_hwnds=excluded_hwnds)
+                    log(f"自动排列完成，结果 {len(results)} 个")
+                    for result_index, result in enumerate(results, start=1):
+                        window = result.window
+                        number = window.number if window.number is not None else "无编号"
+                        if result.success:
+                            log(
+                                f"窗口 {result_index} 排列成功 hwnd={window.hwnd} 编号={number} "
+                                f"x={result.x} y={result.y} w={tile_config.width} h={tile_config.height} 标题={window.title}"
+                            )
+                        else:
+                            log(
+                                f"窗口 {result_index} 排列失败 hwnd={window.hwnd} 编号={number} "
+                                f"x={result.x} y={result.y} 错误={result.error} 标题={window.title}"
+                            )
+                    if auto_rename:
+                        self._wm_rename_windows_after_tile(
+                            log=log,
+                            exclude_hwnds=excluded_hwnds,
+                            title_template=title_template,
+                        )
+                        log("自动编号标题完成")
+                except Exception as exc:
+                    log(f"启动后自动排列失败：{exc}")
+        finally:
+            self.after(0, lambda: self.wm_launch_btn.configure(state=tk.NORMAL))
+
+    def _wm_wait_for_windows_stable(
+        self,
+        target_count: int,
+        excluded_hwnds: list[int],
+        log,
+    ) -> tuple[bool, int]:
+        log("批量启动命令发送完成，等待窗口稳定")
+        last_count: int | None = None
+        stable_count = 0
+        current_count = 0
+        deadline = time.monotonic() + WM_WAIT_TIMEOUT_SECONDS
+
+        while time.monotonic() < deadline:
+            try:
+                current_count = len(list_game_windows(exclude_hwnds=excluded_hwnds))
+            except Exception as exc:
+                stable_count = 0
+                log(f"等待窗口稳定时识别窗口失败：{exc}")
+                time.sleep(WM_POLL_INTERVAL_SECONDS)
+                continue
+
+            if current_count >= target_count:
+                if current_count == last_count:
+                    stable_count += 1
+                else:
+                    stable_count = 1
+                log(
+                    f"当前识别到：{current_count} / {target_count}，"
+                    f"稳定检测 {stable_count}/{WM_STABLE_CHECKS}"
+                )
+                if stable_count >= WM_STABLE_CHECKS:
+                    log(f"窗口数量已稳定，等待 {WM_FINAL_DELAY_SECONDS} 秒后开始自动排列")
+                    time.sleep(WM_FINAL_DELAY_SECONDS)
+                    return True, current_count
+            else:
+                stable_count = 0
+                log(f"目标窗口数：{target_count}，当前识别到：{current_count}")
+
+            last_count = current_count
+            time.sleep(WM_POLL_INTERVAL_SECONDS)
+
+        return False, current_count
+
+    def _wm_rename_windows_after_tile(
+        self,
+        log,
+        exclude_hwnds: list[int],
+        title_template: str | None = None,
+    ) -> None:
+        if title_template is None:
+            title_template = self._wm_read_title_template()
+        if title_template is None:
+            return
+        log(f"开始自动编号标题：模板={title_template}")
+        try:
+            results = rename_game_windows(title_template, exclude_hwnds=exclude_hwnds)
+        except Exception as exc:
+            log(f"自动编号标题失败：{exc}")
+            return
+
+        for index, result in enumerate(results, start=1):
+            window = result.window
+            if result.success:
+                log(f"窗口 {index} 重命名成功 hwnd={window.hwnd} 新标题={result.new_title}")
+            else:
+                log(
+                    f"窗口 {index} 重命名失败 hwnd={window.hwnd} "
+                    f"目标标题={result.new_title} 错误={result.error}"
+                )
+
+    def _wm_rename_windows(self) -> None:
+        self._save_window_manager_settings()
+        self._wm_rename_windows_after_tile(
+            log=lambda message: self._log(f"[窗口管理] {message}"),
+            exclude_hwnds=self._wm_excluded_hwnds(),
+        )
+
+    def _wm_identify_windows(self) -> None:
+        try:
+            windows = list_game_windows(exclude_hwnds=self._wm_excluded_hwnds())
+        except Exception as exc:
+            self._log(f"窗口管理：识别登录窗口失败：{exc}")
+            messagebox.showerror("识别登录窗口失败", str(exc))
+            return
+
+        self._log(f"窗口管理：识别到 {len(windows)} 个斗罗大陆H5登录窗口。")
+        for index, window in enumerate(windows, start=1):
+            number = window.number if window.number is not None else "无编号"
+            self._log(
+                f"窗口管理：窗口 {index} hwnd={window.hwnd} 标题={window.title} 编号={number}"
+            )
+
+    def _wm_tile_windows(self) -> None:
+        self._save_window_manager_settings()
+        config = self._wm_read_tile_config()
+        if config is None:
+            return
+
+        try:
+            results = tile_game_windows(config, exclude_hwnds=self._wm_excluded_hwnds())
+        except Exception as exc:
+            self._log(f"窗口管理：排列登录窗口失败：{exc}")
+            messagebox.showerror("排列登录窗口失败", str(exc))
+            return
+
+        self._log(
+            "窗口管理：排列完成，"
+            f"目标大小={config.width}x{config.height}，每行={config.per_row}，结果 {len(results)} 个。"
+        )
+        for index, result in enumerate(results, start=1):
+            window = result.window
+            number = window.number if window.number is not None else "无编号"
+            if result.success:
+                self._log(
+                    f"窗口管理：窗口 {index} 排列成功 hwnd={window.hwnd} 编号={number} "
+                    f"x={result.x} y={result.y} w={config.width} h={config.height} 标题={window.title}"
+                )
+            else:
+                self._log(
+                    f"窗口管理：窗口 {index} 排列失败 hwnd={window.hwnd} 编号={number} "
+                    f"x={result.x} y={result.y} 错误={result.error} 标题={window.title}"
+                )
+        if self.wm_auto_rename_after_tile_var.get():
+            self._wm_rename_windows_after_tile(
+                log=lambda message: self._log(f"[窗口管理] {message}"),
+                exclude_hwnds=self._wm_excluded_hwnds(),
+            )
+
+    def _wm_close_windows(self) -> None:
+        try:
+            results = close_game_windows(exclude_hwnds=self._wm_excluded_hwnds())
+        except Exception as exc:
+            self._log(f"窗口管理：关闭登录窗口失败：{exc}")
+            messagebox.showerror("关闭登录窗口失败", str(exc))
+            return
+
+        self._log(f"窗口管理：已向 {len(results)} 个斗罗大陆H5登录窗口发送关闭消息。")
+        for index, result in enumerate(results, start=1):
+            window = result.window
+            number = window.number if window.number is not None else "无编号"
+            if result.success:
+                self._log(
+                    f"窗口管理：窗口 {index} 关闭消息已发送 hwnd={window.hwnd} "
+                    f"编号={number} 标题={window.title}"
+                )
+            else:
+                self._log(
+                    f"窗口管理：窗口 {index} 关闭消息发送失败 hwnd={window.hwnd} "
+                    f"编号={number} 错误={result.error} 标题={window.title}"
+                )
+
+    def _track_process(self, proc: object) -> None:
+        with self.running_processes_lock:
+            self.running_processes.append(proc)
+
+    def _untrack_process(self, proc: object) -> None:
+        with self.running_processes_lock:
+            if proc in self.running_processes:
+                self.running_processes.remove(proc)
+
+    def _terminate_running_processes(self) -> int:
+        with self.running_processes_lock:
+            processes = list(self.running_processes)
+
+        terminated = 0
+        for proc in processes:
+            pid = getattr(proc, "pid", None)
+            try:
+                if proc.poll() is not None:
+                    self._untrack_process(proc)
+                    continue
+                proc.terminate()
+                try:
+                    proc.wait(timeout=1)
+                    self._log(f"已终止账号运行子进程 pid={pid}。")
+                except Exception:
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=1)
+                    except Exception:
+                        pass
+                    self._log(f"账号运行子进程 terminate 超时，已强制 kill pid={pid}。")
+                terminated += 1
+            except Exception as exc:
+                self._log(f"终止账号运行子进程失败 pid={pid}: {exc}")
+            finally:
+                self._untrack_process(proc)
+        return terminated
+
+    def _cleanup_dm_click_helper_processes(self) -> int:
+        import subprocess as _sp
+
+        script = r"""
+$selfPid = $PID
+$procs = Get-CimInstance Win32_Process | Where-Object {
+    $_.ProcessId -ne $selfPid -and $_.CommandLine -like '*dm_click_helper.py*'
+}
+$count = 0
+foreach ($p in $procs) {
+    try {
+        Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop
+        $count += 1
+    } catch {
+    }
+}
+Write-Output $count
+"""
+        try:
+            result = _sp.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=_sp.CREATE_NO_WINDOW,
+                timeout=8,
+            )
+            output = (result.stdout or "").strip().splitlines()
+            count = int(output[-1]) if output else 0
+            self._log(f"已清理 dm_click_helper.py 子进程 {count} 个。")
+            if result.stderr:
+                self._write_file_log(f"清理 dm_click_helper.py stderr: {result.stderr.strip()[:500]}")
+            return count
+        except Exception as exc:
+            self._log(f"清理 dm_click_helper.py 子进程失败：{exc}")
+            return 0
+
+    def _cleanup_chromium_processes(self) -> None:
+        import subprocess as _sp
+
+        try:
+            result = _sp.run(
+                ["taskkill", "/f", "/im", "chromium.exe"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=_sp.CREATE_NO_WINDOW,
+                timeout=8,
+            )
+            if result.returncode == 0:
+                self._log("已清理 chromium.exe。")
+            else:
+                detail = (result.stdout or result.stderr or "").strip()
+                self._log(f"chromium.exe 清理命令已执行：{detail or '未发现进程'}")
+        except Exception as exc:
+            self._log(f"清理 chromium.exe 失败：{exc}")
+
+    def _cleanup_external_processes(self) -> None:
+        self._cleanup_dm_click_helper_processes()
+        self._cleanup_chromium_processes()
 
     def _pick_bookmark_file(self) -> None:
         path = filedialog.askopenfilename(filetypes=[("Bookmarks", "Bookmarks"), ("JSON", "*.json"), ("All files", "*.*")])
@@ -330,10 +943,10 @@ class LauncherApp(tk.Tk):
         # 表格
         if is_m1:
             self._table_frame_m2.pack_forget()
-            self._table_frame_m1.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+            self._table_frame_m1.pack(fill=tk.BOTH, expand=True, pady=(0, 8), before=self._log_outer)
         else:
             self._table_frame_m1.pack_forget()
-            self._table_frame_m2.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+            self._table_frame_m2.pack(fill=tk.BOTH, expand=True, pady=(0, 8), before=self._log_outer)
         # 账号下拉框
         if is_m1:
             self._refresh_account_choices()
@@ -566,7 +1179,12 @@ class LauncherApp(tk.Tk):
                     passport_found=lambda a, p, _acc=acc: self._queue_passport_csv(_acc, p),
                 )
                 result = runner.run_method2(acc)
-                if result:
+                if self.stop_event.is_set():
+                    self._queue_status_csv(acc, "已停止")
+                    self._queue_log("[方式二] 任务已停止，不会继续执行后续账号。")
+                    _sp.run(["taskkill", "/f", "/im", "chromium.exe"], capture_output=True, creationflags=_sp.CREATE_NO_WINDOW)
+                    break
+                elif result:
                     success_count += 1
                     self._queue_status_csv(acc, "成功")
                     self._queue_timing_csv(acc, runner.last_timings.get("总计", 0))
@@ -575,9 +1193,14 @@ class LauncherApp(tk.Tk):
                     self._queue_status_csv(acc, "失败")
                 _sp.run(["taskkill", "/f", "/im", "chromium.exe"], capture_output=True, creationflags=_sp.CREATE_NO_WINDOW)
             elapsed = _time.time() - start_time
-            self.ui_queue.put(("status_bar", f"任务完成：成功{success_count}，失败{fail_count}"))
-            self._queue_log(f"[方式二] 任务完成：总{total} 成功{success_count} 失败{fail_count} 耗时{elapsed:.0f}秒")
-            self._write_file_log(f"任务完成：总{total} 成功{success_count} 失败{fail_count} 耗时{elapsed:.0f}秒")
+            if self.stop_event.is_set():
+                self.ui_queue.put(("status_bar", "已停止"))
+                self._queue_log(f"[方式二] 任务已停止：总{total} 成功{success_count} 失败{fail_count} 耗时{elapsed:.0f}秒")
+                self._write_file_log(f"任务已停止：总{total} 成功{success_count} 失败{fail_count} 耗时{elapsed:.0f}秒")
+            else:
+                self.ui_queue.put(("status_bar", f"任务完成：成功{success_count}，失败{fail_count}"))
+                self._queue_log(f"[方式二] 任务完成：总{total} 成功{success_count} 失败{fail_count} 耗时{elapsed:.0f}秒")
+                self._write_file_log(f"任务完成：总{total} 成功{success_count} 失败{fail_count} 耗时{elapsed:.0f}秒")
             self.worker_thread = None
             if self._log_file:
                 self._log_file.close()
@@ -686,6 +1309,26 @@ class LauncherApp(tk.Tk):
         except Exception as exc:
             self._log(f"启动环境检查失败: {exc}")
 
+    def _log_admin_status_warning(self) -> None:
+        try:
+            import ctypes
+
+            is_admin = bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            is_admin = False
+
+        if is_admin:
+            self._log("启动权限检查：当前以管理员权限运行。")
+            return
+
+        restart_result = os.environ.get("DOULUO_ADMIN_RESTART_RESULT", "")
+        if restart_result:
+            self._log(
+                "启动权限检查：管理员重启未完成或被取消，"
+                f"ShellExecuteW 返回码 {restart_result}。"
+            )
+        self._log("启动权限检查：当前非管理员运行，可能无法排列/关闭管理员权限窗口。")
+
     def _start_serial_run(self, accounts: list[AccountConfig]) -> None:
         if self.worker_thread and self.worker_thread.is_alive():
             messagebox.showwarning("任务运行中", "已有任务正在运行，请先停止或等待完成。")
@@ -740,7 +1383,12 @@ class LauncherApp(tk.Tk):
                     passport_found=lambda a, p: self._queue_passport(a, p),
                 )
                 flow_result = runner.run_game_flow()
-                if flow_result:
+                if self.stop_event.is_set():
+                    self._queue_status(account, "已停止")
+                    self._queue_log("任务已停止，不会继续执行后续账号。")
+                    _sp.run(["taskkill", "/f", "/im", "chromium.exe"], capture_output=True, creationflags=_sp.CREATE_NO_WINDOW)
+                    break
+                elif flow_result:
                     success_count += 1
                     self._queue_timing(account, runner.last_timings.get("总计", 0))
                     self._queue_log(f"[{i}/{len(accounts)}] 成功: {account.display_name}")
@@ -802,39 +1450,65 @@ print("TIMING:" + str(runner.last_timings.get("总计", 0)), flush=True)
                     cwd=project_root,
                     creationflags=_sp.CREATE_NO_WINDOW,
                 )
+                self._track_process(proc)
                 result_seen = False
-                for line in proc.stdout:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    if line.startswith("PASSPORT:"):
-                        self._queue_passport(account, line[9:])
-                        self._write_file_log(line)
-                    elif line.startswith("TIMING:"):
+                try:
+                    for line in proc.stdout:
+                        if self.stop_event.is_set():
+                            if proc.poll() is None:
+                                proc.terminate()
+                            self._queue_log(f"[{account.display_name}] 已停止，当前账号子进程正在终止。")
+                            break
+                        line = line.strip()
+                        if not line:
+                            continue
+                        if line.startswith("PASSPORT:"):
+                            self._queue_passport(account, line[9:])
+                            self._write_file_log(line)
+                        elif line.startswith("TIMING:"):
+                            try:
+                                self._queue_timing(account, float(line[7:]))
+                            except ValueError:
+                                pass
+                            self._write_file_log(line)
+                        elif line.startswith("STATUS:"):
+                            self._queue_status(account, line[7:])
+                            self._queue_log(f"[{account.display_name}] → {line[7:]}")
+                            self._write_file_log(line)
+                        elif line.startswith("RESULT:True"):
+                            result_seen = True
+                            self._write_file_log(line)
+                        elif line.startswith("RESULT:"):
+                            self._write_file_log(line)
+                        else:
+                            self._write_file_log(line)
+                    if self.stop_event.is_set() and proc.poll() is None:
+                        proc.terminate()
+                    try:
+                        proc.wait(timeout=3 if self.stop_event.is_set() else 300)
+                    except Exception:
+                        proc.kill()
                         try:
-                            self._queue_timing(account, float(line[7:]))
-                        except ValueError:
+                            proc.wait(timeout=3)
+                        except Exception:
                             pass
-                        self._write_file_log(line)
-                    elif line.startswith("STATUS:"):
-                        self._queue_status(account, line[7:])
-                        self._queue_log(f"[{account.display_name}] → {line[7:]}")
-                        self._write_file_log(line)
-                    elif line.startswith("RESULT:True"):
-                        result_seen = True
-                        self._write_file_log(line)
-                    elif line.startswith("RESULT:"):
-                        self._write_file_log(line)
-                    else:
-                        self._write_file_log(line)
-                proc.wait(timeout=300)
+                        self._queue_log(f"[{account.display_name}] 已强制 kill 账号运行子进程 pid={proc.pid}。")
+                finally:
+                    self._untrack_process(proc)
+
                 stderr_output = proc.stderr.read()
                 for line in stderr_output.splitlines():
                     line = line.strip()
                     if line:
                         self._write_file_log(f"[stderr] {line[:500]}")
 
-                if result_seen:
+                if self.stop_event.is_set():
+                    self._queue_status(account, "已停止")
+                    self._queue_log("任务已停止，不会继续执行后续账号。")
+                    try: cfg_file.unlink()
+                    except Exception: pass
+                    break
+                elif result_seen:
                     success_count += 1
                     self._queue_log(f"[{i}/{len(accounts)}] 成功: {account.display_name}")
                 else:
@@ -847,19 +1521,49 @@ print("TIMING:" + str(runner.last_timings.get("总计", 0)), flush=True)
 
         elapsed = _time.time() - start_time
         log_path = str(self._log_file_path) if self._log_file_path else ""
-        self._queue_log("--------- 任务完成 ---------")
-        self._queue_log(f"总账号: {len(accounts)}  成功: {success_count}  失败: {fail_count}  耗时: {elapsed:.0f}秒")
-        self._update_status_bar(f"任务完成：成功{success_count}，失败{fail_count}")
+        if self.stop_event.is_set():
+            self._queue_log("--------- 任务已停止 ---------")
+            self._queue_log(f"总账号: {len(accounts)}  成功: {success_count}  失败: {fail_count}  耗时: {elapsed:.0f}秒")
+            self._update_status_bar("已停止")
+        else:
+            self._queue_log("--------- 任务完成 ---------")
+            self._queue_log(f"总账号: {len(accounts)}  成功: {success_count}  失败: {fail_count}  耗时: {elapsed:.0f}秒")
+            self._update_status_bar(f"任务完成：成功{success_count}，失败{fail_count}")
         self._queue_log(f"详细日志: {log_path}")
         if self._log_file is not None:
-            self._write_file_log(f"任务完成：总{len(accounts)} 成功{success_count} 失败{fail_count} 耗时{elapsed:.0f}秒")
+            summary_label = "任务已停止" if self.stop_event.is_set() else "任务完成"
+            self._write_file_log(f"{summary_label}：总{len(accounts)} 成功{success_count} 失败{fail_count} 耗时{elapsed:.0f}秒")
             self._log_file.close()
             self._log_file = None
 
     def _stop_tasks(self) -> None:
         self.stop_event.set()
-        self._log("已请求停止任务，正在等待当前步骤结束。")
+        self._log("已请求停止任务，正在强制清理子进程。")
+        terminated = self._terminate_running_processes()
+        if terminated == 0:
+            self._log("当前没有需要终止的账号运行子进程。")
+        self._cleanup_external_processes()
+        self._log("任务已停止，不会继续执行后续账号。")
         self._update_status_bar("已停止")
+
+    def _on_close(self) -> None:
+        if self.is_closing:
+            return
+        self.is_closing = True
+        try:
+            self._log("程序关闭：开始停止任务和清理子进程。")
+            self.stop_event.set()
+            self._terminate_running_processes()
+            self._cleanup_external_processes()
+            self._log("程序关闭：清理完成，退出。")
+        finally:
+            try:
+                if self._log_file is not None:
+                    self._log_file.close()
+                    self._log_file = None
+            except Exception:
+                pass
+            self.destroy()
 
     def _selected_account(self) -> AccountConfig | None:
         display = self.account_var.get()
@@ -898,6 +1602,8 @@ print("TIMING:" + str(runner.last_timings.get("总计", 0)), flush=True)
         return passport
 
     def _drain_ui_queue(self) -> None:
+        if self.is_closing:
+            return
         while True:
             try:
                 kind, payload = self.ui_queue.get_nowait()
@@ -933,7 +1639,8 @@ print("TIMING:" + str(runner.last_timings.get("总计", 0)), flush=True)
             elif kind == "csv_timing":
                 account, timing = payload
                 self._set_csv_timing(account, timing)
-        self.after(100, self._drain_ui_queue)
+        if not self.is_closing:
+            self.after(100, self._drain_ui_queue)
 
     def _set_status(self, account: AccountConfig, status: str) -> None:
         self.status_by_key[account.key] = status

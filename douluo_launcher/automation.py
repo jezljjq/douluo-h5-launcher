@@ -5,6 +5,7 @@ import shutil
 import subprocess as _subprocess
 import threading
 import time
+import ctypes
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -70,6 +71,13 @@ def _preview_text(text: str, limit: int) -> str:
     if len(normalized) > limit:
         return normalized[:limit] + "..."
     return normalized
+
+
+def _extract_clipboard_hex(text: str) -> str | None:
+    match = re.search(r"[0-9a-fA-F]{8}", text or "")
+    if not match:
+        return None
+    return match.group(0).lower()
 
 
 class AccountRunner:
@@ -243,6 +251,8 @@ class AccountRunner:
             self.update_status(self.account, "已提取通行证")
             if source == "ocr":
                 self.log(f"[窗口{self.account.game_window_no}] OCR 提取成功：{passport}")
+            elif source == "copy":
+                self.log(f"[窗口{self.account.game_window_no}] 复制方式提取成功：{passport}")
             elif source == "manual":
                 self.log(f"[窗口{self.account.game_window_no}] 手动输入通行证：{passport}")
             else:
@@ -601,7 +611,7 @@ class AccountRunner:
                 if not passport:
                     raise RuntimeError(f"通行证识别失败（页面状态={source}）")
                 _timings["OCR"] = _time.perf_counter() - _t0
-                self.log(f"[方式二] 通行证: {passport} (来源=OCR)")
+                self.log(f"[方式二] 通行证: {passport} (来源={source})")
                 self.update_status(self.account, "已提取通行证")
 
                 # === 步骤2：打开浏览器 + 账号密码登录 ===
@@ -643,13 +653,7 @@ class AccountRunner:
                 # === 步骤3：关闭公告（多点几次确保公告消失） ===
                 _t2 = _time.perf_counter()
                 self.update_status(self.account, "关闭公告")
-                for _ in range(4):
-                    page.mouse.click(740, 680)
-                    self._wait_or_stop(page, 150)
-                    # 也尝试点 canvas 中央关公告
-                    page.mouse.click(480, 360)
-                    self._wait_or_stop(page, 100)
-                self._wait_or_stop(page, 300)
+                self._close_m2_notice(page)
                 self.update_status(self.account, "已关闭公告")
                 self.log("[方式二] 公告已关闭")
                 _timings["关闭公告"] = _time.perf_counter() - _t2
@@ -677,6 +681,8 @@ class AccountRunner:
                         self.log(f"[方式二] 浏览器截图已保存: {_ref_path}")
                     except Exception:
                         pass
+                    if self._m2_notice_overlay_visible(_client):
+                        raise RuntimeError("方式二公告仍未关闭，停止定位通行证按钮")
                     btn_pos = self._locate_passport_button(_client, use_fallback=False)
                     if btn_pos:
                         AccountRunner._cached_btn_m2 = btn_pos
@@ -1099,6 +1105,13 @@ class AccountRunner:
 
         if state == "qr_page":
             self.log(f"[窗口{self.account.game_window_no}] 检测到二维码登录界面")
+            copied_passport, copy_error = self._copy_passport_from_login_window(selected, image)
+            if copied_passport:
+                self.log(f"[窗口{self.account.game_window_no}] 复制方式获取通行证成功，采用复制结果")
+                return copied_passport, "copy"
+            self.log(
+                f"[窗口{self.account.game_window_no}] 复制方式获取通行证失败，失败类型={copy_error}，进入 OCR 兜底"
+            )
             passport = self._ocr_passport_from_text_region(image, prefix, raw_path)
             if passport:
                 return passport, "ocr"
@@ -1116,6 +1129,245 @@ class AccountRunner:
 
         # 兜底：非 qr_page 即已登录，不跑OCR
         return None, "logged_in"
+
+    def _copy_passport_from_login_window(self, window, image) -> tuple[str | None, str]:
+        self.log(f"[窗口{self.account.game_window_no}] 开始复制方式获取通行证")
+        self.log(f"[窗口{self.account.game_window_no}] 登录窗口 hwnd={window.hwnd} 标题={window.title}")
+
+        original_ok, original_text = self._read_clipboard_text()
+        if not self._set_clipboard_text(""):
+            self.log(f"[窗口{self.account.game_window_no}] 剪贴板预清空失败，仍继续尝试复制")
+
+        try:
+            click_x, click_y, drag_start_x, drag_end_x = self._passport_copy_screen_region(window, image)
+            self.log(f"[窗口{self.account.game_window_no}] 双击坐标: ({click_x}, {click_y})")
+            self._activate_and_copy_at(window.hwnd, click_x, click_y)
+            time.sleep(0.25)
+            clipboard_ok, clipboard_text = self._read_clipboard_text()
+            if not clipboard_ok:
+                self.log(f"[窗口{self.account.game_window_no}] 剪贴板读取失败")
+                return None, "COPY_FAILED"
+
+            text_length = len(clipboard_text or "")
+            self.log(f"[窗口{self.account.game_window_no}] 剪贴板文本长度: {text_length}")
+            if not clipboard_text:
+                self.log(f"[窗口{self.account.game_window_no}] 双击复制为空，尝试拖选复制")
+                self._set_clipboard_text("")
+                self._drag_select_and_copy(window.hwnd, drag_start_x, click_y, drag_end_x)
+                time.sleep(0.35)
+                clipboard_ok, clipboard_text = self._read_clipboard_text()
+                if not clipboard_ok:
+                    self.log(f"[窗口{self.account.game_window_no}] 拖选后剪贴板读取失败")
+                    return None, "COPY_FAILED"
+                text_length = len(clipboard_text or "")
+                self.log(f"[窗口{self.account.game_window_no}] 拖选后剪贴板文本长度: {text_length}")
+                if not clipboard_text:
+                    return None, "COPY_EMPTY"
+
+            passport = _extract_clipboard_hex(clipboard_text)
+            if not passport:
+                preview = _preview_text(clipboard_text, 80)
+                self.log(f"[窗口{self.account.game_window_no}] 剪贴板未提取到 8 位 hex: {preview}")
+                return None, "COPY_NO_HEX"
+
+            self.log(f"[窗口{self.account.game_window_no}] 提取到的 8 位通行证: {passport}")
+            if len(passport) != 8:
+                return None, "COPY_NO_HEX"
+            return passport, ""
+        except Exception as exc:
+            self.log(f"[窗口{self.account.game_window_no}] 复制方式异常: {exc}")
+            return None, "COPY_FAILED"
+        finally:
+            if original_ok and original_text is not None:
+                if not self._set_clipboard_text(original_text):
+                    self.log(f"[窗口{self.account.game_window_no}] 原剪贴板文本恢复失败")
+            else:
+                self.log(f"[窗口{self.account.game_window_no}] 原剪贴板无可恢复文本，已跳过恢复")
+
+    def _passport_copy_screen_region(self, window, image) -> tuple[int, int, int, int]:
+        bar_box = self._locate_passport_copy_bar(image)
+        if bar_box is not None:
+            left, top, right, bottom = bar_box
+            local_x = left + int((right - left) * 0.70)
+            local_y = top + (bottom - top) // 2
+            drag_start_x = window.left + left + int((right - left) * 0.48)
+            drag_end_x = window.left + left + int((right - left) * 0.94)
+            self.log(
+                f"[窗口{self.account.game_window_no}] 复制定位通行证横条: "
+                f"box=({left},{top},{right},{bottom})"
+            )
+            return window.left + local_x, window.top + local_y, drag_start_x, drag_end_x
+
+        _crop, bbox = self._crop_passport_hex_region(image)
+        if bbox is not None:
+            left, top, right, bottom = bbox
+            local_x = left + int((right - left) * 0.68)
+            local_y = top + (bottom - top) // 2
+            drag_start_x = window.left + left + int((right - left) * 0.45)
+            drag_end_x = window.left + left + int((right - left) * 0.95)
+            return window.left + local_x, window.top + local_y, drag_start_x, drag_end_x
+
+        local_x = int(window.width * 0.66)
+        local_y = int(window.height * 0.74)
+        drag_start_x = window.left + int(window.width * 0.48)
+        drag_end_x = window.left + int(window.width * 0.92)
+        return window.left + local_x, window.top + local_y, drag_start_x, drag_end_x
+
+    @staticmethod
+    def _locate_passport_copy_bar(image) -> tuple[int, int, int, int] | None:
+        import numpy as np
+
+        arr = np.array(image.convert("RGB"))
+        height, width = arr.shape[:2]
+        r_arr = arr[:, :, 0].astype(int)
+        g_arr = arr[:, :, 1].astype(int)
+        b_arr = arr[:, :, 2].astype(int)
+
+        reddish = (
+            (r_arr > 70)
+            & (r_arr > g_arr + 10)
+            & (r_arr > b_arr + 5)
+            & (g_arr < 140)
+            & (b_arr < 140)
+        )
+        row_ratio = reddish.mean(axis=1)
+
+        search_start = int(height * 0.72)
+        search_end = int(height * 0.92)
+        best_score = 0.0
+        best_box = None
+        streak_start = None
+
+        for y in range(search_start, search_end):
+            if row_ratio[y] >= 0.18:
+                if streak_start is None:
+                    streak_start = y
+            elif streak_start is not None:
+                top = streak_start
+                bottom = y
+                streak_start = None
+                if bottom - top < 6:
+                    continue
+                score = float(row_ratio[top:bottom].mean()) * (bottom - top)
+                if score > best_score:
+                    best_score = score
+                    best_box = (int(width * 0.06), top, int(width * 0.94), bottom)
+
+        if streak_start is not None:
+            top = streak_start
+            bottom = search_end
+            if bottom - top >= 6:
+                score = float(row_ratio[top:bottom].mean()) * (bottom - top)
+                if score > best_score:
+                    best_box = (int(width * 0.06), top, int(width * 0.94), bottom)
+
+        if best_box is None:
+            return None
+
+        left, top, right, bottom = best_box
+        if bottom - top < 24:
+            bottom = min(height, top + 42)
+        return left, top, right, bottom
+
+    @staticmethod
+    def _activate_and_copy_at(hwnd: int, x: int, y: int) -> None:
+        user32 = ctypes.windll.user32
+        user32.ShowWindow(hwnd, 5)
+        user32.SetForegroundWindow(hwnd)
+        time.sleep(0.25)
+
+        user32.SetCursorPos(int(x), int(y))
+        time.sleep(0.05)
+        left_down = 0x0002
+        left_up = 0x0004
+        for _ in range(2):
+            user32.mouse_event(left_down, 0, 0, 0, 0)
+            time.sleep(0.04)
+            user32.mouse_event(left_up, 0, 0, 0, 0)
+            time.sleep(0.05)
+
+        vk_control = 0x11
+        vk_c = 0x43
+        keyeventf_keyup = 0x0002
+        time.sleep(0.08)
+        user32.keybd_event(vk_control, 0, 0, 0)
+        user32.keybd_event(vk_c, 0, 0, 0)
+        time.sleep(0.04)
+        user32.keybd_event(vk_c, 0, keyeventf_keyup, 0)
+        user32.keybd_event(vk_control, 0, keyeventf_keyup, 0)
+
+    @staticmethod
+    def _drag_select_and_copy(hwnd: int, start_x: int, y: int, end_x: int) -> None:
+        user32 = ctypes.windll.user32
+        user32.ShowWindow(hwnd, 5)
+        user32.SetForegroundWindow(hwnd)
+        time.sleep(0.25)
+
+        left_down = 0x0002
+        left_up = 0x0004
+        user32.SetCursorPos(int(start_x), int(y))
+        time.sleep(0.08)
+        user32.mouse_event(left_down, 0, 0, 0, 0)
+        time.sleep(0.08)
+        step = 8 if end_x >= start_x else -8
+        for x in range(int(start_x), int(end_x), step):
+            user32.SetCursorPos(x, int(y))
+            time.sleep(0.01)
+        user32.SetCursorPos(int(end_x), int(y))
+        time.sleep(0.08)
+        user32.mouse_event(left_up, 0, 0, 0, 0)
+
+        vk_control = 0x11
+        vk_c = 0x43
+        keyeventf_keyup = 0x0002
+        time.sleep(0.12)
+        user32.keybd_event(vk_control, 0, 0, 0)
+        user32.keybd_event(vk_c, 0, 0, 0)
+        time.sleep(0.04)
+        user32.keybd_event(vk_c, 0, keyeventf_keyup, 0)
+        user32.keybd_event(vk_control, 0, keyeventf_keyup, 0)
+
+    @staticmethod
+    def _read_clipboard_text() -> tuple[bool, str | None]:
+        try:
+            import win32clipboard
+            import win32con
+        except Exception:
+            return False, None
+
+        for _ in range(8):
+            try:
+                win32clipboard.OpenClipboard()
+                try:
+                    if not win32clipboard.IsClipboardFormatAvailable(win32con.CF_UNICODETEXT):
+                        return True, None
+                    return True, win32clipboard.GetClipboardData(win32con.CF_UNICODETEXT)
+                finally:
+                    win32clipboard.CloseClipboard()
+            except Exception:
+                time.sleep(0.05)
+        return False, None
+
+    @staticmethod
+    def _set_clipboard_text(text: str) -> bool:
+        try:
+            import win32clipboard
+            import win32con
+        except Exception:
+            return False
+
+        for _ in range(8):
+            try:
+                win32clipboard.OpenClipboard()
+                try:
+                    win32clipboard.EmptyClipboard()
+                    win32clipboard.SetClipboardData(win32con.CF_UNICODETEXT, text)
+                    return True
+                finally:
+                    win32clipboard.CloseClipboard()
+            except Exception:
+                time.sleep(0.05)
+        return False
 
     def _quick_login_state(self) -> str:
         """轻量状态检测：截图 + 图像特征判断，不做 OCR。用于校验轮询。"""
@@ -1309,8 +1561,15 @@ class AccountRunner:
             gray = ImageOps.autocontrast(big.convert("L"))
             binary = gray.point(lambda p: 0 if p < 100 else 255, mode="1")
             result = self._ocr_chars_template_match(binary)
-            return result
-        except Exception:
+            if not result:
+                self.log(f"[窗口{self.account.game_window_no}] 模板匹配OCR候选结果: 无")
+                return None
+            accepted, failure_type = self._decide_ocr_candidate("模板匹配", {result: 1})
+            if failure_type:
+                self.log(f"[窗口{self.account.game_window_no}] 模板匹配OCR失败类型={failure_type}")
+            return accepted
+        except Exception as exc:
+            self.log(f"[窗口{self.account.game_window_no}] 模板匹配OCR异常: {exc}")
             return None
 
     @staticmethod
@@ -1468,6 +1727,84 @@ class AccountRunner:
             return "".join(chars)
         return None
 
+    def _decide_ocr_candidate(self, label: str, results: dict[str, int]) -> tuple[str | None, str | None]:
+        normalized: dict[str, int] = {}
+        for candidate, votes in results.items():
+            value = (candidate or "").strip().lower()
+            if not re.fullmatch(r"[0-9a-f]{8}", value):
+                continue
+            normalized[value] = normalized.get(value, 0) + int(votes)
+
+        if not normalized:
+            self.log(f"[窗口{self.account.game_window_no}] {label} OCR候选结果: 无")
+            self.log(
+                f"[窗口{self.account.game_window_no}] {label} OCR是否接受: 否，失败类型=OCR_LOW_CONFIDENCE"
+            )
+            return None, "OCR_LOW_CONFIDENCE"
+
+        total_votes = sum(normalized.values())
+        ordered = sorted(normalized.items(), key=lambda item: (-item[1], item[0]))
+        self.log(
+            f"[窗口{self.account.game_window_no}] {label} OCR候选结果: "
+            f"{len(ordered)}种，总票数={total_votes}"
+        )
+        for candidate, votes in ordered:
+            self.log(
+                f"[窗口{self.account.game_window_no}] {label} OCR候选票数: "
+                f"{candidate}={votes}/{total_votes}"
+            )
+
+        ambiguous_positions: list[int] = []
+        low_confidence_positions: list[int] = []
+        for index in range(8):
+            char_votes: dict[str, int] = {}
+            for candidate, votes in normalized.items():
+                char = candidate[index]
+                char_votes[char] = char_votes.get(char, 0) + votes
+
+            char_ordered = sorted(char_votes.items(), key=lambda item: (-item[1], item[0]))
+            vote_text = ", ".join(f"{char}={votes}" for char, votes in char_ordered)
+            top_char, top_votes = char_ordered[0]
+            ce_competing = char_votes.get("c", 0) > 0 and char_votes.get("e", 0) > 0
+            if ce_competing:
+                ambiguous_positions.append(index + 1)
+            if top_votes != total_votes:
+                low_confidence_positions.append(index + 1)
+            self.log(
+                f"[窗口{self.account.game_window_no}] {label} 第{index + 1}位字符投票: "
+                f"{vote_text}；最高={top_char}({top_votes}/{total_votes})"
+            )
+
+        if ambiguous_positions:
+            positions = ",".join(str(pos) for pos in ambiguous_positions)
+            self.log(f"[窗口{self.account.game_window_no}] {label} OCR存疑位置: {positions}（c/e竞争）")
+            self.log(
+                f"[窗口{self.account.game_window_no}] {label} OCR是否接受: 否，失败类型=OCR_AMBIGUOUS_CHAR"
+            )
+            return None, "OCR_AMBIGUOUS_CHAR"
+
+        best, best_votes = ordered[0]
+        if total_votes < 4:
+            self.log(f"[窗口{self.account.game_window_no}] {label} OCR存疑位置: 全部（总票数不足）")
+            self.log(
+                f"[窗口{self.account.game_window_no}] {label} OCR是否接受: 否，失败类型=OCR_LOW_CONFIDENCE"
+            )
+            return None, "OCR_LOW_CONFIDENCE"
+
+        if best_votes != total_votes or low_confidence_positions:
+            positions = ",".join(str(pos) for pos in sorted(set(low_confidence_positions))) or "候选不一致"
+            self.log(f"[窗口{self.account.game_window_no}] {label} OCR存疑位置: {positions}")
+            self.log(
+                f"[窗口{self.account.game_window_no}] {label} OCR是否接受: 否，失败类型=OCR_LOW_CONFIDENCE"
+            )
+            return None, "OCR_LOW_CONFIDENCE"
+
+        self.log(f"[窗口{self.account.game_window_no}] {label} OCR存疑位置: 无")
+        self.log(
+            f"[窗口{self.account.game_window_no}] {label} OCR是否接受: 是，结果={best}"
+        )
+        return best, None
+
     def _ocr_passport_from_text_region(self, raw_image, prefix: str, raw_path: Path) -> str | None:
         """针对二维码页底部文字区域做OCR（避开QR码密集图案的干扰）。"""
         import re as _re
@@ -1514,22 +1851,11 @@ class AccountRunner:
             )
             return None
 
-        total = sum(results.values())
-        mixed = {k: v for k, v in results.items() if any(c in "abcdef" for c in k)}
-        candidates = mixed if mixed else results
-        best = max(candidates, key=lambda k: candidates[k])
-        best_votes = candidates[best]
+        best, failure_type = self._decide_ocr_candidate("文字区域", results)
+        if failure_type:
+            self.log(f"[窗口{self.account.game_window_no}] 文字区域OCR失败类型={failure_type}")
+            return None
 
-        if total < 2 or best_votes * 2 <= total:
-            self.log(
-                f"[窗口{self.account.game_window_no}] 文字区域OCR票数偏低"
-                f"（{best}={best_votes}/{total}），接受最佳候选"
-            )
-
-        self.log(
-            f"[窗口{self.account.game_window_no}] 文字区域OCR: "
-            f"选择 {best} (票数={best_votes}/{total})"
-        )
         return best
 
     def _ocr_passport_from_login_image(self, raw_image, prefix: str, raw_path: Path) -> str | None:
@@ -1616,16 +1942,10 @@ class AccountRunner:
             self.log(f"[窗口{self.account.game_window_no}] 全图OCR未能识别到8位hex通行证")
             return None
 
-        # 投票策略：优先选包含 a-f 的结果（避免全数字 d→0 误判）
-        mixed = {k: v for k, v in results.items() if any(c in "abcdef" for c in k)}
-        candidates = mixed if mixed else results
-        # 按出现次数降序取最佳
-        best = max(candidates, key=lambda k: candidates[k])
-        self.log(
-            f"[窗口{self.account.game_window_no}] OCR投票: "
-            f"共{len(results)}种结果, "
-            f"选择 {best} (票数={candidates[best]}/{sum(results.values())})"
-        )
+        best, failure_type = self._decide_ocr_candidate("全图", results)
+        if failure_type:
+            self.log(f"[窗口{self.account.game_window_no}] 全图OCR失败类型={failure_type}")
+            return None
 
         # 保存最佳结果截图
         if best in best_image_for_result:
@@ -2310,6 +2630,95 @@ class AccountRunner:
             )
         return center
 
+    def _close_m2_notice(self, page) -> None:
+        width = int(self.settings.window_width)
+        height = int(self.settings.window_height)
+        points = [
+            (width - 15, 15, "右上角关闭"),
+            (int(width * 0.495), int(height * 0.897), "底部圆形关闭"),
+            (int(width * 0.08), int(height * 0.08), "公告外区域"),
+            (740, 680, "历史关闭坐标"),
+        ]
+
+        for attempt in range(1, max(1, self.settings.notice_close_retries) + 2):
+            self._ensure_not_stopped()
+            image = self._capture_page_image(page, f"m2_notice_before_{attempt}.png")
+            if image is not None and not self._m2_notice_overlay_visible(image):
+                self.log(f"[方式二] 公告检测：未发现遮挡弹窗（第{attempt}次检查）")
+                return
+
+            self.log(f"[方式二] 尝试关闭公告（第{attempt}次）")
+            for x, y, label in points:
+                if 0 <= x < width and 0 <= y < height:
+                    self.log(f"[方式二] 点击公告关闭候选：{label} ({x},{y})")
+                    page.mouse.click(x, y)
+                    self._wait_or_stop(page, 180)
+
+            self._wait_or_stop(page, 300)
+            image = self._capture_page_image(page, f"m2_notice_after_{attempt}.png")
+            if image is not None and not self._m2_notice_overlay_visible(image):
+                self.log(f"[方式二] 公告关闭成功（第{attempt}次）")
+                return
+            if attempt <= self.settings.notice_close_retries:
+                self.log("[方式二] 公告仍存在，继续重试")
+
+        self._capture_page_image(page, "m2_notice_still_visible.png")
+        raise RuntimeError("方式二公告关闭失败")
+
+    def _capture_page_image(self, page, file_name: str | None = None):
+        try:
+            import io
+
+            from PIL import Image
+
+            data = page.screenshot(full_page=False)
+            image = Image.open(io.BytesIO(data)).convert("RGB")
+            if file_name:
+                try:
+                    image.save(str(self._debug_dir / file_name))
+                except Exception:
+                    pass
+            return image
+        except Exception as exc:
+            self.log(f"[方式二] 公告截图检测失败: {exc}")
+            return None
+
+    @staticmethod
+    def _m2_notice_overlay_visible(image) -> bool:
+        import numpy as np
+
+        arr = np.array(image.convert("RGB"))
+        height, width = arr.shape[:2]
+        center = arr[int(height * 0.08): int(height * 0.90), int(width * 0.26): int(width * 0.74)]
+        if center.size == 0:
+            return False
+
+        r_arr = arr[:, :, 0].astype(int)
+        g_arr = arr[:, :, 1].astype(int)
+        b_arr = arr[:, :, 2].astype(int)
+        center_r = center[:, :, 0].astype(int)
+        center_g = center[:, :, 1].astype(int)
+        center_b = center[:, :, 2].astype(int)
+
+        bright_center = (
+            (center_r > 210)
+            & (center_g > 190)
+            & (center_b > 160)
+            & (abs(center_r - center_g) < 70)
+        )
+        orange_center = (
+            (center_r > 180)
+            & (center_g > 45)
+            & (center_g < 130)
+            & (center_b < 90)
+        )
+        dark_page = (r_arr < 70) & (g_arr < 70) & (b_arr < 70)
+
+        bright_ratio = float(bright_center.mean())
+        orange_ratio = float(orange_center.mean())
+        dark_ratio = float(dark_page.mean())
+        return bright_ratio > 0.16 and orange_ratio > 0.006 and dark_ratio > 0.30
+
     def _locate_passport_button(self, screenshot, use_fallback: bool = True) -> tuple[int, int] | None:
         """模板匹配定位通行证按钮，返回 viewport 中心坐标 (vx, vy) 或 None"""
         template_path = app_root() / self.settings.passport_btn_template
@@ -2338,12 +2747,8 @@ class AccountRunner:
                 if known and known[0] > 0:
                     return (known[0], known[1])
                 return None
-            # 不用回退时，返回最佳匹配位置（低分也比错误坐标强）
-            self.log(
-                f"[窗口{self.account.game_window_no}] 使用最佳匹配位置: "
-                f"({center_x},{center_y})"
-            )
-            return (center_x, center_y)
+            self.log(f"[窗口{self.account.game_window_no}] 不使用低分匹配结果，避免缓存错误坐标")
+            return None
         self.log(
             f"[窗口{self.account.game_window_no}] 模板匹配成功: "
             f"({center_x},{center_y}) score={max_val:.3f}"
