@@ -6,6 +6,7 @@ import winreg
 import subprocess
 import os
 import re
+import ctypes
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,6 +15,25 @@ def ratio_to_client_point(ratio: tuple[float, float], width: int, height: int) -
     x = max(0, min(width - 1, int(width * ratio[0])))
     y = max(0, min(height - 1, int(height * ratio[1])))
     return x, y
+
+
+DWMWA_CLOAKED = 14
+
+
+def _is_window_cloaked(hwnd: int) -> bool:
+    try:
+        cloaked = ctypes.c_int(0)
+        result = ctypes.windll.dwmapi.DwmGetWindowAttribute(
+            int(hwnd),
+            DWMWA_CLOAKED,
+            ctypes.byref(cloaked),
+            ctypes.sizeof(cloaked),
+        )
+        if result != 0:
+            return False
+        return bool(cloaked.value)
+    except Exception:
+        return False
 
 
 @dataclass(frozen=True)
@@ -166,6 +186,8 @@ def list_browser_windows(title_keyword: str = "") -> list[WindowInfo]:
     def callback(hwnd, _):
         if not win32gui.IsWindowVisible(hwnd):
             return
+        if _is_window_cloaked(hwnd):
+            return
         title = win32gui.GetWindowText(hwnd)
         class_name = win32gui.GetClassName(hwnd)
         if class_name != "Chrome_WidgetWin_1":
@@ -199,6 +221,8 @@ def list_visible_windows(title_keyword: str = "") -> list[WindowInfo]:
 
     def callback(hwnd, _):
         if not win32gui.IsWindowVisible(hwnd):
+            return
+        if _is_window_cloaked(hwnd):
             return
         title = win32gui.GetWindowText(hwnd)
         if not title:

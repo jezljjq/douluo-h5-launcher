@@ -1,6 +1,6 @@
 # 斗罗大陆H5上号器（前台串行稳定版）
 
-**当前阶段：前台串行模式，方式一和方式二均已接入；窗口管理区已接入。部分新功能代码层面已实现，但仍需现场实机验证。**
+**当前阶段：前台串行模式，方式一和方式二均已接入；窗口管理区已接入。方式一单层 9 账号已验证“快速提交 + 统一校验”最终全部成功。**
 
 > 项目级开发规则见 [CLAUDE.md](CLAUDE.md)。
 
@@ -49,6 +49,8 @@
 | 截图/日志清理 | ✅ 已实现 | _error/ 保留10张，logs/ 保留2份 | — |
 | 窗口管理区 | ✅ 已接入 | 批量启动、识别、排列、关闭、重命名、参数记忆 | [docs/WINDOW_MANAGER_AND_PASSPORT_MILESTONE.md](docs/WINDOW_MANAGER_AND_PASSPORT_MILESTONE.md) |
 | 停止任务/关闭清理 | ✅ 已验证 | 停止时终止账号子进程、清理 dm_click_helper.py 和 Chromium | [CLICK_SOLUTION.md](CLICK_SOLUTION.md) |
+| 通行证弹窗坐标缓存 | ✅ 已验证 | `debug_ocr/passport_dialog_pos_cache.json` 按 viewport 缓存 button/input/confirm，跨账号/子进程复用 | [CLICK_SOLUTION.md](CLICK_SOLUTION.md) |
+| 批量快速登录 + 统一校验 | ✅ 已验证 | 当前层/全部串行先快速提交，统一校验后只重登失败账号；9 个单层账号最终 9/9 成功 | [docs/LAUNCHER_FINAL_MILESTONE.md](docs/LAUNCHER_FINAL_MILESTONE.md) |
 
 ### 2.1 当前窗口管理区能力
 
@@ -76,6 +78,36 @@
 - 关闭窗口
 
 窗口管理参数记忆保存到上号器项目内部独立配置文件 `window_manager_settings.json`。该能力已代码实现，但暂未现场验证，不能写作“实机验证通过”。
+
+---
+
+## 2.2 快速登录缓存与统一校验（2026-05-17）
+
+当前方式一批量串行已接入：
+
+- 通行证弹窗坐标文件缓存：`debug_ocr/passport_dialog_pos_cache.json`。
+- 缓存 key 使用浏览器真实 viewport，例如 `960x720`。
+- 缓存内容包含通行证按钮、输入框、确认按钮坐标和更新时间。
+- 命中缓存后使用合并 Dm chain：
+  `click 通行证按钮 → wait → click 输入框 → type 通行证 → click 确认`。
+- 当前层串行 / 全部串行使用“快速提交 + 统一校验 + 失败重登”。
+- 单账号运行仍保留完整校验逻辑。
+- `重新次数` 用于限制统一校验和失败重登轮数；全部成功会提前结束。
+
+已验证结果：
+
+- 已读取通行证弹窗坐标缓存。
+- 已使用合并 Dm chain，合并 chain 耗时约 `2.4s`。
+- 9 个单层账号批量快速登录 + 统一校验最终全部成功。
+- 最终结果：总 9，成功 9，失败 0。
+
+安全规则：
+
+- `qr_page` 不能判成功。
+- `unknown` 不能判成功。
+- 截图失败不能判成功。
+- 只有明确 `logged_in` 才能成功。
+- 失败账号只重登失败账号，不全量重跑。
 
 ---
 

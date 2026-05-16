@@ -32,6 +32,14 @@ LEVEL_OFFSETS = {
 }
 
 LEVELS = tuple(LEVEL_OFFSETS.keys())
+SINGLE_LEVEL_NAME = "单层账号"
+SELECTABLE_LEVELS = (SINGLE_LEVEL_NAME, *LEVELS)
+DEFAULT_LEVEL_COUNTS = {
+    "第一层": 8,
+    "第二层": 8,
+    "第三层": 8,
+    "第四层": 8,
+}
 STATUSES = ("未开始", "OCR中", "打开中", "关闭公告", "已提取通行证", "已关闭公告", "输入中", "已输入通行证", "成功", "失败")
 
 
@@ -153,12 +161,29 @@ class AutomationSettings:
     logged_in_edge_density_max: float = 0.60
 
 
-def compute_game_window_no(level: str, bookmark_no: int) -> int:
-    if level not in LEVEL_OFFSETS:
+def compute_game_window_no(
+    level: str,
+    bookmark_no: int,
+    level_counts: dict[str, int] | None = None,
+    level_order: Iterable[str] = LEVELS,
+) -> int:
+    if level == SINGLE_LEVEL_NAME:
+        if bookmark_no < 1:
+            raise ValueError(f"收藏编号必须大于等于 1: {bookmark_no}")
+        return bookmark_no
+    if level not in LEVELS:
         raise ValueError(f"未知层级: {level}")
-    if bookmark_no < 1 or bookmark_no > 8:
-        raise ValueError(f"收藏编号必须是 1-8: {bookmark_no}")
-    return bookmark_no + LEVEL_OFFSETS[level]
+    counts = _normalize_level_counts(level_counts, level_order)
+    max_no = counts[level]
+    if bookmark_no < 1 or bookmark_no > max_no:
+        raise ValueError(f"{level} 收藏编号必须是 1-{max_no}: {bookmark_no}")
+
+    offset = 0
+    for ordered_level in level_order:
+        if ordered_level == level:
+            break
+        offset += counts.get(ordered_level, 0)
+    return offset + bookmark_no
 
 
 def load_accounts(path: str | Path) -> list[AccountConfig]:
@@ -180,6 +205,8 @@ def load_accounts_from_bookmarks(
     bookmark_file: str | Path,
     root_name: str,
     level_names: Iterable[str] = LEVELS,
+    level_counts: dict[str, int] | None = None,
+    log=None,
 ) -> list[AccountConfig]:
     path = Path(bookmark_file)
     if not path.exists():
@@ -192,22 +219,39 @@ def load_accounts_from_bookmarks(
     if root_folder is None:
         raise ValueError(f"收藏夹里找不到根目录: {root_name}")
 
+    level_order = tuple(level_names)
+    counts = _normalize_level_counts(level_counts, level_order)
     accounts: list[AccountConfig] = []
-    for level in level_names:
+    accounts.extend(_load_single_level_accounts(root_folder, log=log))
+
+    for level in level_order:
         level_folder = _find_direct_child_folder(root_folder, level)
         if level_folder is None:
+            if log:
+                log(f"收藏夹层级不存在，已跳过：{level}")
             continue
+        children_by_no: dict[int, dict[str, object]] = {}
         for child in level_folder.get("children", []):
-            if child.get("type") != "url":
+            if not isinstance(child, dict) or child.get("type") != "url":
                 continue
-            bookmark_no = _parse_bookmark_no(str(child.get("name", "")).strip())
+            bookmark_no = _parse_bookmark_no(str(child.get("name", "")).strip(), counts[level])
             if bookmark_no is None:
+                if log:
+                    log(f"{level} 非数字或超范围收藏项已跳过：{child.get('name', '')}")
+                continue
+            children_by_no[bookmark_no] = child
+
+        for bookmark_no in range(1, counts[level] + 1):
+            child = children_by_no.get(bookmark_no)
+            if child is None:
+                if log:
+                    log(f"{level} 收藏编号 {bookmark_no} 不存在，已跳过。")
                 continue
             accounts.append(
                 AccountConfig(
                     level=level,
                     bookmark_no=bookmark_no,
-                    game_window_no=compute_game_window_no(level, bookmark_no),
+                    game_window_no=compute_game_window_no(level, bookmark_no, counts, level_order),
                     url=str(child.get("url", "")).strip(),
                 )
             )
@@ -375,13 +419,56 @@ def _find_direct_child_folder(parent: dict[str, object], folder_name: str) -> di
     return None
 
 
-def _parse_bookmark_no(name: str) -> int | None:
+def _load_single_level_accounts(root_folder: dict[str, object], log=None) -> list[AccountConfig]:
+    accounts: list[AccountConfig] = []
+    for child in root_folder.get("children", []):
+        if not isinstance(child, dict):
+            continue
+        if child.get("type") == "folder":
+            continue
+        if child.get("type") != "url":
+            continue
+        name = str(child.get("name", "")).strip()
+        bookmark_no = _parse_bookmark_no(name)
+        if bookmark_no is None:
+            if log:
+                log(f"单层账号非数字收藏项已跳过：{name}")
+            continue
+        accounts.append(
+            AccountConfig(
+                level=SINGLE_LEVEL_NAME,
+                bookmark_no=bookmark_no,
+                game_window_no=bookmark_no,
+                url=str(child.get("url", "")).strip(),
+            )
+        )
+    return sorted(accounts, key=lambda account: account.bookmark_no)
+
+
+def _normalize_level_counts(
+    level_counts: dict[str, int] | None = None,
+    level_order: Iterable[str] = LEVELS,
+) -> dict[str, int]:
+    normalized = DEFAULT_LEVEL_COUNTS.copy()
+    if level_counts:
+        for level in level_order:
+            value = int(level_counts.get(level, normalized.get(level, 8)))
+            if value < 0:
+                raise ValueError(f"{level} 每层数量不能小于 0")
+            normalized[level] = value
+    return normalized
+
+
+def _parse_bookmark_no(name: str, max_no: int | None = None) -> int | None:
     normalized = name.replace("号", "").strip()
     if not normalized.isdigit():
         return None
     number = int(normalized)
-    if 1 <= number <= 8:
+    if number < 1:
+        return None
+    if max_no is None or number <= max_no:
         return number
+    return None
 
 
 def load_csv_accounts(path: str | Path) -> tuple[list[CSVAccount], str | None]:

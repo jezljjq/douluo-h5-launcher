@@ -15,25 +15,33 @@ from .config import (
     AccountConfig,
     CSVAccount,
     LEVELS,
+    SELECTABLE_LEVELS,
+    SINGLE_LEVEL_NAME,
     STATUSES,
     app_root,
     project_root,
-    filter_accounts,
     find_default_bookmark_file,
     load_accounts_from_bookmarks,
     load_csv_accounts,
     load_settings,
 )
-from .dm_client import diagnose_dm_environment_with_32bit_python
+from .dm_client import diagnose_dm_environment_with_32bit_python, select_login_window_by_game_no
 from .window_manager import (
+    RowTileConfig,
     TileConfig,
+    calculate_row_tile_plan,
     close_game_windows,
     launch_game_process,
     list_game_windows,
     rename_game_windows,
     tile_game_windows,
+    tile_game_windows_by_row_count,
 )
 from .window_manager_settings import (
+    FixedModeSettings,
+    RowCountModeSettings,
+    TILE_MODE_FIXED,
+    TILE_MODE_ROW_COUNT,
     WindowManagerSettings,
     load_window_manager_settings,
     save_window_manager_settings,
@@ -44,6 +52,8 @@ WM_WAIT_TIMEOUT_SECONDS = 60
 WM_STABLE_CHECKS = 3
 WM_POLL_INTERVAL_SECONDS = 0.5
 WM_FINAL_DELAY_SECONDS = 1
+WM_TILE_MODE_FIXED = "固定参数排列"
+WM_TILE_MODE_ROW_COUNT = "根据行数排列"
 
 
 class LauncherApp(tk.Tk):
@@ -79,23 +89,30 @@ class LauncherApp(tk.Tk):
         self.level_var = tk.StringVar(value="第一层")
         self.account_var = tk.StringVar(value="")
         self.max_workers_var = tk.IntVar(value=4)
+        self.batch_verify_rounds_var = tk.IntVar(value=3)
         self.notice_outside_x_var = tk.DoubleVar(value=0.08)
         self.notice_outside_y_var = tk.DoubleVar(value=0.08)
         self.method_var = tk.StringVar(value="method1")
         self.csv_path = tk.StringVar(value="")
+        self.level_count_vars = {level: tk.IntVar(value=8) for level in LEVELS}
         self.wm_game_path_var = tk.StringVar(value="")
         self.wm_launch_count_var = tk.IntVar(value=31)
         self.wm_launch_interval_var = tk.IntVar(value=300)
         self.wm_auto_tile_after_launch_var = tk.BooleanVar(value=True)
         self.wm_auto_rename_after_tile_var = tk.BooleanVar(value=True)
         self.wm_title_template_var = tk.StringVar(value="斗罗大陆H5-{index}号")
-        self.wm_window_width_var = tk.IntVar(value=320)
-        self.wm_window_height_var = tk.IntVar(value=540)
+        self.wm_tile_mode_var = tk.StringVar(value=WM_TILE_MODE_FIXED)
+        self.wm_window_width_var = tk.StringVar(value="320")
+        self.wm_window_height_var = tk.StringVar(value="540")
         self.wm_start_x_var = tk.IntVar(value=250)
         self.wm_start_y_var = tk.IntVar(value=0)
         self.wm_offset_x_var = tk.IntVar(value=320)
         self.wm_offset_y_var = tk.IntVar(value=525)
         self.wm_per_row_var = tk.IntVar(value=8)
+        self.wm_prevent_overflow_var = tk.BooleanVar(value=True)
+        self.wm_fixed_mode_settings = FixedModeSettings()
+        self.wm_row_count_mode_settings = RowCountModeSettings()
+        self.wm_current_tile_mode_key = TILE_MODE_FIXED
         self.csv_accounts: list[CSVAccount] = []
         self.csv_status_by_key: dict[str, str] = {}
         self.csv_passport_by_key: dict[str, str] = {}
@@ -161,30 +178,97 @@ class LauncherApp(tk.Tk):
         ttk.Button(window_frame, text="重命名", width=8,
                    command=self._wm_rename_windows).grid(row=1, column=12, sticky="ew", padx=(0, 6), pady=3)
 
-        # 第3行：窗口尺寸和排列参数
-        third_row_fields = (
-            ("窗口宽度", self.wm_window_width_var, 1, 3000),
-            ("窗口高度", self.wm_window_height_var, 1, 3000),
-            ("每行数量", self.wm_per_row_var, 1, 99),
-            ("起点X", self.wm_start_x_var, -5000, 5000),
-            ("起点Y", self.wm_start_y_var, -5000, 5000),
-            ("横向偏移", self.wm_offset_x_var, -5000, 5000),
-            ("纵向偏移", self.wm_offset_y_var, -5000, 5000),
+        # 第3行：排列方式和保护选项
+        ttk.Label(window_frame, text="排列方式").grid(row=2, column=0, sticky="e", padx=(4, 6), pady=3)
+        self.wm_tile_mode_combo = ttk.Combobox(
+            window_frame,
+            textvariable=self.wm_tile_mode_var,
+            values=(WM_TILE_MODE_FIXED, WM_TILE_MODE_ROW_COUNT),
+            state="readonly",
+            width=14,
         )
-        for index, (label, variable, min_value, max_value) in enumerate(third_row_fields):
+        self.wm_tile_mode_combo.grid(row=2, column=1, columnspan=2, sticky="w", padx=(0, 12), pady=3)
+        self.wm_tile_mode_combo.bind("<<ComboboxSelected>>", lambda _: self._wm_on_tile_mode_changed())
+        ttk.Label(window_frame, text="根据行数排列会自动缩放窗口").grid(
+            row=2, column=3, columnspan=2, sticky="w", padx=(0, 12), pady=3
+        )
+        ttk.Checkbutton(
+            window_frame,
+            text="禁止超出屏幕宽度",
+            variable=self.wm_prevent_overflow_var,
+        ).grid(row=2, column=5, columnspan=3, sticky="w", padx=(0, 12), pady=3)
+
+        # 第4行：窗口尺寸和排列参数
+        self.wm_fixed_param_widgets = []
+        self.wm_row_param_widgets = []
+
+        def add_widget(widget, row: int, column: int, **grid_options):
+            widget.grid(row=row, column=column, **grid_options)
+            return widget
+
+        fixed_specs = (
+            ("窗口宽度", "entry", self.wm_window_width_var, None, None),
+            ("窗口高度", "entry", self.wm_window_height_var, None, None),
+            ("每行数量", "spin", self.wm_per_row_var, 1, 99),
+            ("起点X", "spin", self.wm_start_x_var, -5000, 5000),
+            ("起点Y", "spin", self.wm_start_y_var, -5000, 5000),
+            ("横向偏移", "spin", self.wm_offset_x_var, -5000, 5000),
+            ("纵向偏移", "spin", self.wm_offset_y_var, -5000, 5000),
+        )
+        for index, (label, kind, variable, min_value, max_value) in enumerate(fixed_specs):
             label_column = index * 2
             input_column = label_column + 1
-            ttk.Label(window_frame, text=label).grid(
-                row=2, column=label_column, sticky="e", padx=(4 if index == 0 else 8, 4), pady=3
+            label_widget = add_widget(
+                ttk.Label(window_frame, text=label),
+                3,
+                label_column,
+                sticky="e",
+                padx=(4 if index == 0 else 8, 4),
+                pady=3,
             )
-            ttk.Spinbox(window_frame, from_=min_value, to=max_value, increment=1,
-                        textvariable=variable, width=6).grid(
-                row=2, column=input_column, sticky="w", padx=(0, 4), pady=3
-            )
+            if kind == "entry":
+                input_widget = add_widget(
+                    ttk.Entry(window_frame, textvariable=variable, width=7),
+                    3,
+                    input_column,
+                    sticky="w",
+                    padx=(0, 4),
+                    pady=3,
+                )
+            else:
+                input_widget = add_widget(
+                    ttk.Spinbox(window_frame, from_=min_value, to=max_value, increment=1,
+                                textvariable=variable, width=6),
+                    3,
+                    input_column,
+                    sticky="w",
+                    padx=(0, 4),
+                    pady=3,
+                )
+            self.wm_fixed_param_widgets.extend((label_widget, input_widget))
 
-        # 第4行：窗口操作按钮
+        row_label = add_widget(
+            ttk.Label(window_frame, text="每行数量"),
+            3,
+            0,
+            sticky="e",
+            padx=(4, 4),
+            pady=3,
+        )
+        row_input = add_widget(
+            ttk.Spinbox(window_frame, from_=1, to=99, increment=1,
+                        textvariable=self.wm_per_row_var, width=6),
+            3,
+            1,
+            sticky="w",
+            padx=(0, 4),
+            pady=3,
+        )
+        self.wm_row_param_widgets.extend((row_label, row_input))
+
+        # 第5行：窗口操作按钮
         window_action_row = ttk.Frame(window_frame)
-        window_action_row.grid(row=3, column=0, columnspan=14, sticky="w", pady=(6, 0))
+        window_action_row.grid(row=4, column=0, columnspan=14, sticky="w", pady=(6, 0))
         self.wm_launch_btn = ttk.Button(window_action_row, text="批量启动窗口", width=18,
                                         command=self._wm_launch_windows)
         self.wm_launch_btn.pack(side=tk.LEFT, padx=(4, 10))
@@ -229,6 +313,21 @@ class LauncherApp(tk.Tk):
         self._method1_btn_settings = ttk.Button(config_frame, text="选择", width=8, command=self._pick_settings)
         self._method1_btn_settings.grid(row=3, column=2, padx=4, pady=3)
 
+        self._method1_level_count_label = ttk.Label(config_frame, text="每层数量", width=12, anchor="e")
+        self._method1_level_count_label.grid(row=4, column=0, sticky="e", padx=(4, 6), pady=3)
+        self._method1_level_count_frame = ttk.Frame(config_frame)
+        self._method1_level_count_frame.grid(row=4, column=1, columnspan=3, sticky="w", padx=4, pady=3)
+        for level in LEVELS:
+            ttk.Label(self._method1_level_count_frame, text=level).pack(side=tk.LEFT, padx=(0, 4))
+            ttk.Spinbox(
+                self._method1_level_count_frame,
+                from_=0,
+                to=99,
+                increment=1,
+                textvariable=self.level_count_vars[level],
+                width=5,
+            ).pack(side=tk.LEFT, padx=(0, 12))
+
         self._method2_row1 = ttk.Label(config_frame, text="CSV文件", width=12, anchor="e")
         self._method2_csv_entry = ttk.Entry(config_frame, textvariable=self.csv_path)
         self._method2_btn_pick = ttk.Button(config_frame, text="选择", width=8, command=self._pick_csv_file)
@@ -252,9 +351,9 @@ class LauncherApp(tk.Tk):
 
         ttk.Label(select_row, text="层级").pack(side=tk.LEFT, padx=(2, 4))
         self.level_box = ttk.Combobox(select_row, textvariable=self.level_var,
-                                       values=("全部", *LEVELS), width=8, state="readonly")
+                                       values=("全部", *SELECTABLE_LEVELS), width=10, state="readonly")
         self.level_box.pack(side=tk.LEFT, padx=(0, 16))
-        self.level_box.bind("<<ComboboxSelected>>", lambda _: self._refresh_account_choices())
+        self.level_box.bind("<<ComboboxSelected>>", lambda _: self._on_level_changed())
 
         ttk.Label(select_row, text="账号").pack(side=tk.LEFT, padx=(0, 4))
         self.account_box = ttk.Combobox(select_row, textvariable=self.account_var, width=28, state="readonly")
@@ -265,6 +364,10 @@ class LauncherApp(tk.Tk):
 
         ttk.Label(select_row, text="并发").pack(side=tk.LEFT, padx=(0, 4))
         ttk.Label(select_row, text="1", relief="sunken", width=4, anchor="center", padding=2).pack(side=tk.LEFT)
+
+        ttk.Label(select_row, text="重新次数").pack(side=tk.LEFT, padx=(16, 4))
+        ttk.Spinbox(select_row, from_=1, to=9, textvariable=self.batch_verify_rounds_var,
+                    width=5).pack(side=tk.LEFT)
 
         # 操作行
         action_row = ttk.Frame(run_frame)
@@ -383,27 +486,93 @@ class LauncherApp(tk.Tk):
 
     def _load_window_manager_settings(self) -> None:
         settings, error = load_window_manager_settings()
+        self.wm_fixed_mode_settings = settings.fixed_mode
+        self.wm_row_count_mode_settings = settings.row_count_mode
         self.wm_game_path_var.set(settings.game_path)
-        self.wm_launch_count_var.set(settings.launch_count)
         self.wm_launch_interval_var.set(settings.launch_interval)
         self.wm_auto_tile_after_launch_var.set(settings.auto_tile_after_launch)
         self.wm_auto_rename_after_tile_var.set(settings.auto_rename_after_tile)
         self.wm_title_template_var.set(settings.title_template)
-        self.wm_window_width_var.set(settings.window_width)
-        self.wm_window_height_var.set(settings.window_height)
-        self.wm_start_x_var.set(settings.start_x)
-        self.wm_start_y_var.set(settings.start_y)
-        self.wm_offset_x_var.set(settings.offset_x)
-        self.wm_offset_y_var.set(settings.offset_y)
-        self.wm_per_row_var.set(settings.per_row)
+        self.wm_current_tile_mode_key = settings.last_tile_mode
+        self.wm_tile_mode_var.set(self._wm_mode_label_from_key(settings.last_tile_mode))
+        self.wm_prevent_overflow_var.set(settings.prevent_overflow)
+        self._wm_apply_current_mode_settings()
+        self._refresh_mode_account_scope()
 
         if error:
             self._log(f"[窗口管理] 读取参数配置失败，已使用默认值：{error}")
         elif window_manager_settings_path().exists():
             self._log(f"[窗口管理] 已加载参数配置：{window_manager_settings_path()}")
 
+    def _wm_on_tile_mode_changed(self) -> None:
+        self._wm_store_current_mode_values(self.wm_current_tile_mode_key)
+        self.wm_current_tile_mode_key = self._wm_mode_key_from_label()
+        self._wm_apply_current_mode_settings()
+        self._refresh_mode_account_scope(log_change=True)
+
+    def _wm_mode_key_from_label(self, label: str | None = None) -> str:
+        mode_label = (label or self.wm_tile_mode_var.get()).strip()
+        if mode_label == WM_TILE_MODE_ROW_COUNT:
+            return TILE_MODE_ROW_COUNT
+        return TILE_MODE_FIXED
+
+    def _wm_mode_label_from_key(self, key: str) -> str:
+        if key == TILE_MODE_ROW_COUNT:
+            return WM_TILE_MODE_ROW_COUNT
+        return WM_TILE_MODE_FIXED
+
+    def _wm_apply_current_mode_settings(self) -> None:
+        if self._wm_mode_key_from_label() == TILE_MODE_ROW_COUNT:
+            self.wm_launch_count_var.set(self.wm_row_count_mode_settings.launch_count)
+            self.wm_per_row_var.set(self.wm_row_count_mode_settings.per_row)
+            for widget in self.wm_fixed_param_widgets:
+                widget.grid_remove()
+            for widget in self.wm_row_param_widgets:
+                widget.grid()
+            return
+
+        fixed = self.wm_fixed_mode_settings
+        self.wm_launch_count_var.set(fixed.launch_count)
+        self.wm_window_width_var.set(fixed.window_width)
+        self.wm_window_height_var.set(fixed.window_height)
+        self.wm_start_x_var.set(fixed.start_x)
+        self.wm_start_y_var.set(fixed.start_y)
+        self.wm_offset_x_var.set(fixed.offset_x)
+        self.wm_offset_y_var.set(fixed.offset_y)
+        self.wm_per_row_var.set(fixed.per_row)
+        for widget in self.wm_row_param_widgets:
+            widget.grid_remove()
+        for widget in self.wm_fixed_param_widgets:
+            widget.grid()
+
+    def _wm_store_current_mode_values(self, mode_key: str | None = None) -> None:
+        try:
+            launch_count = int(self.wm_launch_count_var.get())
+            per_row = int(self.wm_per_row_var.get())
+            target_mode_key = mode_key or self._wm_mode_key_from_label()
+            if target_mode_key == TILE_MODE_ROW_COUNT:
+                self.wm_row_count_mode_settings = RowCountModeSettings(
+                    launch_count=launch_count,
+                    per_row=per_row,
+                )
+            else:
+                self.wm_fixed_mode_settings = FixedModeSettings(
+                    launch_count=launch_count,
+                    window_width=self.wm_window_width_var.get().strip(),
+                    window_height=self.wm_window_height_var.get().strip(),
+                    start_x=int(self.wm_start_x_var.get()),
+                    start_y=int(self.wm_start_y_var.get()),
+                    offset_x=int(self.wm_offset_x_var.get()),
+                    offset_y=int(self.wm_offset_y_var.get()),
+                    per_row=per_row,
+                )
+        except Exception as exc:
+            self._log(f"[窗口管理] 当前模式参数缓存失败：{exc}")
+
     def _current_window_manager_settings(self) -> WindowManagerSettings | None:
         try:
+            self._wm_store_current_mode_values(self.wm_current_tile_mode_key)
+            self.wm_current_tile_mode_key = self._wm_mode_key_from_label()
             return WindowManagerSettings(
                 game_path=self.wm_game_path_var.get().strip().strip('"'),
                 launch_count=int(self.wm_launch_count_var.get()),
@@ -411,13 +580,10 @@ class LauncherApp(tk.Tk):
                 auto_tile_after_launch=bool(self.wm_auto_tile_after_launch_var.get()),
                 auto_rename_after_tile=bool(self.wm_auto_rename_after_tile_var.get()),
                 title_template=self.wm_title_template_var.get().strip(),
-                window_width=int(self.wm_window_width_var.get()),
-                window_height=int(self.wm_window_height_var.get()),
-                start_x=int(self.wm_start_x_var.get()),
-                start_y=int(self.wm_start_y_var.get()),
-                offset_x=int(self.wm_offset_x_var.get()),
-                offset_y=int(self.wm_offset_y_var.get()),
-                per_row=int(self.wm_per_row_var.get()),
+                last_tile_mode=self._wm_mode_key_from_label(),
+                prevent_overflow=bool(self.wm_prevent_overflow_var.get()),
+                fixed_mode=self.wm_fixed_mode_settings,
+                row_count_mode=self.wm_row_count_mode_settings,
             )
         except Exception as exc:
             self._log(f"[窗口管理] 当前参数读取失败，未保存配置：{exc}")
@@ -440,11 +606,44 @@ class LauncherApp(tk.Tk):
         except Exception:
             return []
 
+    def _wm_parse_positive_dimension(self, value: str, label: str) -> int:
+        text = str(value).strip()
+        if not text or text.lower() == "auto":
+            raise ValueError(
+                "固定参数排列需要填写窗口宽度和窗口高度；"
+                "如果想用当前窗口尺寸，请切换为“根据行数排列”。"
+            )
+        try:
+            parsed = int(text)
+        except Exception as exc:
+            raise ValueError(
+                f"{label}必须是大于 0 的整数；"
+                "如果想用当前窗口尺寸，请切换为“根据行数排列”。"
+            ) from exc
+        if parsed <= 0:
+            raise ValueError(
+                f"{label}必须大于 0；"
+                "如果想用当前窗口尺寸，请切换为“根据行数排列”。"
+            )
+        return parsed
+
+    def _wm_parse_auto_dimension(self, value: str, label: str) -> int | None:
+        text = str(value).strip()
+        if not text or text.lower() == "auto":
+            return None
+        try:
+            parsed = int(text)
+        except Exception as exc:
+            raise ValueError(f"{label}请填写大于 0 的整数、留空，或填写 Auto。") from exc
+        if parsed <= 0:
+            raise ValueError(f"{label}请填写大于 0 的整数、留空，或填写 Auto。")
+        return parsed
+
     def _wm_read_tile_config(self) -> TileConfig | None:
         try:
             config = TileConfig(
-                width=int(self.wm_window_width_var.get()),
-                height=int(self.wm_window_height_var.get()),
+                width=self._wm_parse_positive_dimension(self.wm_window_width_var.get(), "窗口宽度"),
+                height=self._wm_parse_positive_dimension(self.wm_window_height_var.get(), "窗口高度"),
                 start_x=int(self.wm_start_x_var.get()),
                 start_y=int(self.wm_start_y_var.get()),
                 offset_x=int(self.wm_offset_x_var.get()),
@@ -462,6 +661,39 @@ class LauncherApp(tk.Tk):
             messagebox.showerror("窗口管理参数错误", message)
             return None
         return config
+
+    def _wm_read_row_tile_config(self) -> RowTileConfig | None:
+        try:
+            config = RowTileConfig(
+                width=None,
+                height=None,
+                start_x=0,
+                start_y=0,
+                per_row=int(self.wm_per_row_var.get()),
+                prevent_overflow=bool(self.wm_prevent_overflow_var.get()),
+            )
+        except Exception as exc:
+            self._log(f"窗口管理：按行数排列参数读取失败：{exc}")
+            messagebox.showerror("窗口管理参数错误", str(exc))
+            return None
+
+        if config.per_row <= 0:
+            message = "单行数量必须大于 0。"
+            self._log(f"窗口管理：参数无效：{message}")
+            messagebox.showerror("窗口管理参数错误", message)
+            return None
+        return config
+
+    def _wm_read_arrangement_config(self) -> tuple[str, TileConfig | RowTileConfig] | None:
+        mode = self.wm_tile_mode_var.get().strip() or WM_TILE_MODE_FIXED
+        if mode == WM_TILE_MODE_ROW_COUNT:
+            config = self._wm_read_row_tile_config()
+        else:
+            mode = WM_TILE_MODE_FIXED
+            config = self._wm_read_tile_config()
+        if config is None:
+            return None
+        return mode, config
 
     def _wm_read_title_template(self) -> str | None:
         title_template = self.wm_title_template_var.get().strip()
@@ -511,9 +743,11 @@ class LauncherApp(tk.Tk):
         self._save_window_manager_settings()
         auto_tile = bool(self.wm_auto_tile_after_launch_var.get())
         auto_rename = bool(self.wm_auto_rename_after_tile_var.get())
-        tile_config = self._wm_read_tile_config() if auto_tile else None
-        if auto_tile and tile_config is None:
+        arrangement = self._wm_read_arrangement_config() if auto_tile else None
+        if auto_tile and arrangement is None:
             return
+        tile_mode = arrangement[0] if arrangement else WM_TILE_MODE_FIXED
+        tile_config = arrangement[1] if arrangement else None
         title_template = None
         if auto_tile and auto_rename:
             title_template = self._wm_read_title_template()
@@ -530,6 +764,7 @@ class LauncherApp(tk.Tk):
                 launch_interval,
                 auto_tile,
                 auto_rename,
+                tile_mode,
                 tile_config,
                 title_template,
                 excluded_hwnds,
@@ -545,7 +780,8 @@ class LauncherApp(tk.Tk):
         launch_interval: int,
         auto_tile: bool,
         auto_rename: bool,
-        tile_config: TileConfig | None,
+        tile_mode: str,
+        tile_config: TileConfig | RowTileConfig | None,
         title_template: str | None,
         excluded_hwnds: list[int],
     ) -> None:
@@ -614,23 +850,22 @@ class LauncherApp(tk.Tk):
                         )
                     return
 
-                log("已勾选启动后自动排列，开始排列窗口")
+                log(f"已勾选启动后自动排列，开始排列窗口，排列方式={tile_mode}")
+                if tile_mode == WM_TILE_MODE_ROW_COUNT:
+                    log(
+                        f"按行数排列参数：单行数量={tile_config.per_row}，"
+                        "自动缩放窗口=True，"
+                        f"禁止超出屏幕宽度={tile_config.prevent_overflow}"
+                    )
                 try:
-                    results = tile_game_windows(tile_config, exclude_hwnds=excluded_hwnds)
+                    results = self._wm_run_tile(
+                        tile_mode=tile_mode,
+                        tile_config=tile_config,
+                        exclude_hwnds=excluded_hwnds,
+                        log=log,
+                    )
                     log(f"自动排列完成，结果 {len(results)} 个")
-                    for result_index, result in enumerate(results, start=1):
-                        window = result.window
-                        number = window.number if window.number is not None else "无编号"
-                        if result.success:
-                            log(
-                                f"窗口 {result_index} 排列成功 hwnd={window.hwnd} 编号={number} "
-                                f"x={result.x} y={result.y} w={tile_config.width} h={tile_config.height} 标题={window.title}"
-                            )
-                        else:
-                            log(
-                                f"窗口 {result_index} 排列失败 hwnd={window.hwnd} 编号={number} "
-                                f"x={result.x} y={result.y} 错误={result.error} 标题={window.title}"
-                            )
+                    self._wm_log_tile_results(results, log)
                     if auto_rename:
                         self._wm_rename_windows_after_tile(
                             log=log,
@@ -686,6 +921,74 @@ class LauncherApp(tk.Tk):
 
         return False, current_count
 
+    def _wm_run_tile(
+        self,
+        tile_mode: str,
+        tile_config: TileConfig | RowTileConfig,
+        exclude_hwnds: list[int],
+        log=None,
+    ):
+        if tile_mode == WM_TILE_MODE_ROW_COUNT:
+            windows = list_game_windows(exclude_hwnds=exclude_hwnds)
+            plan = calculate_row_tile_plan(len(windows), tile_config)
+            if log is not None:
+                work = plan.work_area
+                log(
+                    "按行数排列诊断："
+                    f"screen_width={plan.screen_width}，screen_height={plan.screen_height}，"
+                    f"work_area_left={work.left}，work_area_top={work.top}，"
+                    f"work_area_right={work.right}，work_area_bottom={work.bottom}，"
+                    f"work_area_width={plan.work_area_width}，work_area_height={plan.work_area_height}"
+                )
+                log(
+                    "按行数排列诊断："
+                    f"使用工作区=True，gap_x={plan.gap_x}，gap_y={plan.gap_y}，"
+                    f"width_gap_total={plan.width_gap_total}，height_gap_total={plan.height_gap_total}，"
+                    f"padding={plan.padding}，safe_margin={plan.safe_margin}，"
+                    f"禁止超出屏幕宽度={tile_config.prevent_overflow}，额外边距=0"
+                )
+                log(
+                    "按行数排列诊断："
+                    f"usable_width={plan.usable_width}，usable_height={plan.usable_height}，"
+                    f"cols={plan.cols}，rows={plan.rows}，窗口数量={plan.window_count}"
+                )
+                log(
+                    "按行数排列诊断："
+                    f"target_width=floor(({plan.usable_width}-{plan.width_gap_total})/{plan.cols})"
+                    f"=floor({plan.raw_target_width:.4f})={plan.target_width}，"
+                    f"target_height=floor(({plan.usable_height}-{plan.height_gap_total})/{max(1, plan.rows)})"
+                    f"=floor({plan.raw_target_height:.4f})={plan.target_height}"
+                )
+            return tile_game_windows_by_row_count(
+                tile_config,
+                exclude_hwnds=exclude_hwnds,
+                windows=windows,
+            )
+        return tile_game_windows(tile_config, exclude_hwnds=exclude_hwnds)
+
+    def _wm_log_tile_results(self, results, log) -> None:
+        for index, result in enumerate(results, start=1):
+            window = result.window
+            number = window.number if window.number is not None else "无编号"
+            rect = window.rect
+            wrap_text = "，因屏幕宽度自动换行" if result.wrapped_by_screen else ""
+            if result.success:
+                log(
+                    f"窗口 {index} 排列成功 hwnd={window.hwnd} 编号={number} "
+                    f"原始rect=({rect.left},{rect.top},{rect.right},{rect.bottom}) "
+                    f"目标x={result.x} y={result.y} "
+                    f"SetWindowPos width={result.width} SetWindowPos height={result.height}"
+                    f"{wrap_text} 标题={window.title}"
+                )
+            else:
+                log(
+                    f"窗口 {index} 排列失败 hwnd={window.hwnd} 编号={number} "
+                    f"原始rect=({rect.left},{rect.top},{rect.right},{rect.bottom}) "
+                    f"目标x={result.x} y={result.y} "
+                    f"SetWindowPos width={result.width} SetWindowPos height={result.height} "
+                    f"错误={result.error}{wrap_text} 标题={window.title}"
+                )
+
     def _wm_rename_windows_after_tile(
         self,
         log,
@@ -731,40 +1034,48 @@ class LauncherApp(tk.Tk):
         self._log(f"窗口管理：识别到 {len(windows)} 个斗罗大陆H5登录窗口。")
         for index, window in enumerate(windows, start=1):
             number = window.number if window.number is not None else "无编号"
+            rect = window.rect
             self._log(
-                f"窗口管理：窗口 {index} hwnd={window.hwnd} 标题={window.title} 编号={number}"
+                f"窗口管理：窗口 {index} hwnd={window.hwnd} 标题={window.title} 编号={number} "
+                f"rect=({rect.left},{rect.top},{rect.right},{rect.bottom})"
             )
 
     def _wm_tile_windows(self) -> None:
         self._save_window_manager_settings()
-        config = self._wm_read_tile_config()
-        if config is None:
+        arrangement = self._wm_read_arrangement_config()
+        if arrangement is None:
             return
+        tile_mode, config = arrangement
 
         try:
-            results = tile_game_windows(config, exclude_hwnds=self._wm_excluded_hwnds())
+            results = self._wm_run_tile(
+                tile_mode=tile_mode,
+                tile_config=config,
+                exclude_hwnds=self._wm_excluded_hwnds(),
+                log=lambda message: self._log(f"窗口管理：{message}"),
+            )
         except Exception as exc:
             self._log(f"窗口管理：排列登录窗口失败：{exc}")
             messagebox.showerror("排列登录窗口失败", str(exc))
             return
 
+        if tile_mode == WM_TILE_MODE_ROW_COUNT:
+            self._log(
+                "窗口管理：排列完成，"
+                f"排列方式={tile_mode}，单行数量={config.per_row}，"
+                f"自动缩放窗口=True，禁止超出屏幕宽度={config.prevent_overflow}，"
+                f"结果 {len(results)} 个。"
+            )
+        else:
+            self._log(
+                "窗口管理：排列完成，"
+                f"排列方式={tile_mode}，目标大小={config.width}x{config.height}，"
+                f"每行={config.per_row}，结果 {len(results)} 个。"
+            )
         self._log(
-            "窗口管理：排列完成，"
-            f"目标大小={config.width}x{config.height}，每行={config.per_row}，结果 {len(results)} 个。"
+            f"窗口管理：当前排列方式={tile_mode}，识别到 {len(results)} 个窗口。"
         )
-        for index, result in enumerate(results, start=1):
-            window = result.window
-            number = window.number if window.number is not None else "无编号"
-            if result.success:
-                self._log(
-                    f"窗口管理：窗口 {index} 排列成功 hwnd={window.hwnd} 编号={number} "
-                    f"x={result.x} y={result.y} w={config.width} h={config.height} 标题={window.title}"
-                )
-            else:
-                self._log(
-                    f"窗口管理：窗口 {index} 排列失败 hwnd={window.hwnd} 编号={number} "
-                    f"x={result.x} y={result.y} 错误={result.error} 标题={window.title}"
-                )
+        self._wm_log_tile_results(results, lambda message: self._log(f"窗口管理：{message}"))
         if self.wm_auto_rename_after_tile_var.get():
             self._wm_rename_windows_after_tile(
                 log=lambda message: self._log(f"[窗口管理] {message}"),
@@ -916,15 +1227,113 @@ Write-Output $count
             settings = load_settings(self.settings_path.get())
             bookmark_file = self.bookmark_path.get() or settings.bookmark_file
             root_name = self.bookmark_root_name.get().strip() or settings.bookmark_root_name
-            self.accounts = load_accounts_from_bookmarks(bookmark_file, root_name, settings.level_names)
+            level_counts = self._current_level_counts()
+            self.accounts = load_accounts_from_bookmarks(
+                bookmark_file,
+                root_name,
+                settings.level_names,
+                level_counts=level_counts,
+                log=lambda message: self._log(f"收藏夹读取：{message}"),
+            )
             self.status_by_key = {account.key: "未开始" for account in self.accounts}
             self.passport_by_key = {account.key: "" for account in self.accounts}
-            self._refresh_table()
-            self._refresh_account_choices()
-            self._log(f"已从收藏夹读取 {len(self.accounts)} 个账号链接。")
+            self._refresh_mode_account_scope()
+            self._log(f"已从收藏夹读取 {len(self.accounts)} 个账号链接。{self._account_count_summary()}")
         except Exception as exc:
             messagebox.showerror("读取收藏夹失败", str(exc))
             self._log(f"读取收藏夹失败: {exc}")
+
+    def _current_level_counts(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for level in LEVELS:
+            counts[level] = int(self.level_count_vars[level].get())
+        return counts
+
+    def _account_count_summary(self, accounts: list[AccountConfig] | None = None) -> str:
+        source = accounts if accounts is not None else self.accounts
+        parts = []
+        single_count = sum(1 for account in source if account.level == SINGLE_LEVEL_NAME)
+        if single_count:
+            parts.append(f"{SINGLE_LEVEL_NAME} {single_count} 个")
+        for level in LEVELS:
+            count = sum(1 for account in source if account.level == level)
+            if count:
+                parts.append(f"{level} {count} 个")
+        return "分类：" + "，".join(parts) if parts else "分类：无账号"
+
+    def _is_row_count_account_mode(self) -> bool:
+        return self._wm_mode_key_from_label() == TILE_MODE_ROW_COUNT
+
+    def _allowed_level_values(self) -> tuple[str, ...]:
+        if self._is_row_count_account_mode():
+            return (SINGLE_LEVEL_NAME,)
+        return ("全部", *LEVELS)
+
+    def _is_account_allowed_in_current_mode(self, account: AccountConfig) -> bool:
+        if self._is_row_count_account_mode():
+            return account.level == SINGLE_LEVEL_NAME
+        return account.level in LEVELS
+
+    def _mode_allowed_accounts(self) -> list[AccountConfig]:
+        return [account for account in self.accounts if self._is_account_allowed_in_current_mode(account)]
+
+    def _filtered_accounts_for_ui(self) -> list[AccountConfig]:
+        mode_accounts = self._mode_allowed_accounts()
+        level = self.level_var.get()
+        if self._is_row_count_account_mode():
+            return [account for account in mode_accounts if account.level == SINGLE_LEVEL_NAME]
+        if level == "全部":
+            return mode_accounts
+        return [account for account in mode_accounts if account.level == level]
+
+    def _on_level_changed(self) -> None:
+        self._refresh_table()
+        self._refresh_account_choices()
+        self._log(
+            f"层级已切换：排列方式={self.wm_tile_mode_var.get()}，"
+            f"层级={self.level_var.get()}，当前账号列表 {len(self._filtered_accounts_for_ui())} 个。"
+        )
+
+    def _refresh_mode_account_scope(self, log_change: bool = False) -> None:
+        allowed_levels = self._allowed_level_values()
+        self.level_box["values"] = allowed_levels
+        if self.level_var.get() not in allowed_levels:
+            self.level_var.set(allowed_levels[0] if allowed_levels else "")
+        self.account_var.set("")
+        self.account_box["values"] = ()
+        for item in self.tree.selection():
+            self.tree.selection_remove(item)
+        self._refresh_table()
+        self._refresh_account_choices()
+        if log_change:
+            self._log(
+                f"排列方式已切换：{self.wm_tile_mode_var.get()}；"
+                f"允许层级={', '.join(allowed_levels)}；"
+                f"当前账号列表 {len(self._filtered_accounts_for_ui())} 个。"
+            )
+
+    def _validate_accounts_for_current_mode(self, accounts: list[AccountConfig]) -> bool:
+        for account in accounts:
+            if not self._is_account_allowed_in_current_mode(account):
+                message = "当前账号不属于当前排列模式，请重新选择层级和账号。"
+                self._log(
+                    f"阻止运行：{message} 排列方式={self.wm_tile_mode_var.get()}，"
+                    f"层级={account.level}，账号={account.display_name}"
+                )
+                messagebox.showwarning("账号模式不匹配", message)
+                return False
+
+        for account in accounts:
+            selected, _ = select_login_window_by_game_no(account.game_window_no)
+            if selected is None:
+                message = f"未在当前桌面找到窗口 {account.game_window_no}，已停止，避免跨桌面运行。"
+                self._log(
+                    f"阻止运行：{message} 排列方式={self.wm_tile_mode_var.get()}，"
+                    f"层级={account.level}，账号={account.display_name}"
+                )
+                messagebox.showwarning("当前桌面窗口不存在", message)
+                return False
+        return True
 
     # ===== 方式二：CSV 导入 =====
 
@@ -934,7 +1343,8 @@ Write-Output $count
         # 方式一控件
         for w in (self._method1_row1, self._method1_bookmark_entry, self._method1_btn_pick,
                   self._method1_btn_load, self._method1_row2a, self._method1_root_entry,
-                  self._method1_row3a, self._method1_settings_entry, self._method1_btn_settings):
+                  self._method1_row3a, self._method1_settings_entry, self._method1_btn_settings,
+                  self._method1_level_count_label, self._method1_level_count_frame):
             w.grid() if is_m1 else w.grid_remove()
         # 方式二控件
         for w in (self._method2_row1, self._method2_csv_entry, self._method2_btn_pick,
@@ -1034,7 +1444,7 @@ Write-Output $count
     def _refresh_table(self) -> None:
         for item in self.tree.get_children():
             self.tree.delete(item)
-        for account in self.accounts:
+        for account in self._filtered_accounts_for_ui():
             self.tree.insert(
                 "",
                 tk.END,
@@ -1051,7 +1461,7 @@ Write-Output $count
             )
 
     def _refresh_account_choices(self) -> None:
-        choices = [account.display_name for account in filter_accounts(self.accounts, self.level_var.get())]
+        choices = [account.display_name for account in self._filtered_accounts_for_ui()]
         self.account_box["values"] = choices
         self.account_var.set(choices[0] if choices else "")
 
@@ -1059,6 +1469,8 @@ Write-Output $count
         account = self._selected_account()
         if account is None:
             messagebox.showwarning("未选择账号", "请先读取配置并选择一个账号。")
+            return
+        if not self._validate_accounts_for_current_mode([account]):
             return
         self._start_run([account])
 
@@ -1071,10 +1483,16 @@ Write-Output $count
             messagebox.showwarning("未选择账号", "请先在表格或下拉框中选择一个账号。")
             return
         self._log(
+            f"单账号运行前校验：排列方式={self.wm_tile_mode_var.get()}，"
+            f"层级={self.level_var.get()}，账号={account.display_name}，窗口号={account.game_window_no}"
+        )
+        if not self._validate_accounts_for_current_mode([account]):
+            return
+        self._log(
             f"单账号运行: {account.display_name}。"
             f"OCR → 打开游戏页 → 关闭公告 → 通行证 → 输入 → 确认。"
         )
-        self._start_serial_run([account])
+        self._start_serial_run([account], batch_fast=False)
 
     def _run_level_serial(self) -> None:
         if self.method_var.get() == "method2":
@@ -1084,22 +1502,27 @@ Write-Output $count
         if level == "全部":
             messagebox.showwarning("请选择层级", "当前层串行需要选择一个具体层级。")
             return
-        accounts = [a for a in self.accounts if a.level == level]
+        accounts = self._filtered_accounts_for_ui()
         if not accounts:
             messagebox.showwarning("无账号", f"当前层 {level} 没有账号。")
             return
-        self._log(f"当前层串行: {level}，共 {len(accounts)} 个账号，严格逐个执行。")
-        self._start_serial_run(accounts)
+        if not self._validate_accounts_for_current_mode(accounts):
+            return
+        self._log(f"当前层串行: {level}，共 {len(accounts)} 个账号，批量快速登录 + 统一校验。")
+        self._start_serial_run(accounts, batch_fast=True)
 
     def _run_all_serial(self) -> None:
         if self.method_var.get() == "method2":
             self._run_method2_all()
             return
-        if not self.accounts:
+        accounts = self._mode_allowed_accounts()
+        if not accounts:
             messagebox.showwarning("无账号", "请先读取收藏夹。")
             return
-        self._log(f"全部串行: 共 {len(self.accounts)} 个账号，严格逐个执行。")
-        self._start_serial_run(self.accounts)
+        if not self._validate_accounts_for_current_mode(accounts):
+            return
+        self._log(f"全部串行: 共 {len(accounts)} 个账号，批量快速登录 + 统一校验。{self._account_count_summary(accounts)}")
+        self._start_serial_run(accounts, batch_fast=True)
 
     # ===== 方式二运行 =====
 
@@ -1329,7 +1752,14 @@ Write-Output $count
             )
         self._log("启动权限检查：当前非管理员运行，可能无法排列/关闭管理员权限窗口。")
 
-    def _start_serial_run(self, accounts: list[AccountConfig]) -> None:
+    def _batch_verify_rounds(self) -> int:
+        try:
+            return max(1, int(self.batch_verify_rounds_var.get()))
+        except Exception:
+            self.batch_verify_rounds_var.set(3)
+            return 3
+
+    def _start_serial_run(self, accounts: list[AccountConfig], batch_fast: bool = False) -> None:
         if self.worker_thread and self.worker_thread.is_alive():
             messagebox.showwarning("任务运行中", "已有任务正在运行，请先停止或等待完成。")
             return
@@ -1343,14 +1773,15 @@ Write-Output $count
         self.stop_event.clear()
         for account in accounts:
             self._set_status(account, "未开始")
+        verify_rounds = self._batch_verify_rounds()
         self.worker_thread = threading.Thread(
             target=self._serial_worker,
-            args=(accounts, settings),
+            args=(accounts, settings, batch_fast, verify_rounds),
             daemon=True,
         )
         self.worker_thread.start()
 
-    def _serial_worker(self, accounts: list[AccountConfig], settings) -> None:
+    def _serial_worker(self, accounts: list[AccountConfig], settings, batch_fast: bool = False, verify_rounds: int = 3) -> None:
         self._setup_log_file()
         self._queue_log(f"前台串行模式：共 {len(accounts)} 个账号，严格逐个执行。")
         self._queue_log("注意：运行期间会短暂移动鼠标，请勿操作。")
@@ -1361,6 +1792,10 @@ Write-Output $count
         fail_count = 0
         start_time = _time.time()
         self._update_status_bar(f"运行中：{len(accounts)} 账号")
+
+        if batch_fast:
+            self._serial_worker_batch_fast(accounts, settings, frozen, verify_rounds, start_time)
+            return
 
         for i, account in enumerate(accounts, start=1):
             if self.stop_event.is_set():
@@ -1536,6 +1971,263 @@ print("TIMING:" + str(runner.last_timings.get("总计", 0)), flush=True)
             self._log_file.close()
             self._log_file = None
 
+    def _run_account_child_process(self, account: AccountConfig, action: str) -> dict[str, object]:
+        import subprocess as _sp, json, tempfile, sys as _sys
+
+        cfg = {
+            "level": account.level,
+            "bookmark_no": account.bookmark_no,
+            "game_window_no": account.game_window_no,
+            "url": account.url,
+            "settings_path": str(app_root() / "automation_settings.json"),
+            "action": action,
+        }
+        cfg_file = Path(tempfile.gettempdir()) / f"douluo_acc_{account.game_window_no}_{action}.json"
+        cfg_file.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+
+        project_root = str(app_root())
+        proc = _sp.Popen(
+            ["python", "-X", "utf8", "-c", f"""
+import sys, json, threading
+sys.path.insert(0, r"{project_root}")
+from douluo_launcher.automation import AccountRunner
+from douluo_launcher.config import AccountConfig, load_settings
+from pathlib import Path
+
+cfg = json.loads(Path(r"{cfg_file}").read_text(encoding='utf-8'))
+settings = load_settings(Path(cfg["settings_path"]))
+account = AccountConfig(
+    level=cfg["level"], bookmark_no=cfg["bookmark_no"],
+    game_window_no=cfg["game_window_no"], url=cfg["url"]
+)
+stop = threading.Event()
+def log(msg):
+    try:
+        print("[W" + str(cfg["game_window_no"]) + "] " + str(msg), flush=True)
+    except Exception:
+        pass
+
+def status(acct, s):
+    try:
+        print("STATUS:" + str(s), flush=True)
+    except Exception:
+        pass
+
+def passport_found(acct, p):
+    try:
+        print("PASSPORT:" + str(p), flush=True)
+    except Exception:
+        pass
+
+runner = AccountRunner(account, settings, stop, log, status, passport_found=passport_found)
+action = cfg.get("action", "full")
+if action == "fast_submit":
+    flow_result = runner.run_game_flow_fast_submit()
+    print("RESULT:" + str(flow_result), flush=True)
+    print("TIMING:" + str(runner.last_timings.get("总计", 0)), flush=True)
+elif action == "verify":
+    verify_state = runner.verify_login_result()
+    print("VERIFY:" + str(verify_state), flush=True)
+    print("RESULT:" + str(verify_state == "logged_in"), flush=True)
+else:
+    flow_result = runner.run_game_flow()
+    print("RESULT:" + str(flow_result), flush=True)
+    print("TIMING:" + str(runner.last_timings.get("总计", 0)), flush=True)
+"""],
+            stdout=_sp.PIPE, stderr=_sp.PIPE,
+            text=True, encoding="utf-8", errors="replace",
+            cwd=project_root,
+            creationflags=_sp.CREATE_NO_WINDOW,
+        )
+        self._track_process(proc)
+        result_seen = False
+        verify_state = ""
+        timing = 0.0
+        try:
+            for line in proc.stdout:
+                if self.stop_event.is_set():
+                    if proc.poll() is None:
+                        proc.terminate()
+                    self._queue_log(f"[{account.display_name}] 已停止，当前账号子进程正在终止。")
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith("PASSPORT:"):
+                    self._queue_passport(account, line[9:])
+                    self._write_file_log(line)
+                elif line.startswith("TIMING:"):
+                    try:
+                        timing = float(line[7:])
+                        self._queue_timing(account, timing)
+                    except ValueError:
+                        pass
+                    self._write_file_log(line)
+                elif line.startswith("STATUS:"):
+                    self._queue_status(account, line[7:])
+                    self._queue_log(f"[{account.display_name}] → {line[7:]}")
+                    self._write_file_log(line)
+                elif line.startswith("VERIFY:"):
+                    verify_state = line[7:]
+                    self._write_file_log(line)
+                elif line.startswith("RESULT:True"):
+                    result_seen = True
+                    self._write_file_log(line)
+                elif line.startswith("RESULT:"):
+                    self._write_file_log(line)
+                else:
+                    self._write_file_log(line)
+            if self.stop_event.is_set() and proc.poll() is None:
+                proc.terminate()
+            try:
+                proc.wait(timeout=3 if self.stop_event.is_set() else 300)
+            except Exception:
+                proc.kill()
+                try:
+                    proc.wait(timeout=3)
+                except Exception:
+                    pass
+                self._queue_log(f"[{account.display_name}] 已强制 kill 账号运行子进程 pid={proc.pid}。")
+        finally:
+            self._untrack_process(proc)
+
+        stderr_output = proc.stderr.read()
+        for line in stderr_output.splitlines():
+            line = line.strip()
+            if line:
+                self._write_file_log(f"[stderr] {line[:500]}")
+        try:
+            cfg_file.unlink()
+        except Exception:
+            pass
+
+        return {"result": result_seen, "verify_state": verify_state, "timing": timing}
+
+    def _run_account_action(self, account: AccountConfig, settings, action: str, frozen: bool) -> dict[str, object]:
+        if frozen:
+            runner = AccountRunner(
+                account, settings, self.stop_event,
+                log=lambda msg: self._queue_log(str(msg)),
+                update_status=lambda a, s: self._queue_status(a, s),
+                passport_found=lambda a, p: self._queue_passport(a, p),
+            )
+            if action == "fast_submit":
+                result = runner.run_game_flow_fast_submit()
+                self._queue_timing(account, runner.last_timings.get("总计", 0))
+                return {"result": result, "verify_state": "", "timing": runner.last_timings.get("总计", 0)}
+            if action == "verify":
+                state = runner.verify_login_result()
+                return {"result": state == "logged_in", "verify_state": state, "timing": 0.0}
+            result = runner.run_game_flow()
+            self._queue_timing(account, runner.last_timings.get("总计", 0))
+            return {"result": result, "verify_state": "", "timing": runner.last_timings.get("总计", 0)}
+        return self._run_account_child_process(account, action)
+
+    def _serial_worker_batch_fast(self, accounts: list[AccountConfig], settings, frozen: bool, verify_rounds: int, start_time: float) -> None:
+        import subprocess as _sp, time as _time
+
+        self._queue_log("批量快速登录模式：先提交全部账号，再统一校验，失败账号才重登。")
+        self._queue_log(f"重新次数：{verify_rounds}。只要全部成功就提前结束。")
+        self._queue_log(f"第一轮登录账号数量：{len(accounts)}")
+
+        pending = list(accounts)
+        success_by_key: dict[str, AccountConfig] = {}
+        final_failed: list[AccountConfig] = []
+
+        for round_index in range(1, verify_rounds + 1):
+            if self.stop_event.is_set():
+                break
+            if round_index == 1:
+                self._queue_log(f"第 {round_index} 轮：批量快速登录 {len(pending)} 个账号。")
+            else:
+                self._queue_log(f"第 {round_index} 轮：只重登失败账号 {len(pending)} 个。")
+
+            submit_failed: list[AccountConfig] = []
+            submitted: list[AccountConfig] = []
+            for i, account in enumerate(pending, start=1):
+                if self.stop_event.is_set():
+                    break
+                self._queue_status(account, "登录中" if round_index == 1 else "重登中")
+                self._queue_log(
+                    f"[第{round_index}轮 {i}/{len(pending)}] "
+                    f"{'登录中' if round_index == 1 else '重登中'}: {account.display_name}"
+                )
+                result = self._run_account_action(account, settings, "fast_submit", frozen)
+                if self.stop_event.is_set():
+                    self._queue_status(account, "已停止")
+                    break
+                if result.get("result"):
+                    submitted.append(account)
+                    self._queue_status(account, "待复核")
+                    self._queue_log(f"{account.display_name} 已输入确认，标记待复核。")
+                else:
+                    submit_failed.append(account)
+                    self._queue_status(account, "失败")
+                    self._queue_log(f"{account.display_name} 快速登录提交失败，加入重登列表。")
+                _sp.run(["taskkill", "/f", "/im", "chromium.exe"], capture_output=True, creationflags=_sp.CREATE_NO_WINDOW)
+
+            if self.stop_event.is_set():
+                break
+
+            verify_targets = submitted
+            failed_this_round = list(submit_failed)
+            self._queue_log(f"第 {round_index} 次统一校验开始：总数 {len(pending)}。")
+            for i, account in enumerate(verify_targets, start=1):
+                if self.stop_event.is_set():
+                    break
+                self._queue_status(account, "校验中")
+                self._queue_log(f"[第{round_index}次校验 {i}/{len(verify_targets)}] {account.display_name}")
+                verify_result = self._run_account_action(account, settings, "verify", frozen)
+                state = str(verify_result.get("verify_state") or "unknown")
+                if state == "logged_in":
+                    success_by_key[account.key] = account
+                    self._queue_status(account, "成功")
+                    self._queue_log(f"{account.display_name} 统一校验成功。")
+                else:
+                    failed_this_round.append(account)
+                    self._queue_status(account, "失败")
+                    self._queue_log(f"{account.display_name} 统一校验失败：{state}，需要重登。")
+
+            if self.stop_event.is_set():
+                break
+
+            success_count = len(success_by_key)
+            failed_count = len(failed_this_round)
+            self._queue_log(
+                f"第 {round_index} 次统一校验完成：总数 {len(pending)}，"
+                f"成功 {len(verify_targets) - (failed_count - len(submit_failed))}，失败 {failed_count}。"
+            )
+            if failed_this_round:
+                self._queue_log("失败账号列表：" + "、".join(a.display_name for a in failed_this_round))
+            if len(success_by_key) >= len(accounts):
+                final_failed = []
+                self._queue_log("全部成功，提前结束，不再执行后续校验。")
+                break
+            if round_index >= verify_rounds:
+                final_failed = failed_this_round
+                self._queue_log("达到重新次数仍失败，最终失败账号列表：" + "、".join(a.display_name for a in final_failed))
+                break
+            pending = failed_this_round
+            self._queue_log(f"下一轮只重登失败账号数量：{len(pending)}")
+
+        elapsed = _time.time() - start_time
+        if self.stop_event.is_set():
+            self._queue_log("--------- 任务已停止 ---------")
+            self._update_status_bar("已停止")
+        else:
+            for account in final_failed:
+                self._queue_status(account, "失败")
+            self._queue_log("--------- 任务完成 ---------")
+            self._update_status_bar(f"任务完成：成功{len(success_by_key)}，失败{len(final_failed)}")
+        self._queue_log(f"总账号: {len(accounts)}  成功: {len(success_by_key)}  失败: {len(final_failed)}  耗时: {elapsed:.0f}秒")
+        log_path = str(self._log_file_path) if self._log_file_path else ""
+        self._queue_log(f"详细日志: {log_path}")
+        if self._log_file is not None:
+            summary_label = "任务已停止" if self.stop_event.is_set() else "任务完成"
+            self._write_file_log(f"{summary_label}：总{len(accounts)} 成功{len(success_by_key)} 失败{len(final_failed)} 耗时{elapsed:.0f}秒")
+            self._log_file.close()
+            self._log_file = None
+
     def _stop_tasks(self) -> None:
         self.stop_event.set()
         self._log("已请求停止任务，正在强制清理子进程。")
@@ -1551,6 +2243,7 @@ print("TIMING:" + str(runner.last_timings.get("总计", 0)), flush=True)
             return
         self.is_closing = True
         try:
+            self._save_window_manager_settings()
             self._log("程序关闭：开始停止任务和清理子进程。")
             self.stop_event.set()
             self._terminate_running_processes()
@@ -1567,7 +2260,7 @@ print("TIMING:" + str(runner.last_timings.get("总计", 0)), flush=True)
 
     def _selected_account(self) -> AccountConfig | None:
         display = self.account_var.get()
-        for account in self.accounts:
+        for account in self._filtered_accounts_for_ui():
             if account.display_name == display:
                 return account
         return None

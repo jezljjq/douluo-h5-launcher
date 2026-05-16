@@ -2,7 +2,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from douluo_launcher.config import compute_game_window_no, filter_accounts, load_accounts_from_bookmarks, load_settings
+from douluo_launcher.config import (
+    SINGLE_LEVEL_NAME,
+    compute_game_window_no,
+    filter_accounts,
+    load_accounts_from_bookmarks,
+    load_settings,
+)
 
 
 class ConfigTests(unittest.TestCase):
@@ -13,6 +19,15 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(compute_game_window_no("第二层", 8), 16)
         self.assertEqual(compute_game_window_no("第三层", 1), 17)
         self.assertEqual(compute_game_window_no("第四层", 8), 32)
+
+    def test_compute_game_window_no_uses_custom_level_counts(self) -> None:
+        counts = {"第一层": 9, "第二层": 8, "第三层": 8, "第四层": 7}
+
+        self.assertEqual(compute_game_window_no("第一层", 9, counts), 9)
+        self.assertEqual(compute_game_window_no("第二层", 1, counts), 10)
+        self.assertEqual(compute_game_window_no("第二层", 8, counts), 17)
+        self.assertEqual(compute_game_window_no("第三层", 1, counts), 18)
+        self.assertEqual(compute_game_window_no("第四层", 7, counts), 32)
 
     def test_load_bookmarks_computes_and_sorts_windows(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -57,6 +72,90 @@ class ConfigTests(unittest.TestCase):
 
         self.assertEqual([account.game_window_no for account in accounts], [2, 9])
         self.assertEqual(accounts[1].key, "第二层-1")
+
+    def test_load_bookmarks_supports_custom_layer_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "Bookmarks"
+            path.write_text(
+                """
+{
+  "roots": {
+    "bookmark_bar": {
+      "type": "folder",
+      "name": "收藏夹栏",
+      "children": [
+        {
+          "type": "folder",
+          "name": "账号",
+          "children": [
+            {"type": "folder", "name": "第一层", "children": [
+              {"type": "url", "name": "9", "url": "https://example.com/9"}
+            ]},
+            {"type": "folder", "name": "第二层", "children": [
+              {"type": "url", "name": "1", "url": "https://example.com/10"},
+              {"type": "url", "name": "8", "url": "https://example.com/17"}
+            ]},
+            {"type": "folder", "name": "第三层", "children": [
+              {"type": "url", "name": "1", "url": "https://example.com/18"}
+            ]},
+            {"type": "folder", "name": "第四层", "children": [
+              {"type": "url", "name": "7", "url": "https://example.com/32"}
+            ]}
+          ]
+        }
+      ]
+    }
+  }
+}
+""",
+                encoding="utf-8",
+            )
+
+            accounts = load_accounts_from_bookmarks(
+                path,
+                "账号",
+                level_counts={"第一层": 9, "第二层": 8, "第三层": 8, "第四层": 7},
+            )
+
+        self.assertEqual([account.game_window_no for account in accounts], [9, 10, 17, 18, 32])
+
+    def test_load_bookmarks_supports_single_level_accounts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "Bookmarks"
+            path.write_text(
+                """
+{
+  "roots": {
+    "bookmark_bar": {
+      "type": "folder",
+      "name": "收藏夹栏",
+      "children": [
+        {
+          "type": "folder",
+          "name": "账号",
+          "children": [
+            {"type": "url", "name": "1", "url": "https://example.com/1"},
+            {"type": "url", "name": "9号", "url": "https://example.com/9"},
+            {"type": "url", "name": "说明", "url": "https://example.com/skip"},
+            {"type": "folder", "name": "第一层", "children": [
+              {"type": "url", "name": "1", "url": "https://example.com/layer1"}
+            ]}
+          ]
+        }
+      ]
+    }
+  }
+}
+""",
+                encoding="utf-8",
+            )
+
+            accounts = load_accounts_from_bookmarks(path, "账号")
+
+        single_accounts = [account for account in accounts if account.level == SINGLE_LEVEL_NAME]
+        self.assertEqual([account.bookmark_no for account in single_accounts], [1, 9])
+        self.assertEqual([account.game_window_no for account in single_accounts], [1, 9])
+        self.assertIn("第一层-1", [account.key for account in accounts])
 
     def test_missing_root_raises(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
