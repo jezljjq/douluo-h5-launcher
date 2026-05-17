@@ -26,6 +26,7 @@ from .config import (
     load_settings,
 )
 from .dm_client import diagnose_dm_environment_with_32bit_python, select_login_window_by_game_no
+from .version import APP_VERSION
 from .window_manager import (
     RowTileConfig,
     TileConfig,
@@ -59,7 +60,7 @@ WM_TILE_MODE_ROW_COUNT = "根据行数排列"
 class LauncherApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("上号器 — 前台串行模式")
+        self.title(f"上号器 — 前台串行模式 v{APP_VERSION}")
         w, h = 1160, 820
         ws = self.winfo_screenwidth()
         hs = self.winfo_screenheight()
@@ -1701,6 +1702,7 @@ Write-Output $count
         self._log_file_path = log_dir / f"run_{ts}.log"
         self._log_file = open(str(self._log_file_path), "w", encoding="utf-8")
         self._write_file_log(f"=== 斗罗大陆H5上号器 运行日志 {ts} ===")
+        self._write_file_log(f"版本号: {APP_VERSION}")
 
     def _write_file_log(self, msg: str) -> None:
         if self._log_file is not None:
@@ -1784,6 +1786,7 @@ Write-Output $count
     def _serial_worker(self, accounts: list[AccountConfig], settings, batch_fast: bool = False, verify_rounds: int = 3) -> None:
         self._setup_log_file()
         self._queue_log(f"前台串行模式：共 {len(accounts)} 个账号，严格逐个执行。")
+        self._queue_log(f"当前版本：v{APP_VERSION}")
         self._queue_log("注意：运行期间会短暂移动鼠标，请勿操作。")
         import subprocess as _sp, json, tempfile, os, sys as _sys, time as _time
 
@@ -1806,18 +1809,9 @@ Write-Output $count
             self._update_status_bar(f"运行中：{i}/{len(accounts)}")
 
             if frozen:
-                # === exe 模式：同进程直接调用（无子进程隔离） ===
-                import os as _os
-                _os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH",
-                    str(Path(_os.environ.get("LOCALAPPDATA", "")) / "ms-playwright"))
-                from .automation import AccountRunner
-                runner = AccountRunner(
-                    account, settings, self.stop_event,
-                    log=lambda msg: self._queue_log(str(msg)),
-                    update_status=lambda a, s: self._queue_status(a, s),
-                    passport_found=lambda a, p: self._queue_passport(a, p),
-                )
-                flow_result = runner.run_game_flow()
+                # exe 模式也使用子进程隔离，和源码模式保持一致，避免 Playwright/COM 状态留在 GUI 进程。
+                result = self._run_account_child_process(account, "full")
+                flow_result = bool(result.get("result"))
                 if self.stop_event.is_set():
                     self._queue_status(account, "已停止")
                     self._queue_log("任务已停止，不会继续执行后续账号。")
@@ -1825,7 +1819,6 @@ Write-Output $count
                     break
                 elif flow_result:
                     success_count += 1
-                    self._queue_timing(account, runner.last_timings.get("总计", 0))
                     self._queue_log(f"[{i}/{len(accounts)}] 成功: {account.display_name}")
                 else:
                     fail_count += 1
@@ -1974,6 +1967,122 @@ print("TIMING:" + str(runner.last_timings.get("总计", 0)), flush=True)
     def _run_account_child_process(self, account: AccountConfig, action: str) -> dict[str, object]:
         import subprocess as _sp, json, tempfile, sys as _sys
 
+        if getattr(_sys, "frozen", False):
+            temp_dir = Path(tempfile.gettempdir())
+            stem = f"douluo_acc_{account.game_window_no}_{action}_{int(time.time() * 1000)}"
+            cfg_file = temp_dir / f"{stem}.json"
+            event_file = temp_dir / f"{stem}.events.jsonl"
+            result_file = temp_dir / f"{stem}.result.json"
+            cfg = {
+                "level": account.level,
+                "bookmark_no": account.bookmark_no,
+                "game_window_no": account.game_window_no,
+                "url": account.url,
+                "settings_path": str(app_root() / "automation_settings.json"),
+                "action": action,
+                "event_path": str(event_file),
+                "result_path": str(result_file),
+            }
+            cfg_file.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+            proc = _sp.Popen(
+                [_sys.executable, "--run-account-action", str(cfg_file)],
+                cwd=str(app_root()),
+                creationflags=_sp.CREATE_NO_WINDOW,
+            )
+            self._track_process(proc)
+            timing = 0.0
+            verify_state = ""
+            submit_result = ""
+            event_offset = 0
+
+            def drain_events() -> None:
+                nonlocal event_offset, timing, verify_state, submit_result
+                if not event_file.exists():
+                    return
+                with event_file.open("r", encoding="utf-8", errors="replace") as file:
+                    file.seek(event_offset)
+                    for raw_line in file:
+                        line = raw_line.strip()
+                        if not line:
+                            continue
+                        try:
+                            event = json.loads(line)
+                        except Exception:
+                            self._write_file_log(line)
+                            continue
+                        kind = event.get("type")
+                        value = str(event.get("value", ""))
+                        if kind == "log":
+                            self._queue_log(value)
+                            self._write_file_log(value)
+                        elif kind == "status":
+                            self._queue_status(account, value)
+                            self._queue_log(f"[{account.display_name}] → {value}")
+                            self._write_file_log(f"STATUS:{value}")
+                        elif kind == "passport":
+                            self._queue_passport(account, value)
+                            self._write_file_log(f"PASSPORT:{value}")
+                        elif kind == "timing":
+                            try:
+                                timing = float(value)
+                                self._queue_timing(account, timing)
+                            except ValueError:
+                                pass
+                            self._write_file_log(f"TIMING:{value}")
+                        elif kind == "verify":
+                            verify_state = value
+                            self._write_file_log(f"VERIFY:{value}")
+                        elif kind == "submit_result":
+                            submit_result = value
+                            self._write_file_log(f"SUBMIT_RESULT:{value}")
+                    event_offset = file.tell()
+
+            try:
+                while proc.poll() is None:
+                    if self.stop_event.is_set():
+                        proc.terminate()
+                        self._queue_log(f"[{account.display_name}] 已停止，当前账号 exe 子进程正在终止。")
+                        break
+                    drain_events()
+                    time.sleep(0.1)
+                drain_events()
+                try:
+                    proc.wait(timeout=3 if self.stop_event.is_set() else 30)
+                except Exception:
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=3)
+                    except Exception:
+                        pass
+                    self._queue_log(f"[{account.display_name}] 已强制 kill 账号 exe 子进程 pid={proc.pid}。")
+            finally:
+                self._untrack_process(proc)
+
+            result_data: dict[str, object] = {
+                "result": False,
+                "verify_state": verify_state,
+                "submit_result": submit_result,
+                "timing": timing,
+            }
+            if result_file.exists():
+                try:
+                    loaded = json.loads(result_file.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        result_data.update(loaded)
+                except Exception as exc:
+                    self._write_file_log(f"[exe-child-result-error] {exc}")
+            if result_data.get("timing"):
+                try:
+                    self._queue_timing(account, float(result_data["timing"]))
+                except Exception:
+                    pass
+            for path in (cfg_file, event_file, result_file):
+                try:
+                    path.unlink()
+                except Exception:
+                    pass
+            return result_data
+
         cfg = {
             "level": account.level,
             "bookmark_no": account.bookmark_no,
@@ -2115,27 +2224,7 @@ else:
 
     def _run_account_action(self, account: AccountConfig, settings, action: str, frozen: bool) -> dict[str, object]:
         if frozen:
-            runner = AccountRunner(
-                account, settings, self.stop_event,
-                log=lambda msg: self._queue_log(str(msg)),
-                update_status=lambda a, s: self._queue_status(a, s),
-                passport_found=lambda a, p: self._queue_passport(a, p),
-            )
-            if action == "fast_submit":
-                result = runner.run_game_flow_fast_submit()
-                self._queue_timing(account, runner.last_timings.get("总计", 0))
-                return {
-                    "result": result,
-                    "verify_state": "",
-                    "submit_result": runner.last_fast_submit_result,
-                    "timing": runner.last_timings.get("总计", 0),
-                }
-            if action == "verify":
-                state = runner.verify_login_result()
-                return {"result": state == "logged_in", "verify_state": state, "timing": 0.0}
-            result = runner.run_game_flow()
-            self._queue_timing(account, runner.last_timings.get("总计", 0))
-            return {"result": result, "verify_state": "", "timing": runner.last_timings.get("总计", 0)}
+            return self._run_account_child_process(account, action)
         return self._run_account_child_process(account, action)
 
     def _serial_worker_batch_fast(self, accounts: list[AccountConfig], settings, frozen: bool, verify_rounds: int, start_time: float) -> None:

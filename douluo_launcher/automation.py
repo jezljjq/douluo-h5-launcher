@@ -7,6 +7,7 @@ import threading
 import time
 import ctypes
 import json
+import os
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -32,6 +33,25 @@ PassportFoundFn = Callable[[AccountConfig, str], None]
 
 _OPEN_SESSIONS: list[tuple[object, object]] = []
 _OPEN_SESSIONS_LOCK = threading.Lock()
+
+
+def _ensure_playwright_browsers_path() -> Path | None:
+    """Keep packaged runs from looking for Chromium under PyInstaller internals."""
+    if os.name != "nt":
+        return None
+    localappdata = os.environ.get("LOCALAPPDATA")
+    if not localappdata:
+        return None
+    expected = Path(localappdata) / "ms-playwright"
+    current = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "")
+    current_lower = current.lower()
+    points_to_packaged_default = (
+        "_internal" in current_lower
+        and ".local-browsers" in current_lower
+    )
+    if not current or points_to_packaged_default:
+        os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(expected)
+    return expected
 
 
 def extract_passport_from_text(text: str, regex: str) -> str | None:
@@ -117,6 +137,7 @@ class AccountRunner:
         self._save_screenshots = (settings.log_level == "debug")
         self.last_timings: dict[str, float] = {}
         self.last_fast_submit_result = "failed"
+        _ensure_playwright_browsers_path()
 
     def run(self) -> bool:
         playwright = None
@@ -303,6 +324,13 @@ class AccountRunner:
                     self.log(f"[窗口{self.account.game_window_no}] 从登录程序窗口提取通行证")
                 new_passport, source = self._extract_passport_from_login_window()
                 if not new_passport:
+                    if source == "logged_in":
+                        self.last_fast_submit_result = "already_logged_in"
+                        self.update_status(self.account, "已登录，跳过")
+                        self.log(f"[窗口{self.account.game_window_no}] 检测到已登录界面，跳过")
+                        keep_open = False
+                        self._clean_tmp()
+                        return True
                     if passport is not None:
                         # 重试时 OCR 返回空：窗口可能正处于黑屏/过渡态
                         self.log(
@@ -324,13 +352,7 @@ class AccountRunner:
                             new_passport = new_passport2
                             source = new_source2
                     elif retry == 0:
-                        if source == "logged_in":
-                            self.last_fast_submit_result = "already_logged_in"
-                            self.update_status(self.account, "已登录，跳过")
-                            keep_open = False
-                            self._clean_tmp()
-                            return True
-                        elif source in ("qr_page", "unknown"):
+                        if source in ("qr_page", "unknown"):
                             self.log(
                                 f"[窗口{self.account.game_window_no}] "
                                 f"页面状态={source}，OCR失败，等待后重试"
@@ -2479,6 +2501,7 @@ class AccountRunner:
         qr_box = None
         qr_box_raw = None
         qr_box_valid = False
+        fallback_qr_box = None
         try:
             qr_box_raw = self._detect_opencv_qr_box(image)
             if qr_box_raw is not None and self._is_qr_box_geometry_valid(image, qr_box_raw):
@@ -2559,6 +2582,9 @@ class AccountRunner:
 
         qr_page_evidence = bool(qr_box is not None and passport_bar_box is not None)
 
+        if qr_box is None and passport_bar_box is not None:
+            fallback_qr_box = self._locate_qr_box_fallback(image)
+
         qr_suspected = (
             qr_box is None
             and black_ratio >= qr_min
@@ -2578,7 +2604,14 @@ class AccountRunner:
             except Exception as exc:
                 self._vlog("debug", f"[窗口{self.account.game_window_no}] 游戏界面检测异常: {exc}")
 
-        logged_by_threshold = bool(black_ratio <= logged_max and edge_density <= logged_edge)
+        # 低黑像素/低边缘只能作为“没有二维码/通行证证据”时的弱已登录依据。
+        # 二维码页在大窗口/缩放后可能因为 ROI 落点变化而指标偏低，但仍有通行证横条。
+        logged_by_threshold = bool(
+            passport_bar_box is None
+            and fallback_qr_box is None
+            and black_ratio <= logged_max
+            and edge_density <= logged_edge
+        )
         logged_in_evidence = bool(game_notice_detected or game_ui_detected or logged_by_threshold)
 
         if qr_page_evidence:
@@ -2587,16 +2620,20 @@ class AccountRunner:
             state = "logged_in"
         elif game_ui_detected:
             state = "logged_in"
+        elif fallback_qr_box is not None and passport_bar_box is not None:
+            state = "qr_page"
         elif qr_suspected:
             state = "unknown"
         elif qr_box is not None:
             state = "unknown"
         elif black_ratio <= logged_max and edge_density <= logged_edge:
-            state = "logged_in"
+            state = "unknown"
         else:
             state = "unknown"
 
-        if state == "qr_page":
+        if state == "qr_page" and fallback_qr_box is not None and qr_box is None:
+            final_reason = "回退 QR 候选与通行证横条同时存在"
+        elif state == "qr_page":
             final_reason = "QR box 与通行证横条同时存在"
         elif state == "logged_in" and game_notice_detected:
             final_reason = "检测到已登录/公告页视觉特征"
@@ -2606,6 +2643,8 @@ class AccountRunner:
             final_reason = "二维码指标低于已登录阈值"
         elif qr_suspected:
             final_reason = "暗像素/边缘疑似二维码但证据不足"
+        elif passport_bar_box is not None:
+            final_reason = "检测到通行证横条，禁止按低指标兜底为已登录"
         elif qr_box is not None and passport_bar_box is None:
             final_reason = "QR box 缺少有效通行证横条，状态不确定"
         elif qr_box_raw is not None and not qr_box_valid:
@@ -2615,6 +2654,8 @@ class AccountRunner:
 
         if qr_page_evidence:
             qr_evidence_type = "strong_qr"
+        elif fallback_qr_box is not None and passport_bar_box is not None:
+            qr_evidence_type = "fallback_qr"
         elif qr_box is not None or qr_suspected:
             qr_evidence_type = "weak_qr"
         else:
@@ -2629,6 +2670,7 @@ class AccountRunner:
             "qr_detected": bool(qr_box),
             "qr_box_raw": qr_box_raw,
             "qr_box_valid": bool(qr_box_valid),
+            "fallback_qr_box": fallback_qr_box,
             "qr_suspected": bool(qr_suspected),
             "qr_page_evidence": bool(qr_page_evidence),
             "qr_evidence_type": qr_evidence_type,
@@ -3498,6 +3540,11 @@ class AccountRunner:
             and center_dark <= 0.35
             and (right_colorful >= 0.18 or bottom_colorful >= 0.10)
         )
+        colorful_game_ui = (
+            center_colorful >= 0.50
+            and center_dark <= 0.25
+            and (right_colorful >= 0.35 or bottom_colorful >= 0.20)
+        )
         reward_or_victory_ui = (
             center_colorful >= 0.28
             and center_red >= 0.22
@@ -3512,7 +3559,7 @@ class AccountRunner:
             f"center_white={center_white:.3f}, right_color={right_colorful:.3f}, "
             f"bottom_color={bottom_colorful:.3f}, bottom_dark={bottom_dark:.3f}"
         )
-        return bool(main_ui or reward_or_victory_ui)
+        return bool(main_ui or colorful_game_ui or reward_or_victory_ui)
 
     def _image_contains_text_or_hex(self, image, expected: str) -> bool:
         text = self._ocr_image_text(image, "通行证输入")

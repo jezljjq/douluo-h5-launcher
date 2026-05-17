@@ -1,6 +1,6 @@
 # 斗罗大陆H5上号器（前台串行稳定版）
 
-**当前阶段：前台串行模式，方式一和方式二均已接入；窗口管理区已接入。方式一单层 9 账号已验证“快速提交 + 统一校验”最终全部成功。**
+**当前阶段：前台串行阶段性完成版。方式一、方式二、窗口管理区、批量快速登录、统一校验、停止清理、源码模式和 exe 模式均已完成当前阶段验证。**
 
 > 项目级开发规则见 [CLAUDE.md](CLAUDE.md)。
 
@@ -51,6 +51,8 @@
 | 停止任务/关闭清理 | ✅ 已验证 | 停止时终止账号子进程、清理 dm_click_helper.py 和 Chromium | [CLICK_SOLUTION.md](CLICK_SOLUTION.md) |
 | 通行证弹窗坐标缓存 | ✅ 已验证 | `debug_ocr/passport_dialog_pos_cache.json` 按 viewport 缓存 button/input/confirm，跨账号/子进程复用 | [CLICK_SOLUTION.md](CLICK_SOLUTION.md) |
 | 批量快速登录 + 统一校验 | ✅ 已验证 | 当前层/全部串行先快速提交，统一校验后只重登失败账号；9 个单层账号最终 9/9 成功 | [docs/LAUNCHER_FINAL_MILESTONE.md](docs/LAUNCHER_FINAL_MILESTONE.md) |
+| 源码 / exe 一致性 | ✅ 已验证 | exe 使用 `dist/Launcher/上号器.exe`，Playwright 浏览器路径固定为 `%LOCALAPPDATA%\ms-playwright` | [BUILD.md](BUILD.md) |
+| 防回归技能 | ✅ 已新增 | `D:\Ai\skills\launcher-regression-guard\SKILL.md`，用于修改前检查旧问题是否复发 | — |
 
 ### 2.1 当前窗口管理区能力
 
@@ -108,6 +110,30 @@
 - 截图失败不能判成功。
 - 只有明确 `logged_in` 才能成功。
 - 失败账号只重登失败账号，不全量重跑。
+
+---
+
+## 2.3 阶段性完成状态（2026-05-17）
+
+当前阶段已确认：
+
+- 方式一通行证上号已验证通过。
+- 方式二账号密码 + 通行证上号已验证通过。
+- 通行证获取为复制优先，OCR 兜底。
+- OCR 低置信度和 `c/e` 混淆不能直接接受。
+- 已登录窗口不能继续 OCR。
+- 二维码页不能判成功。
+- `unknown` 不能判成功。
+- 批量快速登录 + 统一校验 + 失败重登已验证。
+- 文件级通行证弹窗坐标缓存已生效。
+- 合并 Dm chain 已生效。
+- 固定参数排列和行数列数排列已支持。
+- 单层账号和四层账号已隔离。
+- 停止任务和关闭程序清理子进程已修复。
+- 源码模式和 exe 模式均已测试通过。
+- 已新增 `launcher-regression-guard` 防回归技能。
+
+版本号从 `1.0.0.0` 起步；本阶段收尾版本为 `1.0.0.1`。后续每次发布或重要修复必须同步更新版本号。
 
 ---
 
