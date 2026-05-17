@@ -2023,6 +2023,7 @@ runner = AccountRunner(account, settings, stop, log, status, passport_found=pass
 action = cfg.get("action", "full")
 if action == "fast_submit":
     flow_result = runner.run_game_flow_fast_submit()
+    print("SUBMIT_RESULT:" + str(runner.last_fast_submit_result), flush=True)
     print("RESULT:" + str(flow_result), flush=True)
     print("TIMING:" + str(runner.last_timings.get("总计", 0)), flush=True)
 elif action == "verify":
@@ -2042,6 +2043,7 @@ else:
         self._track_process(proc)
         result_seen = False
         verify_state = ""
+        submit_result = ""
         timing = 0.0
         try:
             for line in proc.stdout:
@@ -2069,6 +2071,9 @@ else:
                     self._write_file_log(line)
                 elif line.startswith("VERIFY:"):
                     verify_state = line[7:]
+                    self._write_file_log(line)
+                elif line.startswith("SUBMIT_RESULT:"):
+                    submit_result = line[14:]
                     self._write_file_log(line)
                 elif line.startswith("RESULT:True"):
                     result_seen = True
@@ -2101,7 +2106,12 @@ else:
         except Exception:
             pass
 
-        return {"result": result_seen, "verify_state": verify_state, "timing": timing}
+        return {
+            "result": result_seen,
+            "verify_state": verify_state,
+            "submit_result": submit_result,
+            "timing": timing,
+        }
 
     def _run_account_action(self, account: AccountConfig, settings, action: str, frozen: bool) -> dict[str, object]:
         if frozen:
@@ -2114,7 +2124,12 @@ else:
             if action == "fast_submit":
                 result = runner.run_game_flow_fast_submit()
                 self._queue_timing(account, runner.last_timings.get("总计", 0))
-                return {"result": result, "verify_state": "", "timing": runner.last_timings.get("总计", 0)}
+                return {
+                    "result": result,
+                    "verify_state": "",
+                    "submit_result": runner.last_fast_submit_result,
+                    "timing": runner.last_timings.get("总计", 0),
+                }
             if action == "verify":
                 state = runner.verify_login_result()
                 return {"result": state == "logged_in", "verify_state": state, "timing": 0.0}
@@ -2144,6 +2159,7 @@ else:
 
             submit_failed: list[AccountConfig] = []
             submitted: list[AccountConfig] = []
+            already_logged_in: list[AccountConfig] = []
             for i, account in enumerate(pending, start=1):
                 if self.stop_event.is_set():
                     break
@@ -2156,10 +2172,22 @@ else:
                 if self.stop_event.is_set():
                     self._queue_status(account, "已停止")
                     break
-                if result.get("result"):
+                submit_result = str(result.get("submit_result") or "")
+                if submit_result == "already_logged_in":
+                    already_logged_in.append(account)
+                    success_by_key[account.key] = account
+                    self._queue_status(account, "已登录")
+                    self._queue_log(f"{account.display_name} 已登录，跳过提交，直接计入成功。")
+                elif result.get("result") and submit_result == "submitted":
                     submitted.append(account)
                     self._queue_status(account, "待复核")
-                    self._queue_log(f"{account.display_name} 已输入确认，标记待复核。")
+                    self._queue_log(f"{account.display_name} 已输入确认，加入待复核。")
+                elif result.get("result"):
+                    submitted.append(account)
+                    self._queue_status(account, "待复核")
+                    self._queue_log(
+                        f"{account.display_name} 快速登录结果缺少分类，按 submitted 加入待复核。"
+                    )
                 else:
                     submit_failed.append(account)
                     self._queue_status(account, "失败")
@@ -2171,7 +2199,12 @@ else:
 
             verify_targets = submitted
             failed_this_round = list(submit_failed)
-            self._queue_log(f"第 {round_index} 次统一校验开始：总数 {len(pending)}。")
+            self._queue_log(
+                f"第 {round_index} 次统一校验开始：本轮总数 {len(pending)}，"
+                f"已登录跳过 {len(already_logged_in)}，待复核 {len(verify_targets)}，"
+                f"提交失败 {len(submit_failed)}。"
+            )
+            verify_success_count = 0
             for i, account in enumerate(verify_targets, start=1):
                 if self.stop_event.is_set():
                     break
@@ -2181,6 +2214,7 @@ else:
                 state = str(verify_result.get("verify_state") or "unknown")
                 if state == "logged_in":
                     success_by_key[account.key] = account
+                    verify_success_count += 1
                     self._queue_status(account, "成功")
                     self._queue_log(f"{account.display_name} 统一校验成功。")
                 else:
@@ -2195,7 +2229,8 @@ else:
             failed_count = len(failed_this_round)
             self._queue_log(
                 f"第 {round_index} 次统一校验完成：总数 {len(pending)}，"
-                f"成功 {len(verify_targets) - (failed_count - len(submit_failed))}，失败 {failed_count}。"
+                f"已登录跳过 {len(already_logged_in)}，校验成功 {verify_success_count}，"
+                f"失败 {failed_count}。"
             )
             if failed_this_round:
                 self._queue_log("失败账号列表：" + "、".join(a.display_name for a in failed_this_round))

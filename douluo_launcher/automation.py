@@ -116,6 +116,7 @@ class AccountRunner:
         self._tmp_dir.mkdir(parents=True, exist_ok=True)
         self._save_screenshots = (settings.log_level == "debug")
         self.last_timings: dict[str, float] = {}
+        self.last_fast_submit_result = "failed"
 
     def run(self) -> bool:
         playwright = None
@@ -313,6 +314,7 @@ class AccountRunner:
                             _time.sleep(0.1)
                         new_passport2, new_source2 = self._extract_passport_from_login_window()
                         if new_passport2 is None and new_source2 == "logged_in":
+                            self.last_fast_submit_result = "already_logged_in"
                             self.update_status(self.account, "登录成功")
                             self.log(f"[窗口{self.account.game_window_no}] 登录成功（QR码消失）")
                             keep_open = False
@@ -323,6 +325,7 @@ class AccountRunner:
                             source = new_source2
                     elif retry == 0:
                         if source == "logged_in":
+                            self.last_fast_submit_result = "already_logged_in"
                             self.update_status(self.account, "已登录，跳过")
                             keep_open = False
                             self._clean_tmp()
@@ -518,6 +521,7 @@ class AccountRunner:
 
                 if not verify_after_submit:
                     _time.sleep(0.3)
+                    self.last_fast_submit_result = "submitted"
                     self.update_status(self.account, "待复核")
                     _timings["校验"] = 0
                     _timings["总计"] = _time.perf_counter() - _t_start
@@ -665,7 +669,13 @@ class AccountRunner:
 
     def run_game_flow_fast_submit(self) -> bool:
         """批量模式：只执行到输入通行证并点击确认，不做完整登录校验。"""
-        return self.run_game_flow(verify_after_submit=False)
+        self.last_fast_submit_result = "failed"
+        result = self.run_game_flow(verify_after_submit=False)
+        if result and self.last_fast_submit_result not in ("already_logged_in", "submitted"):
+            self.last_fast_submit_result = "submitted"
+        if not result:
+            self.last_fast_submit_result = "failed"
+        return result
 
     def verify_login_result(self) -> str:
         """统一校验阶段：只读取登录窗口状态，不放宽成功规则。"""
