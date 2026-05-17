@@ -1220,6 +1220,14 @@ class AccountRunner:
         # === 图像状态判断（不用Tesseract，不依赖OCR） ===
         state, metrics = self.detect_login_page_state(image)
         self.log(
+            f"[窗口{self.account.game_window_no}] 登录前状态判断: "
+            f"size={metrics.get('image_size')} state={state} "
+            f"qr_type={metrics.get('qr_evidence_type')} "
+            f"通行证横条={metrics.get('passport_bar_box')} "
+            f"8位通行证探测={metrics.get('passport_hex_probe')} "
+            f"公告特征={metrics.get('game_notice_detected')} "
+            f"游戏界面特征={metrics.get('game_ui_detected')} "
+            f"reason={metrics.get('final_reason')} "
             f"(black={metrics['black_ratio']}, edge={metrics['edge_density']}, var={metrics['local_variance']})"
         )
 
@@ -1292,11 +1300,18 @@ class AccountRunner:
             drag_end_x = copy_region["drag_end_x"]
             drag_y = copy_region["drag_y"]
             bar_box = copy_region.get("bar_box")
+            local_click = copy_region.get("local_click")
+            qr_box = copy_region.get("qr_box")
+            ocr_crop_box = copy_region.get("ocr_crop_box")
             self.log(
                 f"[窗口{self.account.game_window_no}] 通行证复制区域 source={copy_region['source']} "
-                f"bar_box={bar_box} 双击坐标=({click_x}, {click_y}) "
-                f"拖选=({drag_start_x}, {drag_y})→({drag_end_x}, {drag_y})"
+                f"window_size={window.width}x{window.height} qr_box={qr_box} "
+                f"bar_box={bar_box} double_click_local={local_click} "
+                f"double_click_screen=({click_x}, {click_y}) "
+                f"drag_range=({drag_start_x}, {drag_y})→({drag_end_x}, {drag_y}) "
+                f"OCR crop box={ocr_crop_box}"
             )
+            self._save_passport_copy_debug_image(image, copy_region)
             if not self._activate_and_copy_at(window.hwnd, click_x, click_y):
                 self.log(f"[窗口{self.account.game_window_no}] 窗口激活校验失败，失败类型=COPY_WINDOW_NOT_ACTIVE，仍继续读取剪贴板")
             clipboard_ok, clipboard_text = self._wait_for_clipboard_text(timeout_seconds=1.2)
@@ -1324,12 +1339,14 @@ class AccountRunner:
                     f"摘要={_preview_text(clipboard_text or '', 40)}"
                 )
                 if not clipboard_text:
+                    self._save_passport_copy_debug_image(image, copy_region, suffix="copy_empty")
                     return None, "COPY_EMPTY"
 
             passport = _extract_clipboard_hex(clipboard_text)
             if not passport:
                 preview = _preview_text(clipboard_text, 80)
                 self.log(f"[窗口{self.account.game_window_no}] 剪贴板未提取到 8 位 hex: {preview}")
+                self._save_passport_copy_debug_image(image, copy_region, suffix="copy_no_hex")
                 return None, "COPY_NO_HEX"
 
             self.log(f"[窗口{self.account.game_window_no}] 提取到的 8 位通行证: {passport}")
@@ -1338,6 +1355,8 @@ class AccountRunner:
             return passport, ""
         except Exception as exc:
             self.log(f"[窗口{self.account.game_window_no}] 复制方式异常: {exc}")
+            if "COPY_COORD_MISS" in str(exc):
+                return None, "COPY_COORD_MISS"
             return None, "COPY_FAILED"
         finally:
             if original_ok and original_text is not None:
@@ -1347,16 +1366,47 @@ class AccountRunner:
                 self.log(f"[窗口{self.account.game_window_no}] 原剪贴板无可恢复文本，已跳过恢复")
 
     def _passport_copy_screen_region(self, window, image) -> dict:
+        self.log(
+            f"[窗口{self.account.game_window_no}] 通行证定位输入: "
+            f"window_size={window.width}x{window.height} image_size={image.width}x{image.height}"
+        )
         source = "red_bar"
         bar_box = None
         qr_box = self._detect_opencv_qr_box(image)
+        if qr_box is not None and not self._is_qr_box_geometry_valid(image, qr_box):
+            self.log(
+                f"[窗口{self.account.game_window_no}] OpenCV QR box 几何异常，"
+                f"不作为通行证定位依据: {qr_box}"
+            )
+            qr_box = None
         if qr_box is not None:
-            bar_box = self._find_red_bar_below_qr(image, qr_box)
-            if bar_box is not None:
+            qr_bar_box = self._find_red_bar_below_qr(image, qr_box)
+            if qr_bar_box is not None and self._is_passport_bar_box_valid(image, qr_bar_box):
+                bar_box = qr_bar_box
                 source = "qr_red_bar"
+            elif qr_bar_box is not None:
+                self.log(
+                    f"[窗口{self.account.game_window_no}] QR 下方红条位置可疑，忽略: "
+                    f"bar_box={qr_bar_box} image_size={image.width}x{image.height}"
+                )
 
-        if bar_box is None:
-            bar_box = self._locate_passport_copy_bar(image)
+        global_bar_box = self._locate_passport_copy_bar(image)
+        if global_bar_box is not None and not self._is_passport_bar_box_valid(image, global_bar_box):
+            self.log(
+                f"[窗口{self.account.game_window_no}] 全局通行证横条位置可疑，忽略: "
+                f"bar_box={global_bar_box} image_size={image.width}x{image.height}"
+            )
+            global_bar_box = None
+        if global_bar_box is not None and (
+            bar_box is None or global_bar_box[1] > bar_box[1] + max(8, image.height // 60)
+        ):
+            if bar_box is not None:
+                self.log(
+                    f"[窗口{self.account.game_window_no}] 全局横条比 QR 推算横条更靠近底部，"
+                    f"改用全局横条: qr_bar={bar_box} global_bar={global_bar_box}"
+                )
+            bar_box = global_bar_box
+            source = "red_bar"
 
         if bar_box is not None:
             left, top, right, bottom = bar_box
@@ -1374,66 +1424,153 @@ class AccountRunner:
                 "drag_start_x": drag_start_x,
                 "drag_end_x": drag_end_x,
                 "drag_y": window.top + local_y,
+                "local_click": (local_x, local_y),
                 "bar_box": (left, top, right, bottom),
+                "qr_box": qr_box,
+                "ocr_crop_box": None,
                 "source": source,
             }
 
         _crop, bbox = self._crop_passport_hex_region(image)
-        if bbox is not None:
+        if bbox is not None and self._is_passport_bar_box_valid(image, bbox):
             left, top, right, bottom = bbox
             local_x = left + int((right - left) * 0.68)
             local_y = top + (bottom - top) // 2
             drag_start_x = window.left + left + int((right - left) * 0.40)
             drag_end_x = window.left + left + int((right - left) * 0.95)
+            self.log(
+                f"[窗口{self.account.game_window_no}] 使用 OCR 裁剪区域作为复制区域: "
+                f"bbox={bbox}"
+            )
             return {
                 "click_x": window.left + local_x,
                 "click_y": window.top + local_y,
                 "drag_start_x": drag_start_x,
                 "drag_end_x": drag_end_x,
                 "drag_y": window.top + local_y,
+                "local_click": (local_x, local_y),
                 "bar_box": (left, top, right, bottom),
+                "qr_box": qr_box,
+                "ocr_crop_box": bbox,
                 "source": "ocr_crop",
             }
+        if bbox is not None:
+            self.log(
+                f"[窗口{self.account.game_window_no}] OCR 裁剪区域位置可疑，不用于复制: "
+                f"bbox={bbox} image_size={image.width}x{image.height}"
+            )
 
-        local_x = int(window.width * 0.66)
-        local_y = int(window.height * 0.74)
-        drag_start_x = window.left + int(window.width * 0.48)
-        drag_end_x = window.left + int(window.width * 0.92)
-        return {
-            "click_x": window.left + local_x,
-            "click_y": window.top + local_y,
-            "drag_start_x": drag_start_x,
-            "drag_end_x": drag_end_x,
-            "drag_y": window.top + local_y,
-            "bar_box": None,
-            "source": "ratio_fallback",
-        }
+        raise RuntimeError(
+            "COPY_COORD_MISS: 未能可靠定位本次通行证横条，"
+            f"qr_box={qr_box} image_size={image.width}x{image.height}"
+        )
+
+    def _is_qr_box_geometry_valid(self, image, qr_box: tuple[int, int, int, int] | None) -> bool:
+        if qr_box is None:
+            return False
+        left, top, right, bottom = qr_box
+        box_width = max(0, right - left)
+        box_height = max(0, bottom - top)
+        image_width, image_height = image.size
+        if box_width < 50 or box_height < 50:
+            return False
+        aspect = box_width / max(box_height, 1)
+        area_ratio = (box_width * box_height) / max(image_width * image_height, 1)
+        # OpenCV 偶尔会把已登录画面的竖向区域误报为 QR；真正二维码应大致接近正方形。
+        if aspect < 0.55 or aspect > 1.85:
+            return False
+        if area_ratio > 0.45:
+            return False
+        if bottom > image_height + 1 or right > image_width + 1:
+            return False
+        return True
+
+    def _is_passport_bar_box_valid(self, image, bar_box: tuple[int, int, int, int] | None) -> bool:
+        if bar_box is None:
+            return False
+        left, top, right, bottom = bar_box
+        width, height = image.size
+        box_width = max(0, right - left)
+        box_height = max(0, bottom - top)
+        if box_width < max(80, int(width * 0.45)):
+            return False
+        if box_height < max(12, int(height * 0.025)):
+            return False
+        # “本次通行证”红条在登录窗口底部区域；过高的红块很可能来自其他界面元素。
+        if top < int(height * 0.76):
+            return False
+        if bottom > height:
+            return False
+        return True
+
+    def _save_passport_copy_debug_image(self, image, copy_region: dict, suffix: str = "locate") -> None:
+        try:
+            from PIL import ImageDraw
+
+            debug_dir = app_root() / "debug_ocr" / "_tmp"
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            draw_img = image.copy().convert("RGB")
+            draw = ImageDraw.Draw(draw_img)
+            qr_box = copy_region.get("qr_box")
+            bar_box = copy_region.get("bar_box")
+            ocr_crop_box = copy_region.get("ocr_crop_box")
+            if qr_box is not None:
+                draw.rectangle(qr_box, outline="blue", width=2)
+            if bar_box is not None:
+                draw.rectangle(bar_box, outline="red", width=2)
+            if ocr_crop_box is not None:
+                draw.rectangle(ocr_crop_box, outline="orange", width=2)
+            local_click = copy_region.get("local_click")
+            if local_click is not None:
+                x, y = local_click
+                draw.line([(x - 8, y), (x + 8, y)], fill="lime", width=2)
+                draw.line([(x, y - 8), (x, y + 8)], fill="lime", width=2)
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            path = debug_dir / (
+                f"passport_copy_w{self.account.game_window_no}_{suffix}_{stamp}.png"
+            )
+            draw_img.save(path)
+            self.log(f"[窗口{self.account.game_window_no}] 通行证定位调试截图已保存: {path}")
+        except Exception as exc:
+            self._vlog("debug", f"[窗口{self.account.game_window_no}] 保存通行证定位调试截图失败: {exc}")
 
     def _has_passport_page_evidence(self, image) -> bool:
         """判断截图是否仍像二维码通行证页，防止大窗口被误判为已登录。"""
         qr_box = self._detect_opencv_qr_box(image)
-        if qr_box is not None:
+        if qr_box is not None and not self._is_qr_box_geometry_valid(image, qr_box):
             self.log(
-                f"[窗口{self.account.game_window_no}] 已登录初判复核：仍检测到 OpenCV QR box={qr_box}"
+                f"[窗口{self.account.game_window_no}] 已登录初判复核：忽略几何异常 QR box={qr_box}"
             )
-            return True
+            qr_box = None
+        if qr_box is not None:
+            red_bar = self._find_red_bar_below_qr(image, qr_box)
+            if red_bar is not None and self._is_passport_bar_box_valid(image, red_bar):
+                self.log(
+                    f"[窗口{self.account.game_window_no}] 已登录初判复核："
+                    f"仍检测到有效 QR box={qr_box} 和通行证横条={red_bar}"
+                )
+                return True
+            self.log(
+                f"[窗口{self.account.game_window_no}] 已登录初判复核：QR box={qr_box} "
+                "缺少有效通行证横条，不作为二维码页证据"
+            )
 
         fallback_qr = self._locate_qr_box_fallback(image)
         if fallback_qr is not None:
             red_bar = self._find_red_bar_below_qr(image, fallback_qr)
-            if red_bar is not None:
+            if red_bar is not None and self._is_passport_bar_box_valid(image, red_bar):
                 self.log(
                     f"[窗口{self.account.game_window_no}] 已登录初判复核："
-                    f"回退QR候选={fallback_qr} 且下方存在通行证横条={red_bar}"
+                    f"回退QR候选={fallback_qr} 且下方存在疑似横条={red_bar}，"
+                    "仅作为 weak_qr，不阻止已登录判断"
                 )
-                return True
 
         bar_box = self._locate_passport_copy_bar(image)
-        if bar_box is not None:
+        if bar_box is not None and self._is_passport_bar_box_valid(image, bar_box):
             self.log(
-                f"[窗口{self.account.game_window_no}] 已登录初判复核：仍检测到通行证横条={bar_box}"
+                f"[窗口{self.account.game_window_no}] 已登录初判复核：检测到单独红色横条={bar_box}，"
+                "缺少强 QR 证据，不作为二维码页证据"
             )
-            return True
         return False
 
     @staticmethod
@@ -1700,13 +1837,21 @@ class AccountRunner:
             failure_type = "LOGIN_VERIFY_QR_DETECTED"
         elif state == "unknown":
             failure_type = "LOGIN_VERIFY_UNKNOWN"
+        passport_copy_probe = "未执行（统一校验阶段不扰动剪贴板）"
         self.log(
             f"[窗口{self.account.game_window_no}] 登录校验 hwnd={selected.hwnd} "
             f"标题={selected.title} size={selected.width}x{selected.height} "
             f"截图={raw_path} state={state} 二维码特征={metrics.get('qr_detected', False)} "
+            f"QR类型={metrics.get('qr_evidence_type')} "
+            f"QR证据={metrics.get('qr_page_evidence', False)} "
+            f"通行证横条={metrics.get('passport_bar_box')} "
+            f"是否能复制/识别到8位通行证={metrics.get('passport_hex_probe', passport_copy_probe)} "
+            f"已登录特征={metrics.get('logged_in_evidence', False)} "
+            f"公告/游戏特征={metrics.get('game_notice_detected', False)}/{metrics.get('game_ui_detected', False)} "
             f"疑似二维码={metrics.get('qr_suspected', False)} "
             f"black={metrics.get('black_ratio')} edge={metrics.get('edge_density')} "
-            f"var={metrics.get('local_variance')} 失败类型={failure_type or '无'}"
+            f"var={metrics.get('local_variance')} "
+            f"最终判定原因={metrics.get('final_reason')} 失败类型={failure_type or '无'}"
         )
         return state
 
@@ -2322,8 +2467,18 @@ class AccountRunner:
         import numpy as np
 
         qr_box = None
+        qr_box_raw = None
+        qr_box_valid = False
         try:
-            qr_box = self._detect_opencv_qr_box(image)
+            qr_box_raw = self._detect_opencv_qr_box(image)
+            if qr_box_raw is not None and self._is_qr_box_geometry_valid(image, qr_box_raw):
+                qr_box = qr_box_raw
+                qr_box_valid = True
+            elif qr_box_raw is not None:
+                self.log(
+                    f"[窗口{self.account.game_window_no}] QR检测候选几何异常，"
+                    f"不直接判二维码页: qr_box={qr_box_raw} image_size={image.width}x{image.height}"
+                )
         except Exception as exc:
             self._vlog("debug", f"[窗口{self.account.game_window_no}] QR检测异常: {exc}")
 
@@ -2376,6 +2531,24 @@ class AccountRunner:
         logged_max = self.settings.logged_in_black_ratio_max
         logged_edge = self.settings.logged_in_edge_density_max
 
+        passport_bar_box = None
+        qr_bar_box = None
+        if qr_box is not None:
+            qr_bar_box = self._find_red_bar_below_qr(image, qr_box)
+            if qr_bar_box is not None and self._is_passport_bar_box_valid(image, qr_bar_box):
+                passport_bar_box = qr_bar_box
+            elif qr_bar_box is not None:
+                self.log(
+                    f"[窗口{self.account.game_window_no}] 登录校验 QR 下方横条位置可疑，"
+                    f"不作为二维码页证据: bar_box={qr_bar_box}"
+                )
+        global_bar_box = self._locate_passport_copy_bar(image)
+        if global_bar_box is not None and self._is_passport_bar_box_valid(image, global_bar_box):
+            if passport_bar_box is None or global_bar_box[1] > passport_bar_box[1]:
+                passport_bar_box = global_bar_box
+
+        qr_page_evidence = bool(qr_box is not None and passport_bar_box is not None)
+
         qr_suspected = (
             qr_box is None
             and black_ratio >= qr_min
@@ -2384,22 +2557,58 @@ class AccountRunner:
         )
 
         game_notice_detected = False
-        if qr_box is None and not qr_suspected:
+        game_ui_detected = False
+        if not qr_page_evidence:
             try:
                 game_notice_detected = self._looks_like_game_notice_page(image)
             except Exception as exc:
                 self._vlog("debug", f"[窗口{self.account.game_window_no}] 公告页检测异常: {exc}")
+            try:
+                game_ui_detected = self._looks_like_game_ui_page(image)
+            except Exception as exc:
+                self._vlog("debug", f"[窗口{self.account.game_window_no}] 游戏界面检测异常: {exc}")
 
-        if qr_box is not None:
+        logged_by_threshold = bool(black_ratio <= logged_max and edge_density <= logged_edge)
+        logged_in_evidence = bool(game_notice_detected or game_ui_detected or logged_by_threshold)
+
+        if qr_page_evidence:
             state = "qr_page"
-        elif qr_suspected:
-            state = "unknown"
         elif game_notice_detected:
             state = "logged_in"
+        elif game_ui_detected:
+            state = "logged_in"
+        elif qr_suspected:
+            state = "unknown"
+        elif qr_box is not None:
+            state = "unknown"
         elif black_ratio <= logged_max and edge_density <= logged_edge:
             state = "logged_in"
         else:
             state = "unknown"
+
+        if state == "qr_page":
+            final_reason = "QR box 与通行证横条同时存在"
+        elif state == "logged_in" and game_notice_detected:
+            final_reason = "检测到已登录/公告页视觉特征"
+        elif state == "logged_in" and game_ui_detected:
+            final_reason = "检测到游戏界面特征且无 strong_qr"
+        elif state == "logged_in" and logged_by_threshold:
+            final_reason = "二维码指标低于已登录阈值"
+        elif qr_suspected:
+            final_reason = "暗像素/边缘疑似二维码但证据不足"
+        elif qr_box is not None and passport_bar_box is None:
+            final_reason = "QR box 缺少有效通行证横条，状态不确定"
+        elif qr_box_raw is not None and not qr_box_valid:
+            final_reason = "OpenCV QR 候选几何异常，状态按视觉特征复核"
+        else:
+            final_reason = "缺少二维码页和已登录正向证据"
+
+        if qr_page_evidence:
+            qr_evidence_type = "strong_qr"
+        elif qr_box is not None or qr_suspected:
+            qr_evidence_type = "weak_qr"
+        else:
+            qr_evidence_type = "no_qr"
 
         metrics = {
             "black_ratio": round(black_ratio, 4),
@@ -2408,8 +2617,18 @@ class AccountRunner:
             "roi": roi,
             "state": state,
             "qr_detected": bool(qr_box),
+            "qr_box_raw": qr_box_raw,
+            "qr_box_valid": bool(qr_box_valid),
             "qr_suspected": bool(qr_suspected),
+            "qr_page_evidence": bool(qr_page_evidence),
+            "qr_evidence_type": qr_evidence_type,
+            "passport_bar_box": passport_bar_box,
+            "passport_hex_probe": "未执行（状态判断不扰动剪贴板/OCR）",
+            "qr_bar_box": qr_bar_box,
             "game_notice_detected": bool(game_notice_detected),
+            "game_ui_detected": bool(game_ui_detected),
+            "logged_in_evidence": bool(logged_in_evidence),
+            "final_reason": final_reason,
             "qr_box": qr_box,
             "image_size": (w, h),
         }
@@ -2446,10 +2665,10 @@ class AccountRunner:
                 continue
             if bbox is not None and len(bbox) > 0:
                 pts = (bbox.astype(np.float64) / factor).astype(int)
-                left = max(0, pts[:, 0].min())
-                top = max(0, pts[:, 1].min())
-                right = min(image.width, pts[:, 0].max())
-                bottom = min(image.height, pts[:, 1].max())
+                left = int(max(0, pts[:, 0].min()))
+                top = int(max(0, pts[:, 1].min()))
+                right = int(min(image.width, pts[:, 0].max()))
+                bottom = int(min(image.height, pts[:, 1].max()))
                 if right - left >= 50 and bottom - top >= 50:
                     self.log(
                         f"[窗口{self.account.game_window_no}] OpenCV QR检测成功 "
@@ -3225,6 +3444,65 @@ class AccountRunner:
             f"gray_ratio={gray_ratio:.3f}, right_bright_ratio={right_bright_ratio:.3f}"
         )
         return gray_ratio > 0.20 and right_bright_ratio > 0.04
+
+    def _looks_like_game_ui_page(self, image) -> bool:
+        """识别已进入游戏后的主界面/奖励/胜利等画面。
+
+        这不是成功兜底：调用方会先排除 strong_qr。这里只提供正向的游戏 UI 视觉证据。
+        """
+        import numpy as np
+
+        arr = np.array(image.convert("RGB"))
+        height, width = arr.shape[:2]
+        if height < 300 or width < 240:
+            return False
+
+        center = arr[int(height * 0.12):int(height * 0.88), int(width * 0.10):int(width * 0.90)]
+        right = arr[int(height * 0.10):int(height * 0.90), int(width * 0.74):int(width * 0.98)]
+        bottom = arr[int(height * 0.78):int(height * 0.98), int(width * 0.05):int(width * 0.95)]
+        if center.size == 0:
+            return False
+
+        def ratios(region):
+            r = region[:, :, 0].astype(int)
+            g = region[:, :, 1].astype(int)
+            b = region[:, :, 2].astype(int)
+            maxc = np.maximum.reduce([r, g, b])
+            minc = np.minimum.reduce([r, g, b])
+            saturation = maxc - minc
+            colorful = float(((saturation > 45) & (maxc > 80)).mean())
+            bright = float(((r > 115) & (g > 95) & (b > 60)).mean())
+            dark = float(((r < 70) & (g < 70) & (b < 70)).mean())
+            red = float(((r > 70) & (r > g + 10) & (r > b + 5) & (g < 150) & (b < 150)).mean())
+            white_text = float(((r > 185) & (g > 185) & (b > 185) & (saturation < 40)).mean())
+            return colorful, bright, dark, red, white_text
+
+        center_colorful, center_bright, center_dark, center_red, center_white = ratios(center)
+        right_colorful, right_bright, right_dark, _right_red, _right_white = ratios(right) if right.size else (0, 0, 0, 0, 0)
+        bottom_colorful, bottom_bright, bottom_dark, _bottom_red, _bottom_white = ratios(bottom) if bottom.size else (0, 0, 0, 0, 0)
+
+        # 主界面通常有大量彩色 UI 和右侧按钮；胜利/奖励弹窗通常中心彩色/红紫色占比高。
+        main_ui = (
+            center_colorful >= 0.30
+            and center_bright >= 0.22
+            and center_dark <= 0.35
+            and (right_colorful >= 0.18 or bottom_colorful >= 0.10)
+        )
+        reward_or_victory_ui = (
+            center_colorful >= 0.28
+            and center_red >= 0.22
+            and center_white >= 0.01
+            and bottom_dark >= 0.45
+        )
+
+        self.log(
+            f"[窗口{self.account.game_window_no}] 游戏界面视觉校验: "
+            f"center_color={center_colorful:.3f}, center_bright={center_bright:.3f}, "
+            f"center_dark={center_dark:.3f}, center_red={center_red:.3f}, "
+            f"center_white={center_white:.3f}, right_color={right_colorful:.3f}, "
+            f"bottom_color={bottom_colorful:.3f}, bottom_dark={bottom_dark:.3f}"
+        )
+        return bool(main_ui or reward_or_victory_ui)
 
     def _image_contains_text_or_hex(self, image, expected: str) -> bool:
         text = self._ocr_image_text(image, "通行证输入")

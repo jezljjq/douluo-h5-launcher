@@ -205,7 +205,9 @@ GUI 按钮：
 .\scripts\build_exe.bat
 ```
 
-输出：`dist/斗罗大陆H5上号器/斗罗大陆H5上号器.exe`
+输出：`dist/Launcher/上号器.exe`
+
+说明：内部打包目录使用英文 `Launcher`，避免 Windows bat/cmd 对中文目录名处理不稳定；最终用户看到的 exe 名称仍固定为 `上号器.exe`。
 
 详见 [BUILD.md](BUILD.md)。
 

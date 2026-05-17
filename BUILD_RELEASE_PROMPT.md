@@ -73,16 +73,33 @@ pip install pyinstaller
 推荐使用项目内打包脚本：
 
 ```powershell
-build_exe.bat
-```
-
-或：
-
-```powershell
 scripts\build_exe.bat
 ```
 
-不要临时乱写打包命令，优先维护固定脚本。
+脚本是唯一推荐入口。不要临时拼接 PyInstaller 命令；如果打包参数需要变化，先维护 `scripts\build_exe.ps1`，再通过 `scripts\build_exe.bat` 重新执行脚本。
+
+### 打包脚本卫生规则
+
+`scripts\build_exe.bat` 必须保持纯 bat 脚本，并且只作为 ASCII-only 启动器调用 `scripts\build_exe.ps1`：
+
+* 不允许混入 Markdown 文档内容。
+* 不允许混入普通说明文字，除非使用 `REM` 或 `echo`。
+* 中文说明、中文路径、中文 exe 名不要交给 `cmd` 多行解析，放到 UTF-8 PowerShell 脚本中处理。
+* 所有路径必须加双引号。
+* 如 bat 中存在多行命令，必须使用正确的 `^` 续行；当前推荐做法是不要在 bat 中写 PyInstaller 多行命令。
+* 不允许出现断裂参数，例如某个 png、md、exe 文件名被单独当命令执行。
+* 脚本失败时必须输出 `[FAIL]` 并 `exit /b 1`，禁止假成功。
+* 禁止通过改英文软件名、目录名、业务名来绕过中文编码问题。
+
+### Playwright 浏览器策略
+
+当前发布包使用用户级 Playwright 浏览器缓存：
+
+```text
+%LOCALAPPDATA%\ms-playwright
+```
+
+不要让 exe 依赖不存在的 `_internal\.local-browsers`。如果本机没有 Chromium 缓存，打包脚本应执行 `python -m playwright install chromium` 后再继续。
 
 ---
 
@@ -91,7 +108,7 @@ scripts\build_exe.bat
 exe 名称：
 
 ```text
-斗罗大陆H5上号器.exe
+上号器.exe
 ```
 
 输出目录：
@@ -103,8 +120,10 @@ dist\
 最终可运行目录建议：
 
 ```text
-dist\斗罗大陆H5上号器\
+dist\Launcher\
 ```
+
+说明：内部打包目录和 PyInstaller 内部名称可以使用英文 `Launcher`，避免 Windows `cmd` 对中文目录名、spec 名和中间构建路径解析不稳定。发布包最终 exe 文件名必须保持中文 `上号器.exe`。若中文 exe 名处理不稳定，应修复脚本本身，优先使用 UTF-8 PowerShell 脚本和参数数组。GUI 窗口标题仍显示为“上号器 — 前台串行模式”。
 
 ---
 
