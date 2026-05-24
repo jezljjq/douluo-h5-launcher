@@ -2,9 +2,11 @@
 build/
 dist/
 *.spec
+*.exe
 
 # Python
 __pycache__/
+**/__pycache__/
 *.pyc
 *.pyo
 .venv/
@@ -16,6 +18,8 @@ logs/
 
 # 调试截图 - 自动生成
 debug_ocr/latest_*
+debug_ocr/*.png
+debug_ocr/*.json
 
 # 调试截图 - 临时和错误现场
 debug_ocr/_tmp/
@@ -37,7 +41,10 @@ _cleanup_pending/
 *.env
 credentials*
 *secret*
+*.csv
 密码.csv
 *密码*.csv
+window_manager_settings.json
+automation_settings.json
 debug_ocr/m2_browser_screenshot.png
 csv_last_path.txt
