@@ -53,6 +53,25 @@ QLabel#ModeStatus {
     padding-top: 4px;
 }
 
+QLabel#NavItem {
+    background: #f8fafc;
+    border: 1px solid #e2e8f0;
+    border-radius: 6px;
+    color: #172033;
+    font-weight: 600;
+    min-height: 26px;
+    padding: 3px 8px;
+}
+
+QLabel#DetailValue {
+    background: #f8fafc;
+    border: 1px solid #e2e8f0;
+    border-radius: 5px;
+    color: #475569;
+    min-height: 24px;
+    padding: 2px 8px;
+}
+
 QLineEdit,
 QComboBox,
 QSpinBox {
@@ -136,6 +155,21 @@ QPushButton[role="primary"]:hover {
 
 QPushButton[role="primary"]:pressed {
     background: #064ea5;
+}
+
+QPushButton[role="primarySoft"] {
+    background: #eaf3ff;
+    border-color: #80b7ff;
+    color: #075ac9;
+}
+
+QPushButton[role="primarySoft"]:hover {
+    background: #dcecff;
+    border-color: #4c9aff;
+}
+
+QPushButton[role="primarySoft"]:pressed {
+    background: #cfe4ff;
 }
 
 QPushButton[role="danger"],

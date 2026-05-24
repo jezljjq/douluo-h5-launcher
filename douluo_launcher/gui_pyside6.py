@@ -69,7 +69,7 @@ class PySideLauncherWindow(QMainWindow):
         content_layout.addWidget(self._create_window_manager_card())
         content_layout.addLayout(config_mode_row)
         content_layout.addWidget(self._create_run_card())
-        content_layout.addWidget(self._create_account_card())
+        content_layout.addLayout(self._create_workspace_row())
         content_layout.addWidget(self._create_log_card())
 
         scroll_area.setWidget(content)
@@ -78,10 +78,10 @@ class PySideLauncherWindow(QMainWindow):
 
     def _create_window_manager_card(self) -> QFrame:
         card, layout = self._card("窗口管理区", QGridLayout)
-        card.setMinimumHeight(188)
-        card.setMaximumHeight(190)
+        card.setMinimumHeight(178)
+        card.setMaximumHeight(184)
         card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        layout.setVerticalSpacing(10)
+        layout.setVerticalSpacing(6)
         layout.setContentsMargins(10, 6, 10, 10)
         layout.setColumnStretch(0, 1)
 
@@ -147,44 +147,43 @@ class PySideLauncherWindow(QMainWindow):
         row4_layout.addStretch(1)
         layout.addWidget(row4, 3, 0)
         for row in range(4):
-            layout.setRowMinimumHeight(row, 36)
+            layout.setRowMinimumHeight(row, 32)
         return card
 
     def _create_config_card(self) -> QFrame:
         card, layout = self._card("配置区", QGridLayout)
-        card.setMinimumHeight(145)
-        card.setMaximumHeight(150)
+        card.setMinimumHeight(126)
+        card.setMaximumHeight(132)
         card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        layout.setHorizontalSpacing(10)
+        layout.setHorizontalSpacing(8)
         layout.setVerticalSpacing(6)
         layout.setContentsMargins(10, 6, 10, 10)
         layout.setColumnStretch(1, 1)
+        layout.setColumnStretch(4, 1)
 
         self.bookmark_path_edit = QLineEdit(r"D:\Tools\Favorites")
         self.bookmark_root_edit = QLineEdit("账号")
-        self.bookmark_root_edit.setFixedWidth(260)
-        self.bookmark_root_edit.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.settings_path_edit = QLineEdit("automation_settings.json")
         self.csv_path_edit = QLineEdit(r"D:\Tools\accounts.csv")
 
-        layout.addWidget(self._label("收藏夹路径", 90), 0, 0)
+        layout.addWidget(self._label("收藏夹路径", 82), 0, 0)
         layout.addWidget(self.bookmark_path_edit, 0, 1)
-        layout.addWidget(self._secondary_button("选择", 100), 0, 2)
-        layout.addWidget(self._label("根目录名", 90), 1, 0)
-        layout.addWidget(self.bookmark_root_edit, 1, 1)
-        layout.addWidget(self._secondary_button("选择", 100), 1, 2)
-        layout.addWidget(self._label("自动化设置", 90), 2, 0)
-        layout.addWidget(self.settings_path_edit, 2, 1)
-        layout.addWidget(self._secondary_button("选择", 100), 2, 2)
-        layout.addWidget(self._label("CSV 文件路径", 90), 3, 0)
-        layout.addWidget(self.csv_path_edit, 3, 1)
-        layout.addWidget(self._secondary_button("选择", 100), 3, 2)
+        layout.addWidget(self._secondary_button("选择", 86), 0, 2)
+        layout.addWidget(self._label("根目录名", 70), 0, 3)
+        layout.addWidget(self.bookmark_root_edit, 0, 4)
+        layout.addWidget(self._secondary_button("选择", 86), 0, 5)
+        layout.addWidget(self._label("自动化设置", 82), 1, 0)
+        layout.addWidget(self.settings_path_edit, 1, 1)
+        layout.addWidget(self._secondary_button("选择", 86), 1, 2)
+        layout.addWidget(self._label("CSV 文件路径", 70), 1, 3)
+        layout.addWidget(self.csv_path_edit, 1, 4)
+        layout.addWidget(self._secondary_button("选择", 86), 1, 5)
         return card
 
     def _create_mode_card(self) -> QFrame:
         card, layout = self._card("上号方式区", QVBoxLayout)
-        card.setMinimumHeight(145)
-        card.setMaximumHeight(150)
+        card.setMinimumHeight(140)
+        card.setMaximumHeight(145)
         card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         layout.setContentsMargins(10, 6, 10, 10)
         layout.setSpacing(4)
@@ -205,8 +204,8 @@ class PySideLauncherWindow(QMainWindow):
 
     def _create_run_card(self) -> QFrame:
         card, layout = self._card("运行控制区", QGridLayout)
-        card.setMinimumHeight(96)
-        card.setMaximumHeight(105)
+        card.setMinimumHeight(90)
+        card.setMaximumHeight(98)
         card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         layout.setHorizontalSpacing(10)
         layout.setVerticalSpacing(6)
@@ -243,7 +242,7 @@ class PySideLauncherWindow(QMainWindow):
         layout.addWidget(self.retry_spin, 0, 9)
 
         layout.addWidget(self._primary_button("单账号运行", 115), 1, 0, 1, 2)
-        layout.addWidget(self._primary_button("当前层串行", 115), 1, 2, 1, 2)
+        layout.addWidget(self._primary_soft_button("当前层串行", 115), 1, 2, 1, 2)
         layout.addWidget(self._primary_button("全部串行", 115), 1, 4, 1, 2)
         stop_button = self._danger_button("停止任务", 115)
         stop_button.setObjectName("stopButton")
@@ -254,15 +253,17 @@ class PySideLauncherWindow(QMainWindow):
 
     def _create_account_card(self) -> QFrame:
         card, layout = self._card("账号列表区", QVBoxLayout)
-        card.setMinimumHeight(230)
-        card.setMaximumHeight(240)
+        card.setMinimumHeight(240)
+        card.setMaximumHeight(252)
         card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         layout.setContentsMargins(10, 6, 10, 10)
 
         self.account_table = QTableWidget(0, 8)
         self.account_table.setObjectName("AccountTable")
-        self.account_table.setMinimumHeight(210)
-        self.account_table.setHorizontalHeaderLabels(["序号", "层级", "收藏编号", "窗口号", "用户名", "通行证", "链接", "状态"])
+        self.account_table.setMinimumHeight(220)
+        self.account_table.setHorizontalHeaderLabels(
+            ["窗口编号", "账号名称", "当前阶段", "OCR 状态", "通行证状态", "登录结果", "耗时", "错误原因"]
+        )
         self.account_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.account_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.account_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -276,6 +277,50 @@ class PySideLauncherWindow(QMainWindow):
         layout.addWidget(self.account_table)
         return card
 
+    def _create_workspace_row(self) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        row.addWidget(self._create_task_nav_card(), stretch=14)
+        row.addWidget(self._create_account_card(), stretch=62)
+        row.addWidget(self._create_detail_card(), stretch=24)
+        return row
+
+    def _create_task_nav_card(self) -> QFrame:
+        card, layout = self._card("任务导航", QVBoxLayout)
+        card.setMinimumHeight(240)
+        card.setMaximumHeight(252)
+        card.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+        layout.setContentsMargins(10, 6, 10, 10)
+        layout.setSpacing(6)
+
+        for text in ("方式一：通行证", "方式二：账号密码", "单层账号", "四层账号"):
+            item = QLabel(text)
+            item.setObjectName("NavItem")
+            layout.addWidget(item)
+        layout.addSpacing(4)
+        hint = self._help_label("当前为 PySide6 UI 预览，等待真实任务数据接入。")
+        layout.addWidget(hint)
+        layout.addStretch(1)
+        return card
+
+    def _create_detail_card(self) -> QFrame:
+        card, layout = self._card("当前账号流程", QVBoxLayout)
+        card.setMinimumHeight(240)
+        card.setMaximumHeight(252)
+        card.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+        layout.setContentsMargins(10, 6, 10, 10)
+        layout.setSpacing(5)
+
+        layout.addWidget(self._detail_row("窗口", "未选择"))
+        layout.addWidget(self._detail_row("账号", "无数据"))
+        layout.addWidget(self._detail_row("阶段", "等待"))
+        layout.addWidget(self._detail_row("OCR", "未开始"))
+        layout.addWidget(self._detail_row("通行证", "未开始"))
+        layout.addWidget(self._detail_row("结果", "未开始"))
+        layout.addWidget(self._detail_row("错误/耗时", "无数据 / —"))
+        layout.addStretch(1)
+        return card
+
     def _create_log_card(self) -> QFrame:
         card, layout = self._card("日志区", QVBoxLayout)
         card.setMinimumHeight(150)
@@ -287,7 +332,7 @@ class PySideLauncherWindow(QMainWindow):
         header.setSpacing(8)
         header.addWidget(QLabel("前端简洁日志"))
         header.addStretch(1)
-        header.addWidget(self._secondary_button("打开日志目录", 130))
+        header.addWidget(self._secondary_button("打开日志目录", 120))
         layout.addLayout(header)
 
         self.log_text = QPlainTextEdit()
@@ -295,10 +340,10 @@ class PySideLauncherWindow(QMainWindow):
         self.log_text.setReadOnly(True)
         self.log_text.setMinimumHeight(92)
         self.log_text.setPlainText(
-            "[10:35:21] [信息] PySide6 阶段1空壳界面已启动。\n"
-            "[10:35:22] [信息] 当前不接上号流程，不调用业务逻辑。\n"
-            "[10:35:23] [信息] 使用 QFrame 卡片、QGridLayout 与 QSS 还原目标结构。\n"
-            "[10:35:24] [警告] 排列窗口参数已修改，请重新排列生效。"
+            "[信息] PySide6 预览界面已启动。\n"
+            "[信息] 当前未接入业务流程，不展示虚假成功状态。\n"
+            "[信息] 账号表等待真实数据绑定。\n"
+            "[信息] 详细运行日志后续仍写入 logs 文件。"
         )
         layout.addWidget(self.log_text)
         return card
@@ -322,21 +367,16 @@ class PySideLauncherWindow(QMainWindow):
 
     def _fill_sample_accounts(self) -> None:
         rows = [
-            ("1", "第一层", "1", "1", "user_0001", "通行证_0001", "https://example.com/passport?token=PLs8D7K9mNwZrYx1", "运行中"),
-            ("2", "第一层", "2", "2", "user_0002", "通行证_0002", "https://example.com/passport?token=QwE2R4T9bJkLmP2", "成功"),
-            ("3", "第一层", "3", "3", "user_0003", "通行证_0003", "https://example.com/passport?token=RTy6G3P8uLmNeW4", "已登录跳过"),
-            ("4", "第一层", "4", "4", "user_0004", "通行证_0004", "https://example.com/passport?token=GFh9Y6V2dJsQfR7", "未开始"),
-            ("5", "第一层", "5", "5", "user_0005", "通行证_0005", "https://example.com/passport?token=ZgH3dP9LmNwQ12", "失败"),
-            ("6", "第一层", "6", "6", "user_0006", "通行证_0006", "https://example.com/passport?token=YtR4Vb6KpLmNsD8", "未开始"),
+            ("—", "无数据", "等待", "未开始", "未开始", "未开始", "—", "等待真实账号数据"),
         ]
         self.account_table.setColumnCount(8)
         self.account_table.setRowCount(len(rows))
         for row_index, row in enumerate(rows):
             for col_index, value in enumerate(row):
                 item = QTableWidgetItem(value)
-                if col_index in (0, 2, 3, 5, 7):
+                if col_index in (0, 2, 3, 4, 5, 6):
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                if col_index == 7:
+                if col_index in (2, 3, 4, 5):
                     status_text = value
                     color = {
                         "成功": "#52c41a",
@@ -344,17 +384,19 @@ class PySideLauncherWindow(QMainWindow):
                         "未开始": "#8c8c8c",
                         "失败": "#ff4d4f",
                         "已登录跳过": "#fa8c16",
+                        "等待": "#8c8c8c",
                     }.get(status_text, "#8c8c8c")
                     item.setText(f"●  {status_text}")
                     item.setForeground(QBrush(QColor(color)))
+                    item.setBackground(QBrush(QColor("#f8fafc")))
                 self.account_table.setItem(row_index, col_index, item)
-        self.account_table.setColumnWidth(0, 46)
-        self.account_table.setColumnWidth(1, 90)
-        self.account_table.setColumnWidth(2, 90)
-        self.account_table.setColumnWidth(3, 70)
-        self.account_table.setColumnWidth(4, 110)
-        self.account_table.setColumnWidth(5, 120)
-        self.account_table.setColumnWidth(7, 130)
+        self.account_table.setColumnWidth(0, 58)
+        self.account_table.setColumnWidth(1, 100)
+        self.account_table.setColumnWidth(2, 88)
+        self.account_table.setColumnWidth(3, 86)
+        self.account_table.setColumnWidth(4, 98)
+        self.account_table.setColumnWidth(5, 86)
+        self.account_table.setColumnWidth(6, 62)
         self.account_table.horizontalHeader().setStretchLastSection(False)
         self.account_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
         self.account_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
@@ -362,8 +404,8 @@ class PySideLauncherWindow(QMainWindow):
         self.account_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
         self.account_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
         self.account_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
-        self.account_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
-        self.account_table.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeMode.Fixed)
+        self.account_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
+        self.account_table.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
 
     def _card(self, title: str, layout_class: type[QGridLayout] | type[QVBoxLayout]) -> tuple[QFrame, QGridLayout | QVBoxLayout]:
         card = QFrame()
@@ -403,6 +445,15 @@ class PySideLauncherWindow(QMainWindow):
         layout.addWidget(widget)
         return field
 
+    def _detail_row(self, label: str, value: str) -> QWidget:
+        row, layout = self._row(6)
+        name = self._label(label, 64)
+        value_label = QLabel(value)
+        value_label.setObjectName("DetailValue")
+        layout.addWidget(name)
+        layout.addWidget(value_label, 1)
+        return row
+
     @staticmethod
     def _help_label(text: str) -> QLabel:
         label = QLabel(text)
@@ -421,6 +472,18 @@ class PySideLauncherWindow(QMainWindow):
     def _primary_button(text: str, width: int | None = None) -> QPushButton:
         button = QPushButton(text)
         button.setProperty("role", "primary")
+        button.setMinimumHeight(32)
+        button.setMaximumHeight(32)
+        if width is not None:
+            button.setFixedWidth(width)
+        else:
+            button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        return button
+
+    @staticmethod
+    def _primary_soft_button(text: str, width: int | None = None) -> QPushButton:
+        button = QPushButton(text)
+        button.setProperty("role", "primarySoft")
         button.setMinimumHeight(32)
         button.setMaximumHeight(32)
         if width is not None:
