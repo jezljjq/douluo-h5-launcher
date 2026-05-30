@@ -1548,7 +1548,7 @@ Write-Output $count
         if not valid:
             messagebox.showwarning("无有效账号", "CSV中没有有效的账号。")
             return
-        self._log(f"[方式二] 全部串行: 共 {len(valid)} 个账号，严格逐个执行。")
+        self._log(f"[方式二] 全部串行: 共 {len(valid)} 个账号，批量快速登录 + 统一校验。")
         self._start_method2_serial(valid)
 
     def _selected_csv_account(self) -> CSVAccount | None:
@@ -1562,7 +1562,7 @@ Write-Output $count
         return None
 
     def _start_method2_serial(self, accounts: list[CSVAccount]) -> None:
-        """在后台线程串行执行方式二账号列表。"""
+        """在后台线程执行方式二账号列表：快速提交 + 统一校验 + 失败重登。"""
         if self.worker_thread is not None and self.worker_thread.is_alive():
             messagebox.showwarning("任务进行中", "当前有任务正在执行。")
             return
@@ -1573,6 +1573,7 @@ Write-Output $count
         for a in accounts:
             self.csv_status_by_key[a.key] = "未开始"
         self._refresh_csv_table()
+        verify_rounds = self._batch_verify_rounds()
 
         def _run():
             import time as _time
@@ -1583,18 +1584,18 @@ Write-Output $count
                 return
             from .config import AccountConfig as _AC
             import subprocess as _sp
-            success_count = 0
-            fail_count = 0
             total = len(accounts)
             start_time = _time.time()
-            for i, acc in enumerate(accounts, start=1):
-                if self.stop_event.is_set():
-                    self._queue_log("[方式二] 已停止")
-                    break
-                self._queue_log(f"[{i}/{total}] {acc.display_name}")
-                self._queue_status_csv(acc, "OCR中")
+            self._queue_log("[方式二] 批量快速登录模式：先提交全部CSV账号，再统一校验，失败账号才重登。")
+            self._queue_log(f"[方式二] 重新次数：{verify_rounds}。只要全部成功就提前结束。")
+            self._queue_log(f"[方式二] 第一轮登录账号数量：{total}")
 
-                runner = AccountRunner(
+            pending = list(accounts)
+            success_by_key: dict[str, CSVAccount] = {}
+            final_failed: list[CSVAccount] = []
+
+            def make_runner(acc: CSVAccount) -> AccountRunner:
+                return AccountRunner(
                     account=_AC(level="方式二", bookmark_no=0, game_window_no=acc.game_window_no, url=acc.url),
                     settings=settings,
                     stop_event=self.stop_event,
@@ -1602,29 +1603,117 @@ Write-Output $count
                     update_status=lambda a, s, _acc=acc: self._queue_status_csv(_acc, s),
                     passport_found=lambda a, p, _acc=acc: self._queue_passport_csv(_acc, p),
                 )
-                result = runner.run_method2(acc)
+
+            for round_index in range(1, verify_rounds + 1):
                 if self.stop_event.is_set():
-                    self._queue_status_csv(acc, "已停止")
-                    self._queue_log("[方式二] 任务已停止，不会继续执行后续账号。")
-                    _sp.run(["taskkill", "/f", "/im", "chromium.exe"], capture_output=True, creationflags=_sp.CREATE_NO_WINDOW)
                     break
-                elif result:
-                    success_count += 1
-                    self._queue_status_csv(acc, "成功")
-                    self._queue_timing_csv(acc, runner.last_timings.get("总计", 0))
+                if round_index == 1:
+                    self._queue_log(f"[方式二] 第 {round_index} 轮：批量快速提交 {len(pending)} 个账号。")
                 else:
-                    fail_count += 1
-                    self._queue_status_csv(acc, "失败")
-                _sp.run(["taskkill", "/f", "/im", "chromium.exe"], capture_output=True, creationflags=_sp.CREATE_NO_WINDOW)
+                    self._queue_log(f"[方式二] 第 {round_index} 轮：只重登失败账号 {len(pending)} 个。")
+
+                submit_failed: list[CSVAccount] = []
+                submitted: list[CSVAccount] = []
+                already_logged_in: list[CSVAccount] = []
+
+                for i, acc in enumerate(pending, start=1):
+                    if self.stop_event.is_set():
+                        break
+                    status = "登录中" if round_index == 1 else "重登中"
+                    self._queue_status_csv(acc, status)
+                    self._queue_log(f"[方式二 第{round_index}轮 {i}/{len(pending)}] {status}: {acc.display_name}")
+
+                    runner = make_runner(acc)
+                    result = runner.run_method2(acc, verify_after_submit=False)
+                    if runner.last_timings.get("总计"):
+                        self._queue_timing_csv(acc, runner.last_timings["总计"])
+                    if self.stop_event.is_set():
+                        self._queue_status_csv(acc, "已停止")
+                        self._queue_log("[方式二] 任务已停止，不会继续执行后续账号。")
+                        _sp.run(["taskkill", "/f", "/im", "chromium.exe"], capture_output=True, creationflags=_sp.CREATE_NO_WINDOW)
+                        break
+
+                    submit_result = str(runner.last_fast_submit_result or "")
+                    if submit_result == "already_logged_in":
+                        already_logged_in.append(acc)
+                        success_by_key[acc.key] = acc
+                        self._queue_status_csv(acc, "已登录")
+                        self._queue_log(f"[窗口{acc.game_window_no}] 已登录，跳过提交，直接计入成功。")
+                    elif result and submit_result == "submitted":
+                        submitted.append(acc)
+                        self._queue_status_csv(acc, "待复核")
+                        self._queue_log(f"[窗口{acc.game_window_no}] 方式二提交完成，等待统一校验。")
+                    elif result:
+                        submitted.append(acc)
+                        self._queue_status_csv(acc, "待复核")
+                        self._queue_log(
+                            f"[窗口{acc.game_window_no}] 方式二提交结果缺少分类，按 submitted 加入待复核。"
+                        )
+                    else:
+                        submit_failed.append(acc)
+                        self._queue_status_csv(acc, "失败")
+                        self._queue_log(f"[窗口{acc.game_window_no}] 方式二提交失败，加入重登列表。")
+                    _sp.run(["taskkill", "/f", "/im", "chromium.exe"], capture_output=True, creationflags=_sp.CREATE_NO_WINDOW)
+
+                if self.stop_event.is_set():
+                    break
+
+                failed_this_round = list(submit_failed)
+                self._queue_log(
+                    f"[方式二] 开始统一校验：submitted={len(submitted)}, "
+                    f"already_logged_in={len(already_logged_in)}, failed={len(submit_failed)}"
+                )
+
+                verify_success_count = 0
+                for i, acc in enumerate(submitted, start=1):
+                    if self.stop_event.is_set():
+                        break
+                    self._queue_status_csv(acc, "校验中")
+                    self._queue_log(f"[方式二 第{round_index}次校验 {i}/{len(submitted)}] 窗口{acc.game_window_no} {acc.display_name}")
+                    runner = make_runner(acc)
+                    state = runner.verify_login_result()
+                    if state == "logged_in":
+                        success_by_key[acc.key] = acc
+                        verify_success_count += 1
+                        self._queue_status_csv(acc, "成功")
+                        self._queue_log(f"[窗口{acc.game_window_no}] 统一校验成功。")
+                    else:
+                        failed_this_round.append(acc)
+                        self._queue_status_csv(acc, "失败")
+                        self._queue_log(f"[窗口{acc.game_window_no}] 统一校验失败：{state}，需要重登。")
+
+                if self.stop_event.is_set():
+                    break
+
+                self._queue_log(
+                    f"[方式二] 第 {round_index} 轮统一校验完成："
+                    f"成功{verify_success_count}，失败{len(failed_this_round)}，"
+                    f"已登录跳过{len(already_logged_in)}。"
+                )
+                if failed_this_round:
+                    self._queue_log("[方式二] 失败账号列表：" + "、".join(a.display_name for a in failed_this_round))
+                if len(success_by_key) >= total:
+                    final_failed = []
+                    self._queue_log("[方式二] 全部成功，提前结束，不再执行后续校验。")
+                    break
+                if round_index >= verify_rounds:
+                    final_failed = failed_this_round
+                    for acc in final_failed:
+                        self._queue_status_csv(acc, "最终失败")
+                    self._queue_log("[方式二] 达到重新次数仍失败，最终失败账号列表：" + "、".join(a.display_name for a in final_failed))
+                    break
+                pending = failed_this_round
+                self._queue_log(f"[方式二] 开始下一轮失败重登：{len(pending)} 个账号。")
+
             elapsed = _time.time() - start_time
             if self.stop_event.is_set():
                 self.ui_queue.put(("status_bar", "已停止"))
-                self._queue_log(f"[方式二] 任务已停止：总{total} 成功{success_count} 失败{fail_count} 耗时{elapsed:.0f}秒")
-                self._write_file_log(f"任务已停止：总{total} 成功{success_count} 失败{fail_count} 耗时{elapsed:.0f}秒")
+                self._queue_log(f"[方式二] 任务已停止：总{total} 成功{len(success_by_key)} 失败{len(final_failed)} 耗时{elapsed:.0f}秒")
+                self._write_file_log(f"任务已停止：总{total} 成功{len(success_by_key)} 失败{len(final_failed)} 耗时{elapsed:.0f}秒")
             else:
-                self.ui_queue.put(("status_bar", f"任务完成：成功{success_count}，失败{fail_count}"))
-                self._queue_log(f"[方式二] 任务完成：总{total} 成功{success_count} 失败{fail_count} 耗时{elapsed:.0f}秒")
-                self._write_file_log(f"任务完成：总{total} 成功{success_count} 失败{fail_count} 耗时{elapsed:.0f}秒")
+                self.ui_queue.put(("status_bar", f"任务完成：成功{len(success_by_key)}，失败{len(final_failed)}"))
+                self._queue_log(f"[方式二] 任务完成：总{total} 成功{len(success_by_key)} 失败{len(final_failed)} 耗时{elapsed:.0f}秒")
+                self._write_file_log(f"任务完成：总{total} 成功{len(success_by_key)} 失败{len(final_failed)} 耗时{elapsed:.0f}秒")
             self.worker_thread = None
             if self._log_file:
                 self._log_file.close()
@@ -1645,8 +1734,12 @@ Write-Output $count
             tag = ""
             if "成功" in status:
                 tag = "success"
+            elif "已登录" in status or "跳过" in status:
+                tag = "skip"
             elif "失败" in status:
                 tag = "failed"
+            elif "重登" in status or "重试" in status:
+                tag = "retry"
             elif status not in ("未开始",):
                 tag = "running"
             self.csv_tree.item(account.key, values=values, tags=(tag,))

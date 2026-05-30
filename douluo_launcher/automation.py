@@ -722,18 +722,20 @@ class AccountRunner:
 
     # ===== 方式二：账号密码 + 通行证上号 =====
 
-    def run_method2(self, csv_account) -> bool:
+    def run_method2(self, csv_account, verify_after_submit: bool = True) -> bool:
         """方式二入口：账号密码登录 + 通行证上号。"""
         from .config import AccountConfig
         import time as _time
         _timings: dict[str, float] = {}
         _saved_account = self.account
+        self.last_fast_submit_result = "failed"
         self.account = AccountConfig(
             level="方式二", bookmark_no=0,
             game_window_no=csv_account.game_window_no, url=csv_account.url
         )
 
-        for retry in range(2):
+        max_attempts = 2 if verify_after_submit else 1
+        for retry in range(max_attempts):
             _t_start = _time.perf_counter()
             _timings.clear()
             playwright = None
@@ -747,6 +749,7 @@ class AccountRunner:
                 passport, source = self._extract_passport_from_login_window()
                 if not passport:
                     if source == "logged_in":
+                        self.last_fast_submit_result = "already_logged_in"
                         self.update_status(self.account, "已登录，跳过")
                         self.log("[方式二] 检测到已登录界面，跳过")
                         _timings["总计"] = _time.perf_counter() - _t_start
@@ -759,6 +762,7 @@ class AccountRunner:
                         passport = passport2
                         source = source2
                     elif source2 == "logged_in":
+                        self.last_fast_submit_result = "already_logged_in"
                         self.update_status(self.account, "已登录，跳过")
                         _timings["总计"] = _time.perf_counter() - _t_start
                         self._log_timings(_timings)
@@ -867,6 +871,19 @@ class AccountRunner:
                 self.log("[方式二] 输入+确认完成（Dm 合并调用）")
                 _timings["点击按钮"] = _time.perf_counter() - _t_btn
 
+                if not verify_after_submit:
+                    time.sleep(0.3)
+                    self.last_fast_submit_result = "submitted"
+                    self.update_status(self.account, "待复核")
+                    _timings["校验"] = 0
+                    _timings["总计"] = _time.perf_counter() - _t_start
+                    self._log_timings(_timings)
+                    self.log(
+                        f"[窗口{csv_account.game_window_no}] 方式二提交完成，等待统一校验"
+                    )
+                    self._clean_tmp()
+                    return True
+
                 # === 步骤7：校验 ===
                 _t_verify = _time.perf_counter()
                 self.log("[方式二] 校验登录程序窗口：检测QR页面是否消失")
@@ -904,7 +921,7 @@ class AccountRunner:
                 self.update_status(self.account, "失败")
                 self.log(f"[方式二] 失败: {exc}")
                 self._save_error_snapshots()
-                if retry == 0:
+                if retry + 1 < max_attempts:
                     self.log("[方式二] 异常，重试整流程")
                     continue
                 self.last_timings = {}
