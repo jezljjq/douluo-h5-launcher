@@ -47,7 +47,7 @@
 | CSV 导入 | ✅ 稳定 | encoding 自动检测 + 路径记忆 | — |
 | 耗时统计 | ✅ 已实现 | 分阶段计时 + 日志+表格双显示 | — |
 | 截图/日志清理 | ✅ 已实现 | _error/ 保留10张，logs/ 保留2份 | — |
-| 窗口管理区 | ✅ 已接入 | 批量启动、识别、排列、关闭、重命名、参数记忆 | [docs/WINDOW_MANAGER_AND_PASSPORT_MILESTONE.md](docs/WINDOW_MANAGER_AND_PASSPORT_MILESTONE.md) |
+| 窗口管理区 | ✅ 已接入 | 批量启动、识别、按槽位恢复排列、关闭、重命名、单窗口补位、参数记忆 | [docs/WINDOW_MANAGER_AND_PASSPORT_MILESTONE.md](docs/WINDOW_MANAGER_AND_PASSPORT_MILESTONE.md) |
 | 停止任务/关闭清理 | ✅ 已验证 | 停止时终止账号子进程、清理 dm_click_helper.py 和 Chromium | [CLICK_SOLUTION.md](CLICK_SOLUTION.md) |
 | 通行证弹窗坐标缓存 | ✅ 已验证 | `debug_ocr/passport_dialog_pos_cache.json` 按 viewport 缓存 button/input/confirm，跨账号/子进程复用 | [CLICK_SOLUTION.md](CLICK_SOLUTION.md) |
 | 批量快速登录 + 统一校验 | ✅ 已验证 | 当前层/全部串行先快速提交，统一校验后只重登失败账号；9 个单层账号最终 9/9 成功 | [docs/LAUNCHER_FINAL_MILESTONE.md](docs/LAUNCHER_FINAL_MILESTONE.md) |
@@ -77,9 +77,50 @@
 - 批量启动窗口
 - 识别窗口
 - 排列窗口
+- 重新生成槽位
+- 任意窗口槽位修复 / 单窗口补位
 - 关闭窗口
 
 窗口管理参数记忆保存到上号器项目内部独立配置文件 `window_manager_settings.json`。该能力已代码实现，但暂未现场验证，不能写作“实机验证通过”。
+
+### 2.1.1 窗口槽位机制
+
+窗口号现在应理解为固定槽位 `slot`，而不是“当前枚举窗口列表里的第几个”。例如 `slot 11` 表示 11 号窗口的位置、大小、标题、账号映射和当前运行状态。
+
+槽位稳定字段包括：
+
+- `slot_no`
+- `title`
+- `x` / `y`
+- `width` / `height`
+- `account_layer`
+- `account_index`
+- `account_name`
+- `status`
+
+`hwnd` 只是当前运行期间的临时窗口句柄。窗口关闭、卡死后重新打开，`hwnd` 会变化；稳定依据是 `slot_no`、位置、尺寸、账号映射和标题模板。
+
+槽位映射保存到本地运行状态文件 `window_slots.json`。该文件用于单窗口补位和按槽位恢复布局，不提交 Git，也不应进入发布包。
+
+单窗口补位流程：
+
+1. 读取 `window_slots.json`。
+2. 找到目标 `slot_no`。
+3. 只启动 1 个新游戏窗口。
+4. 将新窗口移动到该 slot 保存的位置和大小。
+5. 将新窗口标题修正为该 slot 标题。
+6. 更新该 slot 的新 `hwnd`。
+7. 其它窗口不移动、不重排、不改名。
+
+普通“排列窗口”现在默认优先按 `window_slots.json` 恢复布局。如果存在有效槽位映射：
+
+- 不按 `hwnd` 排序。
+- 不按枚举顺序排序。
+- 不重新编号全部窗口。
+- 不覆盖 `window_slots.json`。
+- 只按 slot 恢复窗口位置和标题。
+
+只有点击高风险操作“重新生成槽位”并二次确认后，才允许全局排序、全局排列、全局重命名并覆盖 `window_slots.json`。
 
 ---
 

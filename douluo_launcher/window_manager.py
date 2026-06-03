@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import json
 import math
 import re
 import time
@@ -183,6 +184,35 @@ class LaunchResult:
     error: str = ""
 
 
+@dataclass(frozen=True)
+class WindowSlot:
+    slot_no: int
+    x: int
+    y: int
+    width: int
+    height: int
+    title: str = ""
+    hwnd: Optional[int] = None
+    account_layer: str = ""
+    account_index: Optional[int] = None
+    status: str = ""
+
+
+@dataclass(frozen=True)
+class SlotRestoreResult:
+    slot: WindowSlot
+    window: Optional[GameWindow]
+    success: bool
+    x: int
+    y: int
+    width: int
+    height: int
+    new_title: str = ""
+    moved: bool = False
+    renamed: bool = False
+    error: str = ""
+
+
 def _get_window_title(hwnd: int) -> str:
     length = user32.GetWindowTextLengthW(hwnd)
     if length <= 0:
@@ -267,6 +297,241 @@ def sort_game_windows(windows: List[GameWindow]) -> List[GameWindow]:
             item.hwnd,
         ),
     )
+
+
+def _slot_title(title_template: Optional[str], slot: WindowSlot) -> str:
+    if title_template and title_template.strip():
+        try:
+            return title_template.format(
+                index=slot.slot_no,
+                number=slot.slot_no,
+                slot_no=slot.slot_no,
+                old_title=slot.title,
+                hwnd=slot.hwnd or "",
+            )
+        except Exception:
+            pass
+    return slot.title or f"{GAME_TITLE_KEYWORD}-{slot.slot_no}号"
+
+
+def _slot_from_mapping(slot_no: int, data: object) -> WindowSlot:
+    if not isinstance(data, dict):
+        raise ValueError(f"slot {slot_no} 内容不是对象")
+
+    required = ("x", "y", "width", "height")
+    missing = [field for field in required if field not in data]
+    if missing:
+        raise ValueError(f"slot {slot_no} 缺少字段：{', '.join(missing)}")
+
+    return WindowSlot(
+        slot_no=int(data.get("slot_no") or slot_no),
+        x=int(data["x"]),
+        y=int(data["y"]),
+        width=int(data["width"]),
+        height=int(data["height"]),
+        title=str(data.get("title") or ""),
+        hwnd=int(data["hwnd"]) if data.get("hwnd") not in (None, "") else None,
+        account_layer=str(data.get("account_layer") or ""),
+        account_index=int(data["account_index"]) if data.get("account_index") not in (None, "") else None,
+        status=str(data.get("status") or ""),
+    )
+
+
+def load_window_slots(slots_path: str | Path = "window_slots.json") -> List[WindowSlot]:
+    path = Path(slots_path)
+    if not path.exists():
+        return []
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("window_slots.json 根节点必须是对象")
+
+    slots: List[WindowSlot] = []
+    for raw_key, value in data.items():
+        try:
+            slot_no = int(raw_key)
+        except (TypeError, ValueError):
+            continue
+        slots.append(_slot_from_mapping(slot_no, value))
+    return sorted(slots, key=lambda item: item.slot_no)
+
+
+def has_valid_window_slots(slots_path: str | Path = "window_slots.json") -> bool:
+    try:
+        return bool(load_window_slots(slots_path))
+    except Exception:
+        return False
+
+
+def _window_matches_slot(
+    slot: WindowSlot,
+    windows_by_hwnd: dict[int, GameWindow],
+    windows_by_title: dict[str, List[GameWindow]],
+    windows_by_number: dict[int, List[GameWindow]],
+    used_hwnds: set[int],
+) -> Optional[GameWindow]:
+    if slot.hwnd is not None:
+        window = windows_by_hwnd.get(int(slot.hwnd))
+        if window is not None and window.hwnd not in used_hwnds:
+            return window
+
+    if slot.title:
+        for window in windows_by_title.get(slot.title, []):
+            if window.hwnd not in used_hwnds:
+                return window
+
+    for window in windows_by_number.get(slot.slot_no, []):
+        if window.hwnd not in used_hwnds:
+            return window
+
+    return None
+
+
+def restore_windows_by_slots(
+    slots_path: str | Path = "window_slots.json",
+    title_template: Optional[str] = None,
+    exclude_hwnds: Optional[Iterable[int]] = None,
+    move_windows: bool = True,
+    rename_windows: bool = True,
+    retries: int = 3,
+    retry_delay: float = 0.5,
+) -> List[SlotRestoreResult]:
+    slots = load_window_slots(slots_path)
+    if not slots:
+        raise ValueError("未找到有效 window_slots.json 槽位映射")
+
+    windows = list_game_windows(exclude_hwnds=exclude_hwnds)
+    windows_by_hwnd = {window.hwnd: window for window in windows}
+    windows_by_title: dict[str, List[GameWindow]] = {}
+    windows_by_number: dict[int, List[GameWindow]] = {}
+    for window in windows:
+        windows_by_title.setdefault(window.title, []).append(window)
+        if window.number is not None:
+            windows_by_number.setdefault(window.number, []).append(window)
+
+    results: List[SlotRestoreResult] = []
+    used_hwnds: set[int] = set()
+    for slot in slots:
+        window = _window_matches_slot(
+            slot=slot,
+            windows_by_hwnd=windows_by_hwnd,
+            windows_by_title=windows_by_title,
+            windows_by_number=windows_by_number,
+            used_hwnds=used_hwnds,
+        )
+        if window is None:
+            results.append(
+                SlotRestoreResult(
+                    slot=slot,
+                    window=None,
+                    success=False,
+                    x=slot.x,
+                    y=slot.y,
+                    width=slot.width,
+                    height=slot.height,
+                    new_title=_slot_title(title_template, slot),
+                    error=f"未找到 slot {slot.slot_no} 对应窗口",
+                )
+            )
+            continue
+
+        used_hwnds.add(window.hwnd)
+        move_ok = True
+        rename_ok = True
+        errors: List[str] = []
+        if move_windows:
+            move_ok = False
+            error_code = 0
+            for attempt in range(retries + 1):
+                move_ok = bool(
+                    user32.SetWindowPos(
+                        wintypes.HWND(window.hwnd),
+                        None,
+                        slot.x,
+                        slot.y,
+                        slot.width,
+                        slot.height,
+                        SWP_NOZORDER | SWP_NOACTIVATE,
+                    )
+                )
+                if move_ok:
+                    break
+                error_code = ctypes.get_last_error()
+                if attempt < retries:
+                    time.sleep(retry_delay)
+            if not move_ok:
+                errors.append(f"SetWindowPos 失败，错误码 {error_code}")
+
+        new_title = _slot_title(title_template, slot)
+        if rename_windows and new_title:
+            rename_ok = bool(user32.SetWindowTextW(wintypes.HWND(window.hwnd), new_title))
+            if not rename_ok:
+                error_code = ctypes.get_last_error()
+                errors.append(f"SetWindowTextW 失败，错误码 {error_code}")
+
+        results.append(
+            SlotRestoreResult(
+                slot=slot,
+                window=window,
+                success=move_ok and rename_ok,
+                x=slot.x,
+                y=slot.y,
+                width=slot.width,
+                height=slot.height,
+                new_title=new_title,
+                moved=move_windows and move_ok,
+                renamed=rename_windows and rename_ok,
+                error="；".join(errors),
+            )
+        )
+
+    return results
+
+
+def save_current_windows_as_slots(
+    slots_path: str | Path = "window_slots.json",
+    exclude_hwnds: Optional[Iterable[int]] = None,
+) -> List[WindowSlot]:
+    windows = list_game_windows(exclude_hwnds=exclude_hwnds)
+    previous: dict[int, WindowSlot] = {}
+    try:
+        previous = {slot.slot_no: slot for slot in load_window_slots(slots_path)}
+    except Exception:
+        previous = {}
+
+    slots: List[WindowSlot] = []
+    payload: dict[str, dict[str, object]] = {}
+    for index, window in enumerate(windows, start=1):
+        slot_no = window.number if window.number is not None else index
+        previous_slot = previous.get(slot_no)
+        slot = WindowSlot(
+            slot_no=slot_no,
+            title=window.title,
+            hwnd=window.hwnd,
+            x=window.rect.left,
+            y=window.rect.top,
+            width=window.rect.width,
+            height=window.rect.height,
+            account_layer=previous_slot.account_layer if previous_slot else "",
+            account_index=previous_slot.account_index if previous_slot else None,
+            status="正常",
+        )
+        slots.append(slot)
+        payload[str(slot_no)] = {
+            "slot_no": slot.slot_no,
+            "title": slot.title,
+            "hwnd": slot.hwnd,
+            "x": slot.x,
+            "y": slot.y,
+            "width": slot.width,
+            "height": slot.height,
+            "account_layer": slot.account_layer,
+            "account_index": slot.account_index,
+            "status": slot.status,
+        }
+
+    Path(slots_path).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return sorted(slots, key=lambda item: item.slot_no)
 
 
 def calculate_tile_position(index: int, config: TileConfig) -> tuple[int, int]:

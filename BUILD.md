@@ -78,6 +78,21 @@ dist/Launcher/上号器.exe
 
 ---
 
+## 3.1 不进入发布包的本地运行状态
+
+以下文件属于本地运行状态或敏感数据，不应提交 Git，也不应打进发布包：
+
+- `window_slots.json`：窗口槽位映射，记录 `slot_no`、当前 `hwnd`、位置、尺寸、标题和账号映射。
+- `window_manager_settings.json`：窗口管理本地参数。
+- `debug_ocr/passport_dialog_pos_cache.json`：通行证弹窗坐标缓存。
+- `logs/`：运行日志。
+- `debug_ocr/_tmp/`、`debug_ocr/history/`：临时截图和失败现场。
+- 真实账号 CSV，例如 `大号游戏账号.csv`、`密码.csv`、`账号密码表.csv`。
+
+打包前必须确认这些文件没有进入待提交列表；发布包内如需示例账号文件，只使用 `accounts.sample.csv`。
+
+---
+
 ## 4. 运行依赖
 
 ### exe 模式

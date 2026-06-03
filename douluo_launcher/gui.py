@@ -32,9 +32,12 @@ from .window_manager import (
     TileConfig,
     calculate_row_tile_plan,
     close_game_windows,
+    has_valid_window_slots,
     launch_game_process,
     list_game_windows,
     rename_game_windows,
+    restore_windows_by_slots,
+    save_current_windows_as_slots,
     tile_game_windows,
     tile_game_windows_by_row_count,
 )
@@ -277,6 +280,8 @@ class LauncherApp(tk.Tk):
                    command=self._wm_identify_windows).pack(side=tk.LEFT, padx=(0, 10))
         ttk.Button(window_action_row, text="排列窗口", width=18,
                    command=self._wm_tile_windows).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Button(window_action_row, text="重新生成槽位", width=18,
+                   command=self._wm_regenerate_slots).pack(side=tk.LEFT, padx=(0, 10))
         tk.Button(window_action_row, text="关闭窗口", width=18, fg="#cc0000",
                   command=self._wm_close_windows, font=("", 9, "bold")).pack(side=tk.LEFT, padx=(0, 10))
 
@@ -859,6 +864,22 @@ class LauncherApp(tk.Tk):
                         f"禁止超出屏幕宽度={tile_config.prevent_overflow}"
                     )
                 try:
+                    if self._wm_has_saved_slots():
+                        log("检测到 window_slots.json，启动后自动排列改为按已保存槽位恢复布局")
+                        log("本次不会按 hwnd / 枚举顺序重新排序，不会覆盖 window_slots.json")
+                        slot_results = restore_windows_by_slots(
+                            slots_path=self._wm_slots_path(),
+                            title_template=title_template,
+                            exclude_hwnds=excluded_hwnds,
+                            move_windows=True,
+                            rename_windows=True,
+                        )
+                        self._wm_log_slot_restore_results(slot_results, log)
+                        success_count = sum(1 for result in slot_results if result.success)
+                        failed_count = len(slot_results) - success_count
+                        log(f"自动按槽位恢复完成：成功 {success_count}，失败 {failed_count}")
+                        return
+
                     results = self._wm_run_tile(
                         tile_mode=tile_mode,
                         tile_config=tile_config,
@@ -967,6 +988,60 @@ class LauncherApp(tk.Tk):
             )
         return tile_game_windows(tile_config, exclude_hwnds=exclude_hwnds)
 
+    def _wm_slots_path(self) -> Path:
+        return app_root() / "window_slots.json"
+
+    def _wm_has_saved_slots(self) -> bool:
+        return has_valid_window_slots(self._wm_slots_path())
+
+    def _wm_log_slot_restore_results(self, results, log) -> None:
+        for result in results:
+            slot = result.slot
+            if result.window is None:
+                log(f"slot {slot.slot_no} 恢复失败：{result.error}")
+                continue
+            if result.success:
+                log(
+                    f"slot {slot.slot_no} 恢复成功 hwnd={result.window.hwnd} "
+                    f"x={result.x} y={result.y} w={result.width} h={result.height} "
+                    f"标题={result.new_title}"
+                )
+            else:
+                log(
+                    f"slot {slot.slot_no} 恢复失败 hwnd={result.window.hwnd} "
+                    f"x={result.x} y={result.y} w={result.width} h={result.height} "
+                    f"目标标题={result.new_title} 错误={result.error}"
+                )
+
+    def _wm_restore_windows_by_slots(
+        self,
+        move_windows: bool,
+        rename_windows: bool,
+        log,
+    ) -> bool:
+        slots_path = self._wm_slots_path()
+        title_template = self.wm_title_template_var.get().strip() or None
+        log(f"检测到 {slots_path.name}，按已保存槽位恢复布局")
+        log("本次不会按 hwnd / 枚举顺序重新排序，不会覆盖 window_slots.json")
+        try:
+            results = restore_windows_by_slots(
+                slots_path=slots_path,
+                title_template=title_template,
+                exclude_hwnds=self._wm_excluded_hwnds(),
+                move_windows=move_windows,
+                rename_windows=rename_windows,
+            )
+        except Exception as exc:
+            log(f"按槽位恢复失败：{exc}")
+            messagebox.showerror("槽位恢复失败", str(exc))
+            return False
+
+        self._wm_log_slot_restore_results(results, log)
+        success_count = sum(1 for result in results if result.success)
+        failed_count = len(results) - success_count
+        log(f"按槽位恢复完成：成功 {success_count}，失败 {failed_count}")
+        return failed_count == 0
+
     def _wm_log_tile_results(self, results, log) -> None:
         for index, result in enumerate(results, start=1):
             window = result.window
@@ -995,10 +1070,18 @@ class LauncherApp(tk.Tk):
         log,
         exclude_hwnds: list[int],
         title_template: str | None = None,
+        force_global: bool = False,
     ) -> None:
         if title_template is None:
             title_template = self._wm_read_title_template()
         if title_template is None:
+            return
+        if self._wm_has_saved_slots() and not force_global:
+            self._wm_restore_windows_by_slots(
+                move_windows=False,
+                rename_windows=True,
+                log=log,
+            )
             return
         log(f"开始自动编号标题：模板={title_template}")
         try:
@@ -1019,6 +1102,13 @@ class LauncherApp(tk.Tk):
 
     def _wm_rename_windows(self) -> None:
         self._save_window_manager_settings()
+        if self._wm_has_saved_slots():
+            self._wm_restore_windows_by_slots(
+                move_windows=False,
+                rename_windows=True,
+                log=lambda message: self._log(f"[窗口管理] {message}"),
+            )
+            return
         self._wm_rename_windows_after_tile(
             log=lambda message: self._log(f"[窗口管理] {message}"),
             exclude_hwnds=self._wm_excluded_hwnds(),
@@ -1043,6 +1133,14 @@ class LauncherApp(tk.Tk):
 
     def _wm_tile_windows(self) -> None:
         self._save_window_manager_settings()
+        if self._wm_has_saved_slots():
+            self._wm_restore_windows_by_slots(
+                move_windows=True,
+                rename_windows=True,
+                log=lambda message: self._log(f"窗口管理：{message}"),
+            )
+            return
+
         arrangement = self._wm_read_arrangement_config()
         if arrangement is None:
             return
@@ -1082,6 +1180,56 @@ class LauncherApp(tk.Tk):
                 log=lambda message: self._log(f"[窗口管理] {message}"),
                 exclude_hwnds=self._wm_excluded_hwnds(),
             )
+
+    def _wm_regenerate_slots(self) -> None:
+        confirmed = messagebox.askyesno(
+            "重新生成槽位",
+            "此操作会重新排列并重新编号全部窗口，可能覆盖 window_slots.json。\n\n是否继续？",
+            parent=self,
+        )
+        if not confirmed:
+            self._log("窗口管理：已取消重新生成槽位。")
+            return
+
+        self._save_window_manager_settings()
+        arrangement = self._wm_read_arrangement_config()
+        if arrangement is None:
+            return
+        tile_mode, config = arrangement
+        excluded_hwnds = self._wm_excluded_hwnds()
+
+        try:
+            self._log(f"窗口管理：开始全局重新排列，排列方式={tile_mode}")
+            results = self._wm_run_tile(
+                tile_mode=tile_mode,
+                tile_config=config,
+                exclude_hwnds=excluded_hwnds,
+                log=lambda message: self._log(f"窗口管理：{message}"),
+            )
+        except Exception as exc:
+            self._log(f"窗口管理：重新生成槽位失败：{exc}")
+            messagebox.showerror("重新生成槽位失败", str(exc))
+            return
+
+        self._wm_log_tile_results(results, lambda message: self._log(f"窗口管理：{message}"))
+        if self.wm_auto_rename_after_tile_var.get():
+            self._wm_rename_windows_after_tile(
+                log=lambda message: self._log(f"[窗口管理] {message}"),
+                exclude_hwnds=excluded_hwnds,
+                force_global=True,
+            )
+
+        try:
+            slots = save_current_windows_as_slots(
+                slots_path=self._wm_slots_path(),
+                exclude_hwnds=excluded_hwnds,
+            )
+        except Exception as exc:
+            self._log(f"窗口管理：排列完成，但保存 window_slots.json 失败：{exc}")
+            messagebox.showerror("保存槽位失败", str(exc))
+            return
+
+        self._log(f"窗口管理：已重新生成并保存 {len(slots)} 个槽位到 {self._wm_slots_path().name}。")
 
     def _wm_close_windows(self) -> None:
         try:

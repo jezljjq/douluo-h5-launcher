@@ -1,5 +1,7 @@
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 
 if sys.platform != "win32":
     raise unittest.SkipTest("window_manager uses user32 and only runs on Windows")
@@ -9,6 +11,7 @@ from douluo_launcher.window_manager import (  # noqa: E402
     TileConfig,
     calculate_tile_position,
     extract_window_number,
+    load_window_slots,
     sort_game_windows,
 )
 
@@ -72,6 +75,27 @@ class WindowManagerTests(unittest.TestCase):
         self.assertEqual(config.offset_x, 320)
         self.assertEqual(config.offset_y, 525)
         self.assertEqual(config.per_row, 8)
+
+    def test_load_window_slots_uses_numeric_slot_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "window_slots.json"
+            path.write_text(
+                """
+                {
+                  "11": {"slot_no": 11, "title": "斗罗大陆H5-11号", "hwnd": 1100,
+                         "x": 890, "y": 525, "width": 320, "height": 540},
+                  "2": {"slot_no": 2, "title": "斗罗大陆H5-2号", "hwnd": 200,
+                        "x": 570, "y": 0, "width": 320, "height": 540}
+                }
+                """,
+                encoding="utf-8",
+            )
+
+            slots = load_window_slots(path)
+
+        self.assertEqual([slot.slot_no for slot in slots], [2, 11])
+        self.assertEqual(slots[1].title, "斗罗大陆H5-11号")
+        self.assertEqual((slots[1].x, slots[1].y, slots[1].width, slots[1].height), (890, 525, 320, 540))
 
 
 if __name__ == "__main__":

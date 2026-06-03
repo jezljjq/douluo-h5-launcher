@@ -43,11 +43,19 @@
   - `_queue_log()` / `_queue_status()` / `_queue_passport()` — 线程安全 UI 更新
   - `_set_status()` — 状态列 + 颜色标签更新
   - 按钮：单账号运行 / 当前层串行 / 全部串行 / 停止任务
+  - 窗口管理入口：批量启动 / 识别 / 按槽位恢复排列 / 重命名 / 重新生成槽位 / 关闭
 
 - [douluo_launcher/dm_client.py](douluo_launcher/dm_client.py) — 窗口管理和截图
   - `select_login_window_by_game_no()` — 按游戏窗口号定位登录程序窗口
   - `capture_window_background()` — BitBlt 后台截图 + ImageGrab 回退
   - `WindowInfo` — 窗口信息 dataclass
+
+- [douluo_launcher/window_manager.py](douluo_launcher/window_manager.py) — 窗口管理模块
+  - `list_game_windows()` — 枚举当前桌面可见的斗罗大陆H5窗口
+  - `tile_game_windows()` / `tile_game_windows_by_row_count()` — 全局排列能力，仅用于明确重新生成槽位等场景
+  - `load_window_slots()` / `restore_windows_by_slots()` — 读取 `window_slots.json` 并按固定槽位恢复窗口位置和标题
+  - `save_current_windows_as_slots()` — 明确“重新生成槽位”后覆盖保存当前槽位映射
+  - `window_slots.json` 是本地运行状态文件，不提交 Git
 
 - [dm_click_helper.py](dm_click_helper.py) — 32 位 Python Dm 点击/输入脚本
   - `click` 模式：MoveTo + LeftDown + 保持 + LeftUp
