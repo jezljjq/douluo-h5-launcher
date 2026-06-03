@@ -37,7 +37,9 @@ from .window_manager import (
     list_game_windows,
     load_window_slots,
     rename_game_windows,
+    refresh_window_slots_from_current_windows,
     repair_window_slot,
+    resolve_window_slot_for_repair,
     restore_windows_by_slots,
     save_current_windows_as_slots,
     tile_game_windows,
@@ -284,6 +286,8 @@ class LauncherApp(tk.Tk):
                    command=self._wm_identify_windows).pack(side=tk.LEFT, padx=(0, 10))
         ttk.Button(window_action_row, text="排列窗口", width=18,
                    command=self._wm_tile_windows).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Button(window_action_row, text="刷新槽位映射", width=18,
+                   command=self._wm_refresh_window_slots).pack(side=tk.LEFT, padx=(0, 10))
         ttk.Button(window_action_row, text="重新生成槽位", width=18,
                    command=self._wm_regenerate_slots).pack(side=tk.LEFT, padx=(0, 10))
         ttk.Label(window_action_row, text="目标槽位").pack(side=tk.LEFT, padx=(0, 4))
@@ -1003,6 +1007,48 @@ class LauncherApp(tk.Tk):
     def _wm_has_saved_slots(self) -> bool:
         return has_valid_window_slots(self._wm_slots_path())
 
+    def _wm_read_fixed_slot_config(self) -> TileConfig | None:
+        self._wm_store_current_mode_values(self.wm_current_tile_mode_key)
+        fixed = self.wm_fixed_mode_settings
+        try:
+            return TileConfig(
+                width=self._wm_parse_positive_dimension(fixed.window_width, "窗口宽度"),
+                height=self._wm_parse_positive_dimension(fixed.window_height, "窗口高度"),
+                start_x=int(fixed.start_x),
+                start_y=int(fixed.start_y),
+                offset_x=int(fixed.offset_x),
+                offset_y=int(fixed.offset_y),
+                per_row=int(fixed.per_row),
+            )
+        except Exception as exc:
+            self._log(f"[窗口管理] 固定参数不足，无法推导缺失槽位：{exc}")
+            return None
+
+    def _wm_log_refresh_slot_results(self, slots) -> None:
+        self._log(f"[窗口管理] 已扫描当前窗口并刷新槽位映射：{len(slots)} 个")
+        for slot in slots:
+            self._log(
+                f"[窗口管理] slot {slot.slot_no} 已记录："
+                f"hwnd={slot.hwnd} x={slot.x} y={slot.y} "
+                f"w={slot.width} h={slot.height} 标题={slot.title}"
+            )
+
+    def _wm_refresh_window_slots(self) -> None:
+        self._save_window_manager_settings()
+        try:
+            slots = refresh_window_slots_from_current_windows(
+                slots_path=self._wm_slots_path(),
+                exclude_hwnds=self._wm_excluded_hwnds(),
+            )
+        except Exception as exc:
+            self._log(f"[窗口管理] 刷新槽位映射失败：{exc}")
+            messagebox.showerror("刷新槽位映射失败", str(exc))
+            return
+
+        self._wm_log_refresh_slot_results(slots)
+        if not slots:
+            self._log("[窗口管理] 未识别到带编号标题的斗罗大陆H5窗口，未刷新任何槽位。")
+
     def _wm_log_slot_restore_results(self, results, log) -> None:
         for result in results:
             slot = result.slot
@@ -1262,18 +1308,37 @@ class LauncherApp(tk.Tk):
             return
 
         slots_path = self._wm_slots_path()
+        title_template = self.wm_title_template_var.get().strip() or None
+        excluded_hwnds = self._wm_excluded_hwnds()
+        fixed_config = self._wm_read_fixed_slot_config()
         try:
-            slots = load_window_slots(slots_path)
+            slot, slot_source, resolve_error = resolve_window_slot_for_repair(
+                slot_no=slot_no,
+                slots_path=slots_path,
+                title_template=title_template,
+                fixed_config=fixed_config,
+                exclude_hwnds=excluded_hwnds,
+            )
         except Exception as exc:
-            self._log(f"[窗口管理] 读取槽位文件失败：{exc}")
+            self._log(f"[窗口管理] 解析 slot {slot_no} 失败：{exc}")
             messagebox.showerror("修复窗口", str(exc))
             return
-        slot = next((item for item in slots if item.slot_no == slot_no), None)
         if slot is None:
-            message = f"未找到 slot {slot_no} 的历史位置。"
-            self._log(f"[窗口管理] {message}")
-            messagebox.showwarning("修复窗口", message)
+            self._log(f"[窗口管理] {resolve_error}")
+            messagebox.showwarning("修复窗口", resolve_error)
             return
+        if slot_source == "slot_file":
+            self._log(f"[窗口管理] slot {slot_no} 已从 window_slots.json 读取。")
+        elif slot_source == "current_title":
+            self._log(
+                f"[窗口管理] slot {slot_no} 已从当前窗口标题补齐："
+                f"hwnd={slot.hwnd} x={slot.x} y={slot.y} w={slot.width} h={slot.height}"
+            )
+        elif slot_source == "fixed_config":
+            self._log(
+                f"[窗口管理] slot {slot_no} 已根据固定排列参数推导："
+                f"x={slot.x} y={slot.y} w={slot.width} h={slot.height}"
+            )
 
         close_existing = False
         if slot.hwnd is not None and user32.IsWindow(int(slot.hwnd)):
@@ -1286,11 +1351,9 @@ class LauncherApp(tk.Tk):
                 self._log(f"[窗口管理] 已取消修复 slot {slot_no}。")
                 return
 
-        title_template = self.wm_title_template_var.get().strip() or None
-        excluded_hwnds = self._wm_excluded_hwnds()
         threading.Thread(
             target=self._wm_repair_window_slot_worker,
-            args=(slot_no, game_path, close_existing, title_template, excluded_hwnds),
+            args=(slot_no, game_path, close_existing, title_template, excluded_hwnds, fixed_config),
             daemon=True,
         ).start()
 
@@ -1301,6 +1364,7 @@ class LauncherApp(tk.Tk):
         close_existing: bool,
         title_template: str | None,
         excluded_hwnds: list[int],
+        fixed_config: TileConfig | None,
     ) -> None:
         def log(message: str) -> None:
             self._queue_log(f"[窗口管理] {message}")
@@ -1314,12 +1378,19 @@ class LauncherApp(tk.Tk):
                 title_template=title_template,
                 close_existing=close_existing,
                 exclude_hwnds=excluded_hwnds,
+                fixed_config=fixed_config,
             )
         except Exception as exc:
             log(f"slot {slot_no} 修复异常：{exc}")
             return
 
         slot = result.slot
+        source_text = {
+            "slot_file": "window_slots.json",
+            "current_title": "当前窗口标题",
+            "fixed_config": "固定排列参数推导",
+        }.get(result.slot_source, result.slot_source or "未知")
+        log(f"slot {slot_no} 位置来源：{source_text}")
         log(f"读取 slot {slot_no}：x={slot.x} y={slot.y} w={slot.width} h={slot.height}")
         log(f"旧 hwnd={result.old_hwnd if result.old_hwnd else '无'}")
         if result.success:

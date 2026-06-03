@@ -222,6 +222,7 @@ class RepairSlotResult:
     new_title: str = ""
     error: str = ""
     requires_close_confirmation: bool = False
+    slot_source: str = ""
 
 
 def _get_window_title(hwnd: int) -> str:
@@ -365,6 +366,49 @@ def load_window_slots(slots_path: str | Path = "window_slots.json") -> List[Wind
             continue
         slots.append(_slot_from_mapping(slot_no, value))
     return sorted(slots, key=lambda item: item.slot_no)
+
+
+def _slot_payload(slot: WindowSlot) -> dict[str, object]:
+    return {
+        "slot_no": slot.slot_no,
+        "title": slot.title,
+        "hwnd": slot.hwnd,
+        "x": slot.x,
+        "y": slot.y,
+        "width": slot.width,
+        "height": slot.height,
+        "account_layer": slot.account_layer,
+        "account_index": slot.account_index,
+        "status": slot.status,
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+
+
+def _read_slot_payload(slots_path: str | Path) -> dict[str, object]:
+    path = Path(slots_path)
+    if not path.exists():
+        return {}
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("window_slots.json 根节点必须是对象")
+    return data
+
+
+def _write_slot_payload(slots_path: str | Path, data: dict[str, object]) -> None:
+    path = Path(slots_path)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _upsert_window_slot(slots_path: str | Path, slot: WindowSlot) -> None:
+    data = _read_slot_payload(slots_path)
+    previous = data.get(str(slot.slot_no))
+    payload = _slot_payload(slot)
+    if isinstance(previous, dict):
+        for key in ("account_layer", "account_index"):
+            if not payload.get(key) and previous.get(key) not in (None, ""):
+                payload[key] = previous.get(key)
+    data[str(slot.slot_no)] = payload
+    _write_slot_payload(slots_path, data)
 
 
 def has_valid_window_slots(slots_path: str | Path = "window_slots.json") -> bool:
@@ -545,6 +589,123 @@ def save_current_windows_as_slots(
     return sorted(slots, key=lambda item: item.slot_no)
 
 
+def refresh_window_slots_from_current_windows(
+    slots_path: str | Path = "window_slots.json",
+    exclude_hwnds: Optional[Iterable[int]] = None,
+) -> List[WindowSlot]:
+    """Save numbered visible game windows as slots without moving or renaming them."""
+    previous: dict[int, WindowSlot] = {}
+    try:
+        previous = {slot.slot_no: slot for slot in load_window_slots(slots_path)}
+    except Exception:
+        previous = {}
+
+    data = _read_slot_payload(slots_path)
+    refreshed: List[WindowSlot] = []
+    for window in list_game_windows(exclude_hwnds=exclude_hwnds):
+        if window.number is None:
+            continue
+        previous_slot = previous.get(window.number)
+        slot = WindowSlot(
+            slot_no=window.number,
+            title=window.title,
+            hwnd=window.hwnd,
+            x=window.rect.left,
+            y=window.rect.top,
+            width=window.rect.width,
+            height=window.rect.height,
+            account_layer=previous_slot.account_layer if previous_slot else "",
+            account_index=previous_slot.account_index if previous_slot else None,
+            status="正常",
+        )
+        data[str(slot.slot_no)] = _slot_payload(slot)
+        refreshed.append(slot)
+
+    _write_slot_payload(slots_path, data)
+    return sorted(refreshed, key=lambda item: item.slot_no)
+
+
+def calculate_slot_from_tile_config(
+    slot_no: int,
+    config: TileConfig,
+    title_template: Optional[str] = None,
+) -> WindowSlot:
+    if slot_no <= 0:
+        raise ValueError("目标槽位必须大于 0")
+    if config.per_row <= 0:
+        raise ValueError("每行数量必须大于 0")
+    if config.width <= 0 or config.height <= 0:
+        raise ValueError("窗口宽度和高度必须大于 0")
+
+    index0 = slot_no - 1
+    row = index0 // config.per_row
+    col = index0 % config.per_row
+    slot = WindowSlot(
+        slot_no=slot_no,
+        title=f"{GAME_TITLE_KEYWORD}-{slot_no}号",
+        x=config.start_x + col * config.offset_x,
+        y=config.start_y + row * config.offset_y,
+        width=config.width,
+        height=config.height,
+        status="参数推导",
+    )
+    if title_template:
+        return WindowSlot(
+            slot_no=slot.slot_no,
+            title=_slot_title(title_template, slot),
+            x=slot.x,
+            y=slot.y,
+            width=slot.width,
+            height=slot.height,
+            status=slot.status,
+        )
+    return slot
+
+
+def resolve_window_slot_for_repair(
+    slot_no: int,
+    slots_path: str | Path = "window_slots.json",
+    title_template: Optional[str] = None,
+    fixed_config: Optional[TileConfig] = None,
+    exclude_hwnds: Optional[Iterable[int]] = None,
+) -> tuple[Optional[WindowSlot], str, str]:
+    slot_no = int(slot_no)
+    if slot_no <= 0:
+        return None, "", "目标槽位必须大于 0"
+
+    slots = load_window_slots(slots_path)
+    slot_map = {slot.slot_no: slot for slot in slots}
+    if slot_no in slot_map:
+        return slot_map[slot_no], "slot_file", ""
+
+    for window in list_game_windows(exclude_hwnds=exclude_hwnds):
+        if window.number != slot_no:
+            continue
+        slot = WindowSlot(
+            slot_no=slot_no,
+            title=window.title,
+            hwnd=window.hwnd,
+            x=window.rect.left,
+            y=window.rect.top,
+            width=window.rect.width,
+            height=window.rect.height,
+            status="从当前窗口标题补齐",
+        )
+        _upsert_window_slot(slots_path, slot)
+        return slot, "current_title", ""
+
+    if fixed_config is not None:
+        slot = calculate_slot_from_tile_config(slot_no, fixed_config, title_template=title_template)
+        _upsert_window_slot(slots_path, slot)
+        return slot, "fixed_config", ""
+
+    return (
+        None,
+        "",
+        f"未找到 slot {slot_no} 的历史位置，也无法根据当前排列参数推导，请先刷新槽位映射或手动选择补位位置。",
+    )
+
+
 def repair_window_slot(
     slot_no: int,
     game_path: str,
@@ -552,18 +713,23 @@ def repair_window_slot(
     title_template: Optional[str] = None,
     close_existing: bool = False,
     exclude_hwnds: Optional[Iterable[int]] = None,
+    fixed_config: Optional[TileConfig] = None,
     timeout_seconds: float = 60.0,
     poll_interval: float = 0.5,
 ) -> RepairSlotResult:
-    slots = load_window_slots(slots_path)
-    slot_map = {slot.slot_no: slot for slot in slots}
-    slot = slot_map.get(int(slot_no))
+    slot, slot_source, resolve_error = resolve_window_slot_for_repair(
+        slot_no=slot_no,
+        slots_path=slots_path,
+        title_template=title_template,
+        fixed_config=fixed_config,
+        exclude_hwnds=exclude_hwnds,
+    )
     if slot is None:
         placeholder = WindowSlot(slot_no=int(slot_no), x=0, y=0, width=0, height=0)
         return RepairSlotResult(
             slot=placeholder,
             success=False,
-            error=f"未找到 slot {slot_no} 的历史位置",
+            error=resolve_error,
         )
 
     old_hwnd = slot.hwnd
@@ -575,6 +741,7 @@ def repair_window_slot(
                 old_hwnd=old_hwnd,
                 error=f"slot {slot_no} 的旧窗口仍存在 hwnd={old_hwnd}",
                 requires_close_confirmation=True,
+                slot_source=slot_source,
             )
         close_result = wintypes.DWORD()
         user32.SendMessageTimeoutW(
@@ -597,6 +764,7 @@ def repair_window_slot(
             success=False,
             old_hwnd=old_hwnd,
             error=f"启动新窗口失败：{launch_result.error}",
+            slot_source=slot_source,
         )
 
     new_window: Optional[GameWindow] = None
@@ -616,6 +784,7 @@ def repair_window_slot(
             success=False,
             old_hwnd=old_hwnd,
             error="启动后未检测到新增 H5 窗口",
+            slot_source=slot_source,
         )
 
     move_ok = bool(
@@ -637,6 +806,7 @@ def repair_window_slot(
             old_hwnd=old_hwnd,
             new_hwnd=new_window.hwnd,
             error=f"移动新窗口失败，错误码 {error_code}",
+            slot_source=slot_source,
         )
 
     new_title = _slot_title(title_template, slot)
@@ -650,17 +820,22 @@ def repair_window_slot(
             new_hwnd=new_window.hwnd,
             new_title=new_title,
             error=f"重命名新窗口失败，错误码 {error_code}",
+            slot_source=slot_source,
         )
 
-    path = Path(slots_path)
-    data = json.loads(path.read_text(encoding="utf-8"))
-    slot_key = str(slot.slot_no)
-    if isinstance(data.get(slot_key), dict):
-        data[slot_key]["hwnd"] = new_window.hwnd
-        data[slot_key]["title"] = new_title
-        data[slot_key]["status"] = "已补位"
-        data[slot_key]["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    repaired_slot = WindowSlot(
+        slot_no=slot.slot_no,
+        title=new_title,
+        hwnd=new_window.hwnd,
+        x=slot.x,
+        y=slot.y,
+        width=slot.width,
+        height=slot.height,
+        account_layer=slot.account_layer,
+        account_index=slot.account_index,
+        status="已补位",
+    )
+    _upsert_window_slot(slots_path, repaired_slot)
 
     return RepairSlotResult(
         slot=slot,
@@ -668,6 +843,7 @@ def repair_window_slot(
         old_hwnd=old_hwnd,
         new_hwnd=new_window.hwnd,
         new_title=new_title,
+        slot_source=slot_source,
     )
 
 

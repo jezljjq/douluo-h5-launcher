@@ -17,9 +17,11 @@ logs/
 *.log
 
 # 调试截图 - 自动生成
+debug_ocr/*
 debug_ocr/latest_*
 debug_ocr/*.png
 debug_ocr/*.json
+!debug_ocr/template_passport_btn.png
 
 # 调试截图 - 临时和错误现场
 debug_ocr/_tmp/
@@ -44,6 +46,7 @@ credentials*
 *.csv
 密码.csv
 *密码*.csv
+大号游戏账号.csv
 window_manager_settings.json
 window_slots.json
 automation_settings.json

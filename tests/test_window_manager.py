@@ -9,6 +9,7 @@ if sys.platform != "win32":
 from douluo_launcher.window_manager import (  # noqa: E402
     GameWindow,
     TileConfig,
+    calculate_slot_from_tile_config,
     calculate_tile_position,
     extract_window_number,
     load_window_slots,
@@ -75,6 +76,23 @@ class WindowManagerTests(unittest.TestCase):
         self.assertEqual(config.offset_x, 320)
         self.assertEqual(config.offset_y, 525)
         self.assertEqual(config.per_row, 8)
+
+    def test_calculate_slot_from_tile_config_uses_slot_number(self) -> None:
+        config = TileConfig(
+            width=320,
+            height=540,
+            start_x=250,
+            start_y=0,
+            offset_x=320,
+            offset_y=525,
+            per_row=8,
+        )
+
+        slot = calculate_slot_from_tile_config(15, config)
+
+        self.assertEqual(slot.slot_no, 15)
+        self.assertEqual((slot.x, slot.y, slot.width, slot.height), (2170, 525, 320, 540))
+        self.assertEqual(slot.title, "斗罗大陆H5-15号")
 
     def test_load_window_slots_uses_numeric_slot_order(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

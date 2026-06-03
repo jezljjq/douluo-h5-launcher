@@ -82,7 +82,7 @@ dist/Launcher/上号器.exe
 
 以下文件属于本地运行状态或敏感数据，不应提交 Git，也不应打进发布包：
 
-- `window_slots.json`：窗口槽位映射，记录 `slot_no`、当前 `hwnd`、位置、尺寸、标题和账号映射。
+- `window_slots.json`：窗口槽位映射，记录 `slot_no`、当前 `hwnd`、位置、尺寸、标题和账号映射；该文件用于本机单窗口补位和按槽位恢复布局，换机器或换布局后应重新生成。
 - `window_manager_settings.json`：窗口管理本地参数。
 - `debug_ocr/passport_dialog_pos_cache.json`：通行证弹窗坐标缓存。
 - `logs/`：运行日志。
