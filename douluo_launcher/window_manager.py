@@ -213,6 +213,17 @@ class SlotRestoreResult:
     error: str = ""
 
 
+@dataclass(frozen=True)
+class RepairSlotResult:
+    slot: WindowSlot
+    success: bool
+    old_hwnd: Optional[int] = None
+    new_hwnd: Optional[int] = None
+    new_title: str = ""
+    error: str = ""
+    requires_close_confirmation: bool = False
+
+
 def _get_window_title(hwnd: int) -> str:
     length = user32.GetWindowTextLengthW(hwnd)
     if length <= 0:
@@ -532,6 +543,132 @@ def save_current_windows_as_slots(
 
     Path(slots_path).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return sorted(slots, key=lambda item: item.slot_no)
+
+
+def repair_window_slot(
+    slot_no: int,
+    game_path: str,
+    slots_path: str | Path = "window_slots.json",
+    title_template: Optional[str] = None,
+    close_existing: bool = False,
+    exclude_hwnds: Optional[Iterable[int]] = None,
+    timeout_seconds: float = 60.0,
+    poll_interval: float = 0.5,
+) -> RepairSlotResult:
+    slots = load_window_slots(slots_path)
+    slot_map = {slot.slot_no: slot for slot in slots}
+    slot = slot_map.get(int(slot_no))
+    if slot is None:
+        placeholder = WindowSlot(slot_no=int(slot_no), x=0, y=0, width=0, height=0)
+        return RepairSlotResult(
+            slot=placeholder,
+            success=False,
+            error=f"未找到 slot {slot_no} 的历史位置",
+        )
+
+    old_hwnd = slot.hwnd
+    if old_hwnd is not None and user32.IsWindow(wintypes.HWND(old_hwnd)):
+        if not close_existing:
+            return RepairSlotResult(
+                slot=slot,
+                success=False,
+                old_hwnd=old_hwnd,
+                error=f"slot {slot_no} 的旧窗口仍存在 hwnd={old_hwnd}",
+                requires_close_confirmation=True,
+            )
+        close_result = wintypes.DWORD()
+        user32.SendMessageTimeoutW(
+            wintypes.HWND(old_hwnd),
+            WM_CLOSE,
+            0,
+            0,
+            SMTO_ABORTIFHUNG,
+            1500,
+            ctypes.byref(close_result),
+        )
+        time.sleep(0.5)
+
+    excluded = {int(hwnd) for hwnd in exclude_hwnds or []}
+    before_hwnds = {window.hwnd for window in list_game_windows(exclude_hwnds=excluded)}
+    launch_result = launch_game_process(game_path)
+    if not launch_result.success:
+        return RepairSlotResult(
+            slot=slot,
+            success=False,
+            old_hwnd=old_hwnd,
+            error=f"启动新窗口失败：{launch_result.error}",
+        )
+
+    new_window: Optional[GameWindow] = None
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        time.sleep(poll_interval)
+        windows = list_game_windows(exclude_hwnds=excluded)
+        candidates = [window for window in windows if window.hwnd not in before_hwnds]
+        if candidates:
+            candidates.sort(key=lambda item: (item.number is not None, item.title, item.hwnd))
+            new_window = candidates[0]
+            break
+
+    if new_window is None:
+        return RepairSlotResult(
+            slot=slot,
+            success=False,
+            old_hwnd=old_hwnd,
+            error="启动后未检测到新增 H5 窗口",
+        )
+
+    move_ok = bool(
+        user32.SetWindowPos(
+            wintypes.HWND(new_window.hwnd),
+            None,
+            slot.x,
+            slot.y,
+            slot.width,
+            slot.height,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        )
+    )
+    if not move_ok:
+        error_code = ctypes.get_last_error()
+        return RepairSlotResult(
+            slot=slot,
+            success=False,
+            old_hwnd=old_hwnd,
+            new_hwnd=new_window.hwnd,
+            error=f"移动新窗口失败，错误码 {error_code}",
+        )
+
+    new_title = _slot_title(title_template, slot)
+    rename_ok = bool(user32.SetWindowTextW(wintypes.HWND(new_window.hwnd), new_title))
+    if not rename_ok:
+        error_code = ctypes.get_last_error()
+        return RepairSlotResult(
+            slot=slot,
+            success=False,
+            old_hwnd=old_hwnd,
+            new_hwnd=new_window.hwnd,
+            new_title=new_title,
+            error=f"重命名新窗口失败，错误码 {error_code}",
+        )
+
+    path = Path(slots_path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    slot_key = str(slot.slot_no)
+    if isinstance(data.get(slot_key), dict):
+        data[slot_key]["hwnd"] = new_window.hwnd
+        data[slot_key]["title"] = new_title
+        data[slot_key]["status"] = "已补位"
+        data[slot_key]["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    return RepairSlotResult(
+        slot=slot,
+        success=True,
+        old_hwnd=old_hwnd,
+        new_hwnd=new_window.hwnd,
+        new_title=new_title,
+    )
 
 
 def calculate_tile_position(index: int, config: TileConfig) -> tuple[int, int]:

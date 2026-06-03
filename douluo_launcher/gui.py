@@ -35,11 +35,14 @@ from .window_manager import (
     has_valid_window_slots,
     launch_game_process,
     list_game_windows,
+    load_window_slots,
     rename_game_windows,
+    repair_window_slot,
     restore_windows_by_slots,
     save_current_windows_as_slots,
     tile_game_windows,
     tile_game_windows_by_row_count,
+    user32,
 )
 from .window_manager_settings import (
     FixedModeSettings,
@@ -114,6 +117,7 @@ class LauncherApp(tk.Tk):
         self.wm_offset_y_var = tk.IntVar(value=525)
         self.wm_per_row_var = tk.IntVar(value=8)
         self.wm_prevent_overflow_var = tk.BooleanVar(value=True)
+        self.wm_repair_slot_var = tk.IntVar(value=11)
         self.wm_fixed_mode_settings = FixedModeSettings()
         self.wm_row_count_mode_settings = RowCountModeSettings()
         self.wm_current_tile_mode_key = TILE_MODE_FIXED
@@ -282,6 +286,11 @@ class LauncherApp(tk.Tk):
                    command=self._wm_tile_windows).pack(side=tk.LEFT, padx=(0, 10))
         ttk.Button(window_action_row, text="重新生成槽位", width=18,
                    command=self._wm_regenerate_slots).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(window_action_row, text="目标槽位").pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Spinbox(window_action_row, from_=1, to=99, increment=1,
+                    textvariable=self.wm_repair_slot_var, width=5).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(window_action_row, text="修复窗口", width=12,
+                   command=self._wm_repair_window_slot).pack(side=tk.LEFT, padx=(0, 10))
         tk.Button(window_action_row, text="关闭窗口", width=18, fg="#cc0000",
                   command=self._wm_close_windows, font=("", 9, "bold")).pack(side=tk.LEFT, padx=(0, 10))
 
@@ -1230,6 +1239,99 @@ class LauncherApp(tk.Tk):
             return
 
         self._log(f"窗口管理：已重新生成并保存 {len(slots)} 个槽位到 {self._wm_slots_path().name}。")
+
+    def _wm_repair_window_slot(self) -> None:
+        self._save_window_manager_settings()
+        game_path = self.wm_game_path_var.get().strip().strip('"')
+        if not game_path:
+            messagebox.showwarning("修复窗口", "请先填写游戏路径。")
+            self._log("[窗口管理] 修复窗口失败：游戏路径为空。")
+            return
+        if not Path(game_path).exists():
+            messagebox.showwarning("修复窗口", f"游戏路径不存在：{game_path}")
+            self._log(f"[窗口管理] 修复窗口失败：游戏路径不存在：{game_path}")
+            return
+
+        try:
+            slot_no = int(self.wm_repair_slot_var.get())
+        except Exception:
+            messagebox.showwarning("修复窗口", "目标槽位必须是整数。")
+            return
+        if slot_no < 1:
+            messagebox.showwarning("修复窗口", "目标槽位必须大于 0。")
+            return
+
+        slots_path = self._wm_slots_path()
+        try:
+            slots = load_window_slots(slots_path)
+        except Exception as exc:
+            self._log(f"[窗口管理] 读取槽位文件失败：{exc}")
+            messagebox.showerror("修复窗口", str(exc))
+            return
+        slot = next((item for item in slots if item.slot_no == slot_no), None)
+        if slot is None:
+            message = f"未找到 slot {slot_no} 的历史位置。"
+            self._log(f"[窗口管理] {message}")
+            messagebox.showwarning("修复窗口", message)
+            return
+
+        close_existing = False
+        if slot.hwnd is not None and user32.IsWindow(int(slot.hwnd)):
+            close_existing = messagebox.askyesno(
+                "修复窗口",
+                f"slot {slot_no} 的旧窗口仍存在 hwnd={slot.hwnd}。\n\n是否只关闭该旧窗口并启动 1 个新窗口补位？",
+                parent=self,
+            )
+            if not close_existing:
+                self._log(f"[窗口管理] 已取消修复 slot {slot_no}。")
+                return
+
+        title_template = self.wm_title_template_var.get().strip() or None
+        excluded_hwnds = self._wm_excluded_hwnds()
+        threading.Thread(
+            target=self._wm_repair_window_slot_worker,
+            args=(slot_no, game_path, close_existing, title_template, excluded_hwnds),
+            daemon=True,
+        ).start()
+
+    def _wm_repair_window_slot_worker(
+        self,
+        slot_no: int,
+        game_path: str,
+        close_existing: bool,
+        title_template: str | None,
+        excluded_hwnds: list[int],
+    ) -> None:
+        def log(message: str) -> None:
+            self._queue_log(f"[窗口管理] {message}")
+
+        log(f"开始修复 slot {slot_no}")
+        try:
+            result = repair_window_slot(
+                slot_no=slot_no,
+                game_path=game_path,
+                slots_path=self._wm_slots_path(),
+                title_template=title_template,
+                close_existing=close_existing,
+                exclude_hwnds=excluded_hwnds,
+            )
+        except Exception as exc:
+            log(f"slot {slot_no} 修复异常：{exc}")
+            return
+
+        slot = result.slot
+        log(f"读取 slot {slot_no}：x={slot.x} y={slot.y} w={slot.width} h={slot.height}")
+        log(f"旧 hwnd={result.old_hwnd if result.old_hwnd else '无'}")
+        if result.success:
+            log("仅启动 1 个新窗口")
+            log(f"检测到新 hwnd={result.new_hwnd}")
+            log(f"新窗口已移动到 slot {slot_no}")
+            log(f"新窗口已重命名为窗口 {slot_no}：{result.new_title}")
+            log(f"slot {slot_no} 补位完成")
+        elif result.requires_close_confirmation:
+            log(f"slot {slot_no} 旧窗口仍存在，需确认后关闭旧窗口再补位：{result.error}")
+        else:
+            log(f"slot {slot_no} 修复失败：{result.error}")
 
     def _wm_close_windows(self) -> None:
         try:
