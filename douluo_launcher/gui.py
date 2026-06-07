@@ -31,9 +31,11 @@ from .window_manager import (
     RowTileConfig,
     TileConfig,
     calculate_row_tile_plan,
+    check_window_slots_compatibility,
     close_game_windows,
     has_valid_window_slots,
     launch_game_process,
+    layout_params_from_tile_config,
     list_game_windows,
     load_window_slots,
     rename_game_windows,
@@ -767,6 +769,15 @@ class LauncherApp(tk.Tk):
             return
         tile_mode = arrangement[0] if arrangement else WM_TILE_MODE_FIXED
         tile_config = arrangement[1] if arrangement else None
+        layout_params = (
+            self._wm_slot_layout_params(
+                tile_mode,
+                tile_config,
+                self.wm_title_template_var.get().strip(),
+            )
+            if tile_config is not None
+            else None
+        )
         title_template = None
         if auto_tile and auto_rename:
             title_template = self._wm_read_title_template()
@@ -786,6 +797,7 @@ class LauncherApp(tk.Tk):
                 tile_mode,
                 tile_config,
                 title_template,
+                layout_params,
                 excluded_hwnds,
             ),
             daemon=True,
@@ -802,6 +814,7 @@ class LauncherApp(tk.Tk):
         tile_mode: str,
         tile_config: TileConfig | RowTileConfig | None,
         title_template: str | None,
+        layout_params,
         excluded_hwnds: list[int],
     ) -> None:
         def log(message: str) -> None:
@@ -877,9 +890,11 @@ class LauncherApp(tk.Tk):
                         f"禁止超出屏幕宽度={tile_config.prevent_overflow}"
                     )
                 try:
-                    if self._wm_has_saved_slots():
+                    full_restart = before_count == 0
+                    if self._wm_has_saved_slots() and not full_restart:
                         log("检测到 window_slots.json，启动后自动排列改为按已保存槽位恢复布局")
                         log("本次不会按 hwnd / 枚举顺序重新排序，不会覆盖 window_slots.json")
+                        self._wm_log_slot_compatibility(layout_params, log)
                         slot_results = restore_windows_by_slots(
                             slots_path=self._wm_slots_path(),
                             title_template=title_template,
@@ -892,6 +907,12 @@ class LauncherApp(tk.Tk):
                         failed_count = len(slot_results) - success_count
                         log(f"自动按槽位恢复完成：成功 {success_count}，失败 {failed_count}")
                         return
+
+                    if full_restart:
+                        log("启动前没有旧 H5 窗口，本次按当前窗口管理参数重新生成槽位")
+                        log("本次不使用旧 hwnd 槽位快照，不按旧 window_slots.json 恢复")
+                    elif not self._wm_has_saved_slots():
+                        log("未检测到有效 window_slots.json，本次排列后保存新的槽位快照")
 
                     results = self._wm_run_tile(
                         tile_mode=tile_mode,
@@ -908,6 +929,12 @@ class LauncherApp(tk.Tk):
                             title_template=title_template,
                         )
                         log("自动编号标题完成")
+                    slots = save_current_windows_as_slots(
+                        slots_path=self._wm_slots_path(),
+                        exclude_hwnds=excluded_hwnds,
+                        layout_params=layout_params,
+                    )
+                    log(f"已按当前窗口管理参数保存槽位快照：{len(slots)} 个")
                 except Exception as exc:
                     log(f"启动后自动排列失败：{exc}")
         finally:
@@ -1007,6 +1034,49 @@ class LauncherApp(tk.Tk):
     def _wm_has_saved_slots(self) -> bool:
         return has_valid_window_slots(self._wm_slots_path())
 
+    def _wm_slot_layout_params(
+        self,
+        tile_mode: str,
+        tile_config: TileConfig | RowTileConfig,
+        title_template: str | None = None,
+    ):
+        mode = "row_count" if tile_mode == WM_TILE_MODE_ROW_COUNT else "fixed"
+        return layout_params_from_tile_config(
+            tile_config,
+            title_template=title_template if title_template is not None else self.wm_title_template_var.get().strip(),
+            mode=mode,
+        )
+
+    def _wm_current_slot_layout_params(self):
+        arrangement = self._wm_read_arrangement_config()
+        if arrangement is None:
+            return None
+        tile_mode, tile_config = arrangement
+        return self._wm_slot_layout_params(tile_mode, tile_config)
+
+    def _wm_log_slot_compatibility(self, layout_params, log) -> None:
+        try:
+            result = check_window_slots_compatibility(self._wm_slots_path(), layout_params)
+        except Exception as exc:
+            log(f"槽位环境校验失败：{exc}")
+            return
+
+        current = result.current_environment
+        log(
+            "当前槽位环境："
+            f"screen={current.screen_width}x{current.screen_height} "
+            f"dpi={current.dpi} scale={current.scale:g} profile={current.profile}"
+        )
+        if result.slot_environment is not None:
+            saved = result.slot_environment
+            log(
+                "保存槽位环境："
+                f"screen={saved.screen_width}x{saved.screen_height} "
+                f"dpi={saved.dpi} scale={saved.scale:g} profile={saved.profile}"
+            )
+        for warning in result.warnings:
+            log(f"槽位校验提醒：{warning}")
+
     def _wm_read_fixed_slot_config(self) -> TileConfig | None:
         self._wm_store_current_mode_values(self.wm_current_tile_mode_key)
         fixed = self.wm_fixed_mode_settings
@@ -1035,10 +1105,12 @@ class LauncherApp(tk.Tk):
 
     def _wm_refresh_window_slots(self) -> None:
         self._save_window_manager_settings()
+        layout_params = self._wm_current_slot_layout_params()
         try:
             slots = refresh_window_slots_from_current_windows(
                 slots_path=self._wm_slots_path(),
                 exclude_hwnds=self._wm_excluded_hwnds(),
+                layout_params=layout_params,
             )
         except Exception as exc:
             self._log(f"[窗口管理] 刷新槽位映射失败：{exc}")
@@ -1078,6 +1150,7 @@ class LauncherApp(tk.Tk):
         title_template = self.wm_title_template_var.get().strip() or None
         log(f"检测到 {slots_path.name}，按已保存槽位恢复布局")
         log("本次不会按 hwnd / 枚举顺序重新排序，不会覆盖 window_slots.json")
+        self._wm_log_slot_compatibility(self._wm_current_slot_layout_params(), log)
         try:
             results = restore_windows_by_slots(
                 slots_path=slots_path,
@@ -1278,6 +1351,11 @@ class LauncherApp(tk.Tk):
             slots = save_current_windows_as_slots(
                 slots_path=self._wm_slots_path(),
                 exclude_hwnds=excluded_hwnds,
+                layout_params=self._wm_slot_layout_params(
+                    tile_mode,
+                    config,
+                    self.wm_title_template_var.get().strip(),
+                ),
             )
         except Exception as exc:
             self._log(f"窗口管理：排列完成，但保存 window_slots.json 失败：{exc}")
@@ -1311,6 +1389,11 @@ class LauncherApp(tk.Tk):
         title_template = self.wm_title_template_var.get().strip() or None
         excluded_hwnds = self._wm_excluded_hwnds()
         fixed_config = self._wm_read_fixed_slot_config()
+        layout_params = (
+            self._wm_slot_layout_params(WM_TILE_MODE_FIXED, fixed_config, title_template)
+            if fixed_config is not None
+            else None
+        )
         try:
             slot, slot_source, resolve_error = resolve_window_slot_for_repair(
                 slot_no=slot_no,
@@ -1318,6 +1401,7 @@ class LauncherApp(tk.Tk):
                 title_template=title_template,
                 fixed_config=fixed_config,
                 exclude_hwnds=excluded_hwnds,
+                layout_params=layout_params,
             )
         except Exception as exc:
             self._log(f"[窗口管理] 解析 slot {slot_no} 失败：{exc}")
@@ -1353,7 +1437,7 @@ class LauncherApp(tk.Tk):
 
         threading.Thread(
             target=self._wm_repair_window_slot_worker,
-            args=(slot_no, game_path, close_existing, title_template, excluded_hwnds, fixed_config),
+            args=(slot_no, game_path, close_existing, title_template, excluded_hwnds, fixed_config, layout_params),
             daemon=True,
         ).start()
 
@@ -1365,6 +1449,7 @@ class LauncherApp(tk.Tk):
         title_template: str | None,
         excluded_hwnds: list[int],
         fixed_config: TileConfig | None,
+        layout_params,
     ) -> None:
         def log(message: str) -> None:
             self._queue_log(f"[窗口管理] {message}")
@@ -1379,6 +1464,7 @@ class LauncherApp(tk.Tk):
                 close_existing=close_existing,
                 exclude_hwnds=excluded_hwnds,
                 fixed_config=fixed_config,
+                layout_params=layout_params,
             )
         except Exception as exc:
             log(f"slot {slot_no} 修复异常：{exc}")

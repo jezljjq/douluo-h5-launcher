@@ -22,6 +22,8 @@ SM_CXSCREEN = 0
 SM_CYSCREEN = 1
 SPI_GETWORKAREA = 0x0030
 DWMWA_CLOAKED = 14
+DEFAULT_DPI = 96
+SLOT_FILE_VERSION = 1
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
@@ -199,6 +201,38 @@ class WindowSlot:
 
 
 @dataclass(frozen=True)
+class SlotEnvironment:
+    screen_width: int
+    screen_height: int
+    dpi: int
+    scale: float
+    profile: str
+
+
+@dataclass(frozen=True)
+class SlotLayoutParams:
+    mode: str = "fixed"
+    window_width: Optional[int] = None
+    window_height: Optional[int] = None
+    per_row: Optional[int] = None
+    start_x: Optional[int] = None
+    start_y: Optional[int] = None
+    offset_x: Optional[int] = None
+    offset_y: Optional[int] = None
+    title_template: str = ""
+
+
+@dataclass(frozen=True)
+class SlotCompatibilityResult:
+    compatible: bool
+    warnings: List[str]
+    current_environment: SlotEnvironment
+    slot_environment: Optional[SlotEnvironment] = None
+    current_layout_params: Optional[SlotLayoutParams] = None
+    slot_layout_params: Optional[SlotLayoutParams] = None
+
+
+@dataclass(frozen=True)
 class SlotRestoreResult:
     slot: WindowSlot
     window: Optional[GameWindow]
@@ -268,6 +302,127 @@ def get_full_screen_size() -> tuple[int, int]:
     return (
         int(user32.GetSystemMetrics(SM_CXSCREEN)),
         int(user32.GetSystemMetrics(SM_CYSCREEN)),
+    )
+
+
+def get_system_dpi() -> int:
+    try:
+        get_dpi = user32.GetDpiForSystem
+        get_dpi.restype = ctypes.c_uint
+        dpi = int(get_dpi())
+        if dpi > 0:
+            return dpi
+    except Exception:
+        pass
+    return DEFAULT_DPI
+
+
+def make_slot_environment(screen_width: int, screen_height: int, dpi: int) -> SlotEnvironment:
+    safe_dpi = int(dpi) if int(dpi) > 0 else DEFAULT_DPI
+    scale = round(safe_dpi / DEFAULT_DPI, 4)
+    percent = int(round(scale * 100))
+    return SlotEnvironment(
+        screen_width=int(screen_width),
+        screen_height=int(screen_height),
+        dpi=safe_dpi,
+        scale=scale,
+        profile=f"{int(screen_width)}x{int(screen_height)}_{percent}",
+    )
+
+
+def get_current_slot_environment() -> SlotEnvironment:
+    screen_width, screen_height = get_full_screen_size()
+    return make_slot_environment(screen_width, screen_height, get_system_dpi())
+
+
+def layout_params_from_tile_config(
+    config: TileConfig | RowTileConfig,
+    title_template: Optional[str] = None,
+    mode: str = "fixed",
+) -> SlotLayoutParams:
+    return SlotLayoutParams(
+        mode=mode,
+        window_width=config.width if isinstance(config.width, int) else None,
+        window_height=config.height if isinstance(config.height, int) else None,
+        per_row=int(config.per_row),
+        start_x=int(config.start_x),
+        start_y=int(config.start_y),
+        offset_x=int(config.offset_x) if isinstance(config, TileConfig) else None,
+        offset_y=int(config.offset_y) if isinstance(config, TileConfig) else None,
+        title_template=str(title_template or ""),
+    )
+
+
+def _environment_payload(environment: SlotEnvironment) -> dict[str, object]:
+    return {
+        "screen_width": environment.screen_width,
+        "screen_height": environment.screen_height,
+        "dpi": environment.dpi,
+        "scale": environment.scale,
+        "profile": environment.profile,
+    }
+
+
+def _layout_params_payload(layout_params: SlotLayoutParams) -> dict[str, object]:
+    return {
+        "mode": layout_params.mode,
+        "window_width": layout_params.window_width,
+        "window_height": layout_params.window_height,
+        "per_row": layout_params.per_row,
+        "start_x": layout_params.start_x,
+        "start_y": layout_params.start_y,
+        "offset_x": layout_params.offset_x,
+        "offset_y": layout_params.offset_y,
+        "title_template": layout_params.title_template,
+    }
+
+
+def _environment_from_mapping(data: object) -> Optional[SlotEnvironment]:
+    if not isinstance(data, dict):
+        return None
+    try:
+        screen_width = int(data.get("screen_width") or 0)
+        screen_height = int(data.get("screen_height") or 0)
+        dpi = int(data.get("dpi") or DEFAULT_DPI)
+        profile = str(data.get("profile") or "")
+        if screen_width <= 0 or screen_height <= 0:
+            return None
+        environment = make_slot_environment(screen_width, screen_height, dpi)
+        if profile:
+            return SlotEnvironment(
+                screen_width=environment.screen_width,
+                screen_height=environment.screen_height,
+                dpi=environment.dpi,
+                scale=environment.scale,
+                profile=profile,
+            )
+        return environment
+    except Exception:
+        return None
+
+
+def _optional_int(value: object) -> Optional[int]:
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _layout_params_from_mapping(data: object) -> Optional[SlotLayoutParams]:
+    if not isinstance(data, dict):
+        return None
+    return SlotLayoutParams(
+        mode=str(data.get("mode") or "fixed"),
+        window_width=_optional_int(data.get("window_width")),
+        window_height=_optional_int(data.get("window_height")),
+        per_row=_optional_int(data.get("per_row")),
+        start_x=_optional_int(data.get("start_x")),
+        start_y=_optional_int(data.get("start_y")),
+        offset_x=_optional_int(data.get("offset_x")),
+        offset_y=_optional_int(data.get("offset_y")),
+        title_template=str(data.get("title_template") or ""),
     )
 
 
@@ -349,23 +504,93 @@ def _slot_from_mapping(slot_no: int, data: object) -> WindowSlot:
     )
 
 
-def load_window_slots(slots_path: str | Path = "window_slots.json") -> List[WindowSlot]:
+def _read_slot_file(slots_path: str | Path) -> dict[str, object]:
     path = Path(slots_path)
     if not path.exists():
-        return []
+        return {}
 
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise ValueError("window_slots.json 根节点必须是对象")
+    return data
+
+
+def _slot_records(data: dict[str, object]) -> dict[str, object]:
+    slots = data.get("slots")
+    if isinstance(slots, dict):
+        return slots
+    return data
+
+
+def _is_legacy_slot_file(data: dict[str, object]) -> bool:
+    return "slots" not in data
+
+
+def _slot_file_payload(
+    slots: dict[str, object],
+    environment: Optional[SlotEnvironment] = None,
+    layout_params: Optional[SlotLayoutParams] = None,
+) -> dict[str, object]:
+    return {
+        "version": SLOT_FILE_VERSION,
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "environment": _environment_payload(environment or get_current_slot_environment()),
+        "layout_params": _layout_params_payload(layout_params) if layout_params else None,
+        "slots": slots,
+    }
+
+
+def _normalize_slot_file(
+    data: dict[str, object],
+    environment: Optional[SlotEnvironment] = None,
+    layout_params: Optional[SlotLayoutParams] = None,
+) -> dict[str, object]:
+    if _is_legacy_slot_file(data):
+        return _slot_file_payload(
+            slots=dict(_slot_records(data)),
+            environment=environment,
+            layout_params=layout_params,
+        )
+
+    normalized = dict(data)
+    normalized["version"] = int(normalized.get("version") or SLOT_FILE_VERSION)
+    normalized["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    if environment is not None or not isinstance(normalized.get("environment"), dict):
+        normalized["environment"] = _environment_payload(environment or get_current_slot_environment())
+    if layout_params is not None:
+        normalized["layout_params"] = _layout_params_payload(layout_params)
+    elif "layout_params" not in normalized:
+        normalized["layout_params"] = None
+    if not isinstance(normalized.get("slots"), dict):
+        normalized["slots"] = {}
+    return normalized
+
+
+def load_window_slots(slots_path: str | Path = "window_slots.json") -> List[WindowSlot]:
+    data = _read_slot_file(slots_path)
+    if not data:
+        return []
 
     slots: List[WindowSlot] = []
-    for raw_key, value in data.items():
+    for raw_key, value in _slot_records(data).items():
         try:
             slot_no = int(raw_key)
         except (TypeError, ValueError):
             continue
         slots.append(_slot_from_mapping(slot_no, value))
     return sorted(slots, key=lambda item: item.slot_no)
+
+
+def load_window_slot_metadata(
+    slots_path: str | Path = "window_slots.json",
+) -> tuple[Optional[SlotEnvironment], Optional[SlotLayoutParams]]:
+    data = _read_slot_file(slots_path)
+    if not data or _is_legacy_slot_file(data):
+        return None, None
+    return (
+        _environment_from_mapping(data.get("environment")),
+        _layout_params_from_mapping(data.get("layout_params")),
+    )
 
 
 def _slot_payload(slot: WindowSlot) -> dict[str, object]:
@@ -385,13 +610,7 @@ def _slot_payload(slot: WindowSlot) -> dict[str, object]:
 
 
 def _read_slot_payload(slots_path: str | Path) -> dict[str, object]:
-    path = Path(slots_path)
-    if not path.exists():
-        return {}
-    data = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict):
-        raise ValueError("window_slots.json 根节点必须是对象")
-    return data
+    return _read_slot_file(slots_path)
 
 
 def _write_slot_payload(slots_path: str | Path, data: dict[str, object]) -> None:
@@ -399,15 +618,25 @@ def _write_slot_payload(slots_path: str | Path, data: dict[str, object]) -> None
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _upsert_window_slot(slots_path: str | Path, slot: WindowSlot) -> None:
-    data = _read_slot_payload(slots_path)
-    previous = data.get(str(slot.slot_no))
+def _upsert_window_slot(
+    slots_path: str | Path,
+    slot: WindowSlot,
+    environment: Optional[SlotEnvironment] = None,
+    layout_params: Optional[SlotLayoutParams] = None,
+) -> None:
+    data = _normalize_slot_file(
+        _read_slot_payload(slots_path),
+        environment=environment,
+        layout_params=layout_params,
+    )
+    slots = _slot_records(data)
+    previous = slots.get(str(slot.slot_no))
     payload = _slot_payload(slot)
     if isinstance(previous, dict):
         for key in ("account_layer", "account_index"):
             if not payload.get(key) and previous.get(key) not in (None, ""):
                 payload[key] = previous.get(key)
-    data[str(slot.slot_no)] = payload
+    slots[str(slot.slot_no)] = payload
     _write_slot_payload(slots_path, data)
 
 
@@ -416,6 +645,61 @@ def has_valid_window_slots(slots_path: str | Path = "window_slots.json") -> bool
         return bool(load_window_slots(slots_path))
     except Exception:
         return False
+
+
+def check_window_slots_compatibility(
+    slots_path: str | Path = "window_slots.json",
+    current_layout_params: Optional[SlotLayoutParams] = None,
+) -> SlotCompatibilityResult:
+    current_environment = get_current_slot_environment()
+    slot_environment, slot_layout_params = load_window_slot_metadata(slots_path)
+    warnings: List[str] = []
+
+    if slot_environment is None:
+        warnings.append("槽位文件缺少环境信息，无法确认屏幕/DPI/缩放是否一致")
+    else:
+        if slot_environment.screen_width != current_environment.screen_width:
+            warnings.append(
+                f"屏幕宽度变化：槽位={slot_environment.screen_width} 当前={current_environment.screen_width}"
+            )
+        if slot_environment.screen_height != current_environment.screen_height:
+            warnings.append(
+                f"屏幕高度变化：槽位={slot_environment.screen_height} 当前={current_environment.screen_height}"
+            )
+        if slot_environment.dpi != current_environment.dpi:
+            warnings.append(f"DPI变化：槽位={slot_environment.dpi} 当前={current_environment.dpi}")
+        if abs(slot_environment.scale - current_environment.scale) > 0.001:
+            warnings.append(f"缩放比例变化：槽位={slot_environment.scale:g} 当前={current_environment.scale:g}")
+
+    if current_layout_params is not None:
+        if slot_layout_params is None:
+            warnings.append("槽位文件缺少 layout_params，无法确认排列参数是否一致")
+        else:
+            checks = [
+                ("mode", "排列方式"),
+                ("window_width", "窗口宽度"),
+                ("window_height", "窗口高度"),
+                ("per_row", "每行数量"),
+                ("start_x", "起点X"),
+                ("start_y", "起点Y"),
+                ("offset_x", "横向偏移"),
+                ("offset_y", "纵向偏移"),
+                ("title_template", "标题模板"),
+            ]
+            for attr, label in checks:
+                current_value = getattr(current_layout_params, attr)
+                slot_value = getattr(slot_layout_params, attr)
+                if current_value != slot_value:
+                    warnings.append(f"{label}变化：槽位={slot_value} 当前={current_value}")
+
+    return SlotCompatibilityResult(
+        compatible=not warnings,
+        warnings=warnings,
+        current_environment=current_environment,
+        slot_environment=slot_environment,
+        current_layout_params=current_layout_params,
+        slot_layout_params=slot_layout_params,
+    )
 
 
 def _window_matches_slot(
@@ -546,6 +830,8 @@ def restore_windows_by_slots(
 def save_current_windows_as_slots(
     slots_path: str | Path = "window_slots.json",
     exclude_hwnds: Optional[Iterable[int]] = None,
+    environment: Optional[SlotEnvironment] = None,
+    layout_params: Optional[SlotLayoutParams] = None,
 ) -> List[WindowSlot]:
     windows = list_game_windows(exclude_hwnds=exclude_hwnds)
     previous: dict[int, WindowSlot] = {}
@@ -572,26 +858,22 @@ def save_current_windows_as_slots(
             status="正常",
         )
         slots.append(slot)
-        payload[str(slot_no)] = {
-            "slot_no": slot.slot_no,
-            "title": slot.title,
-            "hwnd": slot.hwnd,
-            "x": slot.x,
-            "y": slot.y,
-            "width": slot.width,
-            "height": slot.height,
-            "account_layer": slot.account_layer,
-            "account_index": slot.account_index,
-            "status": slot.status,
-        }
+        payload[str(slot_no)] = _slot_payload(slot)
 
-    Path(slots_path).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    data = _slot_file_payload(
+        payload,
+        environment=environment,
+        layout_params=layout_params,
+    )
+    Path(slots_path).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     return sorted(slots, key=lambda item: item.slot_no)
 
 
 def refresh_window_slots_from_current_windows(
     slots_path: str | Path = "window_slots.json",
     exclude_hwnds: Optional[Iterable[int]] = None,
+    environment: Optional[SlotEnvironment] = None,
+    layout_params: Optional[SlotLayoutParams] = None,
 ) -> List[WindowSlot]:
     """Save numbered visible game windows as slots without moving or renaming them."""
     previous: dict[int, WindowSlot] = {}
@@ -600,7 +882,12 @@ def refresh_window_slots_from_current_windows(
     except Exception:
         previous = {}
 
-    data = _read_slot_payload(slots_path)
+    data = _normalize_slot_file(
+        _read_slot_payload(slots_path),
+        environment=environment,
+        layout_params=layout_params,
+    )
+    slot_records = _slot_records(data)
     refreshed: List[WindowSlot] = []
     for window in list_game_windows(exclude_hwnds=exclude_hwnds):
         if window.number is None:
@@ -618,7 +905,7 @@ def refresh_window_slots_from_current_windows(
             account_index=previous_slot.account_index if previous_slot else None,
             status="正常",
         )
-        data[str(slot.slot_no)] = _slot_payload(slot)
+        slot_records[str(slot.slot_no)] = _slot_payload(slot)
         refreshed.append(slot)
 
     _write_slot_payload(slots_path, data)
@@ -668,6 +955,8 @@ def resolve_window_slot_for_repair(
     title_template: Optional[str] = None,
     fixed_config: Optional[TileConfig] = None,
     exclude_hwnds: Optional[Iterable[int]] = None,
+    environment: Optional[SlotEnvironment] = None,
+    layout_params: Optional[SlotLayoutParams] = None,
 ) -> tuple[Optional[WindowSlot], str, str]:
     slot_no = int(slot_no)
     if slot_no <= 0:
@@ -691,12 +980,22 @@ def resolve_window_slot_for_repair(
             height=window.rect.height,
             status="从当前窗口标题补齐",
         )
-        _upsert_window_slot(slots_path, slot)
+        _upsert_window_slot(
+            slots_path,
+            slot,
+            environment=environment,
+            layout_params=layout_params,
+        )
         return slot, "current_title", ""
 
     if fixed_config is not None:
         slot = calculate_slot_from_tile_config(slot_no, fixed_config, title_template=title_template)
-        _upsert_window_slot(slots_path, slot)
+        _upsert_window_slot(
+            slots_path,
+            slot,
+            environment=environment,
+            layout_params=layout_params,
+        )
         return slot, "fixed_config", ""
 
     return (
@@ -714,6 +1013,8 @@ def repair_window_slot(
     close_existing: bool = False,
     exclude_hwnds: Optional[Iterable[int]] = None,
     fixed_config: Optional[TileConfig] = None,
+    environment: Optional[SlotEnvironment] = None,
+    layout_params: Optional[SlotLayoutParams] = None,
     timeout_seconds: float = 60.0,
     poll_interval: float = 0.5,
 ) -> RepairSlotResult:
@@ -723,6 +1024,8 @@ def repair_window_slot(
         title_template=title_template,
         fixed_config=fixed_config,
         exclude_hwnds=exclude_hwnds,
+        environment=environment,
+        layout_params=layout_params,
     )
     if slot is None:
         placeholder = WindowSlot(slot_no=int(slot_no), x=0, y=0, width=0, height=0)
@@ -835,7 +1138,12 @@ def repair_window_slot(
         account_index=slot.account_index,
         status="已补位",
     )
-    _upsert_window_slot(slots_path, repaired_slot)
+    _upsert_window_slot(
+        slots_path,
+        repaired_slot,
+        environment=environment,
+        layout_params=layout_params,
+    )
 
     return RepairSlotResult(
         slot=slot,

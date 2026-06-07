@@ -54,11 +54,13 @@
   - `list_game_windows()` — 枚举当前桌面可见的斗罗大陆H5窗口
   - `tile_game_windows()` / `tile_game_windows_by_row_count()` — 全局排列能力，仅用于明确重新生成槽位等场景
   - `load_window_slots()` / `restore_windows_by_slots()` — 读取 `window_slots.json` 并按固定槽位恢复窗口位置和标题
+  - `load_window_slot_metadata()` / `check_window_slots_compatibility()` — 读取并校验槽位快照中的环境、DPI、缩放比例和 `layout_params`
   - `refresh_window_slots_from_current_windows()` — 只扫描当前带编号窗口并保存槽位映射，不移动、不重命名、不启动窗口
   - `resolve_window_slot_for_repair()` — 修复窗口前解析目标 slot，支持槽位文件、当前标题补齐和固定参数推导兜底
   - `repair_window_slot()` — 只启动 1 个新窗口补目标 slot，不全局重排
-  - `save_current_windows_as_slots()` — 明确“重新生成槽位”后覆盖保存当前槽位映射
-  - `window_slots.json` 是本地运行状态文件，不提交 Git
+  - `save_current_windows_as_slots()` — 明确“重新生成槽位”或全部窗口重新启动后覆盖保存当前槽位快照
+  - `window_slots.json` 是当前批次窗口槽位快照，本地运行状态文件，不提交 Git，不进入发布包
+  - `window_manager_settings.json` 是长期窗口管理参数配置，关闭全部窗口后重新批量启动会按该配置重新生成槽位
 
 - [dm_click_helper.py](dm_click_helper.py) — 32 位 Python Dm 点击/输入脚本
   - `click` 模式：MoveTo + LeftDown + 保持 + LeftUp
