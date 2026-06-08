@@ -7,6 +7,7 @@ import threading
 import time
 import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import replace
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
@@ -19,8 +20,11 @@ from .config import (
     SINGLE_LEVEL_NAME,
     STATUSES,
     app_root,
+    describe_bookmark_file,
+    find_bookmark_file_candidates,
+    find_preferred_bookmark_file,
     project_root,
-    find_default_bookmark_file,
+    list_bookmark_top_level_dirs,
     load_accounts_from_bookmarks,
     load_csv_accounts,
     load_settings,
@@ -33,11 +37,11 @@ from .window_manager import (
     calculate_row_tile_plan,
     check_window_slots_compatibility,
     close_game_windows,
+    extract_window_number,
     has_valid_window_slots,
     launch_game_process,
     layout_params_from_tile_config,
     list_game_windows,
-    load_window_slots,
     rename_game_windows,
     refresh_window_slots_from_current_windows,
     repair_window_slot,
@@ -47,6 +51,7 @@ from .window_manager import (
     tile_game_windows,
     tile_game_windows_by_row_count,
     user32,
+    window_slots_profile_path,
 )
 from .window_manager_settings import (
     FixedModeSettings,
@@ -65,6 +70,96 @@ WM_POLL_INTERVAL_SECONDS = 0.5
 WM_FINAL_DELAY_SECONDS = 1
 WM_TILE_MODE_FIXED = "固定参数排列"
 WM_TILE_MODE_ROW_COUNT = "根据行数排列"
+
+ACCOUNT_TABLE_COLUMNS = (
+    "level",
+    "bookmark",
+    "window",
+    "include_in_all",
+    "passport",
+    "url",
+    "status",
+    "timing",
+)
+ACCOUNT_TABLE_COLUMN_INDEX = {column: index for index, column in enumerate(ACCOUNT_TABLE_COLUMNS)}
+ACCOUNT_TABLE_HEADINGS = {
+    "level": "层级",
+    "bookmark": "收藏编号",
+    "window": "窗口号",
+    "include_in_all": "参与全部串行",
+    "passport": "本次通行证",
+    "url": "链接",
+    "status": "状态",
+    "timing": "耗时",
+}
+ACCOUNT_TABLE_COLUMNS_CONFIG = {
+    "level": {"width": 70, "anchor": tk.CENTER},
+    "bookmark": {"width": 70, "anchor": tk.CENTER},
+    "window": {"width": 65, "anchor": tk.CENTER},
+    "include_in_all": {"width": 95, "anchor": tk.CENTER},
+    "passport": {"width": 110, "anchor": tk.CENTER},
+    "url": {"width": 390},
+    "status": {"width": 130, "anchor": tk.CENTER},
+    "timing": {"width": 70, "anchor": tk.CENTER},
+}
+
+
+def _account_table_values(
+    account: AccountConfig,
+    passport: str = "",
+    status: str = "未开始",
+    timing: str = "",
+) -> tuple[object, ...]:
+    return (
+        account.level,
+        account.bookmark_title or account.bookmark_no,
+        account.game_window_no,
+        "是" if account.include_in_all else "否",
+        passport,
+        account.url,
+        status,
+        timing,
+    )
+
+
+def _replace_account_table_value(values: object, column: str, value: str) -> list[object]:
+    updated = list(values if isinstance(values, (list, tuple)) else ())
+    if len(updated) < len(ACCOUNT_TABLE_COLUMNS):
+        updated.extend([""] * (len(ACCOUNT_TABLE_COLUMNS) - len(updated)))
+    updated[ACCOUNT_TABLE_COLUMN_INDEX[column]] = value
+    return updated
+
+
+def _merge_account_group_settings(
+    existing: object,
+    include_by_group: dict[str, bool],
+) -> dict[str, dict[str, bool]]:
+    merged: dict[str, dict[str, bool]] = {}
+    if isinstance(existing, dict):
+        for raw_group_name, raw_group_setting in existing.items():
+            group_name = str(raw_group_name).strip()
+            if not group_name:
+                continue
+            include_in_all = False
+            if isinstance(raw_group_setting, dict):
+                include_in_all = bool(raw_group_setting.get("include_in_all", False))
+            elif isinstance(raw_group_setting, bool):
+                include_in_all = raw_group_setting
+            merged[group_name] = {"include_in_all": include_in_all}
+
+    for group_name, include_in_all in include_by_group.items():
+        clean_group_name = str(group_name).strip()
+        if clean_group_name:
+            merged[clean_group_name] = {"include_in_all": bool(include_in_all)}
+    return merged
+
+
+def _split_all_serial_accounts(
+    accounts: list[AccountConfig],
+) -> tuple[list[AccountConfig], list[AccountConfig]]:
+    enabled = [account for account in accounts if account.include_in_all]
+    skipped = [account for account in accounts if not account.include_in_all]
+    return enabled, skipped
 
 
 class LauncherApp(tk.Tk):
@@ -95,7 +190,7 @@ class LauncherApp(tk.Tk):
         self.is_closing = False
 
         self.settings_path = tk.StringVar(value=str(app_root() / "automation_settings.json"))
-        self.bookmark_path = tk.StringVar(value=find_default_bookmark_file())
+        self.bookmark_path = tk.StringVar(value="")
         self.bookmark_root_name = tk.StringVar(value="账号")
         self.level_var = tk.StringVar(value="第一层")
         self.account_var = tk.StringVar(value="")
@@ -133,6 +228,7 @@ class LauncherApp(tk.Tk):
         self._apply_settings_defaults()
         self._build_widgets()
         self._load_window_manager_settings()
+        self._log_bookmark_startup_state()
         self._auto_load_csv()
         self.after(100, self._drain_ui_queue)
         self._load_default_config_if_present()
@@ -147,10 +243,81 @@ class LauncherApp(tk.Tk):
             return
         if settings.bookmark_file:
             self.bookmark_path.set(settings.bookmark_file)
+        else:
+            edge_bookmark = find_preferred_bookmark_file("Edge", "Default")
+            if edge_bookmark:
+                self.bookmark_path.set(edge_bookmark)
         self.bookmark_root_name.set(settings.bookmark_root_name)
         self.max_workers_var.set(settings.max_workers)
         self.notice_outside_x_var.set(settings.notice_close_outside_ratio[0])
         self.notice_outside_y_var.set(settings.notice_close_outside_ratio[1])
+
+    def _bookmark_candidates_summary(self) -> str:
+        candidates = find_bookmark_file_candidates()
+        if not candidates:
+            return "未检测到 Chrome / Edge Bookmarks 候选"
+        return "；".join(
+            f"{candidate.browser} {candidate.profile or '默认'}: {candidate.path}"
+            for candidate in candidates
+        )
+
+    def _log_bookmark_startup_state(self) -> None:
+        try:
+            settings = load_settings(self.settings_path.get())
+        except Exception as exc:
+            self._log(f"收藏夹配置读取失败：{self.settings_path.get()}，{exc}")
+            return
+
+        saved_path = str(settings.bookmark_file or "").strip()
+        if saved_path:
+            info = describe_bookmark_file(saved_path)
+            if Path(saved_path).is_file():
+                self._log(
+                    f"已使用上次保存的收藏夹路径：{saved_path} "
+                    f"({info.browser}, profile={info.profile or '未知'})"
+                )
+            else:
+                self._log(
+                    f"上次保存的收藏夹路径不存在或不可读：{saved_path}。"
+                    f"请重新选择 Bookmarks 文件。候选：{self._bookmark_candidates_summary()}"
+                )
+            return
+
+        edge_bookmark = find_preferred_bookmark_file("Edge", "Default")
+        if edge_bookmark:
+            self.bookmark_path.set(edge_bookmark)
+            self._save_bookmark_settings(edge_bookmark)
+            self._log(f"当前未保存收藏夹路径，已按默认浏览器使用 Edge Default：{edge_bookmark}")
+            return
+
+        self._log(
+            "当前未保存收藏夹路径，且未检测到 Edge Default Bookmarks。"
+            f"请手动选择；检测到候选：{self._bookmark_candidates_summary()}"
+        )
+
+    def _save_bookmark_settings(self, bookmark_file: str) -> None:
+        bookmark_path = str(bookmark_file or "").strip()
+        if not bookmark_path:
+            return
+        path = Path(self.settings_path.get())
+        info = describe_bookmark_file(bookmark_path)
+        try:
+            data = {}
+            if path.exists():
+                data = json.loads(path.read_text(encoding="utf-8-sig"))
+                if not isinstance(data, dict):
+                    data = {}
+            data["bookmark_file"] = bookmark_path
+            data["bookmark_browser"] = info.browser
+            data["bookmark_profile"] = info.profile
+            data["bookmark_root_name"] = self.bookmark_root_name.get().strip() or data.get("bookmark_root_name", "账号")
+            path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            self._log(
+                f"已保存收藏夹配置：browser={info.browser}, "
+                f"profile={info.profile or '未知'}, path={bookmark_path}"
+            )
+        except Exception as exc:
+            self._log(f"保存收藏夹配置失败：{exc}")
 
     def _build_widgets(self) -> None:
         root = ttk.Frame(self, padding=(12, 8, 12, 4))
@@ -373,8 +540,15 @@ class LauncherApp(tk.Tk):
         ttk.Label(select_row, text="层级").pack(side=tk.LEFT, padx=(2, 4))
         self.level_box = ttk.Combobox(select_row, textvariable=self.level_var,
                                        values=("全部", *SELECTABLE_LEVELS), width=10, state="readonly")
-        self.level_box.pack(side=tk.LEFT, padx=(0, 16))
+        self.level_box.pack(side=tk.LEFT, padx=(0, 4))
         self.level_box.bind("<<ComboboxSelected>>", lambda _: self._on_level_changed())
+        self.group_settings_btn = ttk.Button(
+            select_row,
+            text="分组设置",
+            width=10,
+            command=self._open_account_group_settings,
+        )
+        self.group_settings_btn.pack(side=tk.LEFT, padx=(0, 16))
 
         ttk.Label(select_row, text="账号").pack(side=tk.LEFT, padx=(0, 4))
         self.account_box = ttk.Combobox(select_row, textvariable=self.account_var, width=28, state="readonly")
@@ -403,22 +577,10 @@ class LauncherApp(tk.Tk):
 
         # ===== 4. 账号列表 =====
         self._table_frame_m1 = ttk.LabelFrame(root, text="账号列表（方式一）", padding=2)
-        columns = ("level", "bookmark", "window", "passport", "url", "status", "timing")
-        self.tree = ttk.Treeview(self._table_frame_m1, columns=columns, show="headings", height=7)
-        self.tree.heading("level", text="层级")
-        self.tree.heading("bookmark", text="收藏编号")
-        self.tree.heading("window", text="窗口号")
-        self.tree.heading("passport", text="本次通行证")
-        self.tree.heading("url", text="链接")
-        self.tree.heading("status", text="状态")
-        self.tree.heading("timing", text="耗时")
-        self.tree.column("level", width=70, anchor=tk.CENTER)
-        self.tree.column("bookmark", width=70, anchor=tk.CENTER)
-        self.tree.column("window", width=65, anchor=tk.CENTER)
-        self.tree.column("passport", width=110, anchor=tk.CENTER)
-        self.tree.column("url", width=450)
-        self.tree.column("status", width=130, anchor=tk.CENTER)
-        self.tree.column("timing", width=70, anchor=tk.CENTER)
+        self.tree = ttk.Treeview(self._table_frame_m1, columns=ACCOUNT_TABLE_COLUMNS, show="headings", height=7)
+        for column in ACCOUNT_TABLE_COLUMNS:
+            self.tree.heading(column, text=ACCOUNT_TABLE_HEADINGS[column])
+            self.tree.column(column, **ACCOUNT_TABLE_COLUMNS_CONFIG[column])
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar = ttk.Scrollbar(self._table_frame_m1, command=self.tree.yview)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
@@ -761,6 +923,22 @@ class LauncherApp(tk.Tk):
             messagebox.showwarning("批量启动窗口", message)
             return
 
+        excluded_hwnds = self._wm_excluded_hwnds()
+        try:
+            existing_count = len(list_game_windows(exclude_hwnds=excluded_hwnds))
+        except Exception as exc:
+            self._log(f"[窗口管理] 批量启动前识别窗口失败：{exc}")
+            existing_count = 0
+        if existing_count >= launch_count:
+            message = (
+                f"当前已检测到 {existing_count} 个窗口，目标打开数量为 {launch_count}。\n"
+                "如需重新启动，请先关闭窗口。\n"
+                "如需重新排列，请使用“排列窗口”或“重新生成槽位”。"
+            )
+            self._log(f"[窗口管理] 已阻止批量追加启动：当前={existing_count}，目标={launch_count}")
+            messagebox.showwarning("批量启动窗口", message)
+            return
+
         self._save_window_manager_settings()
         auto_tile = bool(self.wm_auto_tile_after_launch_var.get())
         auto_rename = bool(self.wm_auto_rename_after_tile_var.get())
@@ -774,6 +952,7 @@ class LauncherApp(tk.Tk):
                 tile_mode,
                 tile_config,
                 self.wm_title_template_var.get().strip(),
+                target_window_count=launch_count,
             )
             if tile_config is not None
             else None
@@ -784,7 +963,6 @@ class LauncherApp(tk.Tk):
             if title_template is None:
                 return
 
-        excluded_hwnds = self._wm_excluded_hwnds()
         self.wm_launch_btn.configure(state=tk.DISABLED)
         self.wm_launch_thread = threading.Thread(
             target=self._wm_launch_windows_worker,
@@ -829,9 +1007,23 @@ class LauncherApp(tk.Tk):
             except Exception as exc:
                 before_count = 0
                 log(f"启动前识别窗口失败：{exc}")
+            new_session = before_count == 0
+            if new_session:
+                log("启动前没有旧 H5 窗口，本次按当前窗口管理参数重新生成槽位")
+                log("本次不使用旧 hwnd 槽位快照，不按旧 window_slots.json 恢复")
+            if before_count >= launch_count:
+                log(
+                    f"已阻止批量追加启动：当前已检测到 {before_count} 个窗口，"
+                    f"目标打开数量为 {launch_count}。如需重新启动请先关闭窗口。"
+                )
+                return
 
-            for index in range(1, launch_count + 1):
-                log(f"正在启动第 {index}/{launch_count} 个窗口")
+            launch_missing = max(0, launch_count - before_count)
+            if before_count > 0:
+                log(f"当前已有 {before_count} 个窗口，本次只补齐启动 {launch_missing} 个，目标总数 {launch_count}。")
+
+            for index in range(1, launch_missing + 1):
+                log(f"正在启动第 {index}/{launch_missing} 个窗口")
                 result = launch_game_process(game_path)
                 if result.success:
                     log(f"第 {index} 个窗口启动命令已发送")
@@ -859,7 +1051,7 @@ class LauncherApp(tk.Tk):
                 final_count = -1
                 log(f"批量启动完成后识别窗口失败：{exc}")
 
-            target_count = before_count + launch_count
+            target_count = launch_count
             if final_count >= 0:
                 log(f"批量启动完成，目标 {target_count} 个，当前识别到 {final_count} 个")
 
@@ -890,13 +1082,21 @@ class LauncherApp(tk.Tk):
                         f"禁止超出屏幕宽度={tile_config.prevent_overflow}"
                     )
                 try:
-                    full_restart = before_count == 0
-                    if self._wm_has_saved_slots() and not full_restart:
-                        log("检测到 window_slots.json，启动后自动排列改为按已保存槽位恢复布局")
-                        log("本次不会按 hwnd / 枚举顺序重新排序，不会覆盖 window_slots.json")
-                        self._wm_log_slot_compatibility(layout_params, log)
+                    if self._wm_has_saved_slots(layout_params) and not new_session:
+                        current_count = len(list_game_windows(exclude_hwnds=excluded_hwnds))
+                        if not self._wm_validate_slot_profile(
+                            layout_params=layout_params,
+                            current_window_count=current_count,
+                            log=log,
+                            show_error=False,
+                        ):
+                            log("槽位 profile 不一致，已阻止按旧槽位恢复。请点击“重新生成槽位”。")
+                            return
+                        slots_path = self._wm_slots_path(layout_params)
+                        log(f"检测到当前 profile 槽位文件：{slots_path.name}，启动后自动排列改为按已保存槽位恢复布局")
+                        log("本次不会按 hwnd / 枚举顺序重新排序，不会覆盖其它 profile 槽位")
                         slot_results = restore_windows_by_slots(
-                            slots_path=self._wm_slots_path(),
+                            slots_path=slots_path,
                             title_template=title_template,
                             exclude_hwnds=excluded_hwnds,
                             move_windows=True,
@@ -908,11 +1108,8 @@ class LauncherApp(tk.Tk):
                         log(f"自动按槽位恢复完成：成功 {success_count}，失败 {failed_count}")
                         return
 
-                    if full_restart:
-                        log("启动前没有旧 H5 窗口，本次按当前窗口管理参数重新生成槽位")
-                        log("本次不使用旧 hwnd 槽位快照，不按旧 window_slots.json 恢复")
-                    elif not self._wm_has_saved_slots():
-                        log("未检测到有效 window_slots.json，本次排列后保存新的槽位快照")
+                    if not new_session and not self._wm_has_saved_slots(layout_params):
+                        log("未检测到当前 profile 的有效槽位文件，本次排列后保存新的槽位快照")
 
                     results = self._wm_run_tile(
                         tile_mode=tile_mode,
@@ -927,14 +1124,15 @@ class LauncherApp(tk.Tk):
                             log=log,
                             exclude_hwnds=excluded_hwnds,
                             title_template=title_template,
+                            force_global=new_session,
                         )
                         log("自动编号标题完成")
                     slots = save_current_windows_as_slots(
-                        slots_path=self._wm_slots_path(),
+                        slots_path=self._wm_slots_path(layout_params),
                         exclude_hwnds=excluded_hwnds,
                         layout_params=layout_params,
                     )
-                    log(f"已按当前窗口管理参数保存槽位快照：{len(slots)} 个")
+                    log(f"已按当前 profile 保存槽位快照：{len(slots)} 个，路径={self._wm_slots_path(layout_params)}")
                 except Exception as exc:
                     log(f"启动后自动排列失败：{exc}")
         finally:
@@ -1028,23 +1226,35 @@ class LauncherApp(tk.Tk):
             )
         return tile_game_windows(tile_config, exclude_hwnds=exclude_hwnds)
 
-    def _wm_slots_path(self) -> Path:
-        return app_root() / "window_slots.json"
+    def _wm_target_window_count(self) -> int | None:
+        try:
+            value = int(self.wm_launch_count_var.get())
+            return value if value > 0 else None
+        except Exception:
+            return None
 
-    def _wm_has_saved_slots(self) -> bool:
-        return has_valid_window_slots(self._wm_slots_path())
+    def _wm_slots_path(self, layout_params=None) -> Path:
+        params = layout_params or self._wm_current_slot_layout_params()
+        if params is None:
+            return app_root() / "slots" / "invalid_profile.json"
+        return window_slots_profile_path(app_root(), params)
+
+    def _wm_has_saved_slots(self, layout_params=None) -> bool:
+        return has_valid_window_slots(self._wm_slots_path(layout_params))
 
     def _wm_slot_layout_params(
         self,
         tile_mode: str,
         tile_config: TileConfig | RowTileConfig,
         title_template: str | None = None,
+        target_window_count: int | None = None,
     ):
         mode = "row_count" if tile_mode == WM_TILE_MODE_ROW_COUNT else "fixed"
         return layout_params_from_tile_config(
             tile_config,
             title_template=title_template if title_template is not None else self.wm_title_template_var.get().strip(),
             mode=mode,
+            target_window_count=target_window_count if target_window_count is not None else self._wm_target_window_count(),
         )
 
     def _wm_current_slot_layout_params(self):
@@ -1054,13 +1264,18 @@ class LauncherApp(tk.Tk):
         tile_mode, tile_config = arrangement
         return self._wm_slot_layout_params(tile_mode, tile_config)
 
-    def _wm_log_slot_compatibility(self, layout_params, log) -> None:
+    def _wm_log_slot_compatibility(self, layout_params, log, current_window_count: int | None = None) -> None:
         try:
-            result = check_window_slots_compatibility(self._wm_slots_path(), layout_params)
+            result = check_window_slots_compatibility(
+                self._wm_slots_path(layout_params),
+                layout_params,
+                current_window_count=current_window_count,
+            )
         except Exception as exc:
             log(f"槽位环境校验失败：{exc}")
             return
 
+        log(f"当前槽位 profile 文件：{self._wm_slots_path(layout_params)}")
         current = result.current_environment
         log(
             "当前槽位环境："
@@ -1076,6 +1291,52 @@ class LauncherApp(tk.Tk):
             )
         for warning in result.warnings:
             log(f"槽位校验提醒：{warning}")
+
+    def _wm_validate_slot_profile(
+        self,
+        layout_params,
+        current_window_count: int | None,
+        log,
+        show_error: bool = True,
+    ) -> bool:
+        slots_path = self._wm_slots_path(layout_params)
+        if not has_valid_window_slots(slots_path):
+            message = (
+                f"当前 profile 尚未生成槽位：{slots_path.name}。\n"
+                "请先执行“重新生成槽位”。"
+            )
+            log(message.replace("\n", " "))
+            if show_error:
+                messagebox.showwarning("槽位 profile 不存在", message)
+            return False
+
+        try:
+            result = check_window_slots_compatibility(
+                slots_path,
+                layout_params,
+                current_window_count=current_window_count,
+            )
+        except Exception as exc:
+            message = f"槽位 profile 校验失败：{exc}"
+            log(message)
+            if show_error:
+                messagebox.showerror("槽位 profile 校验失败", message)
+            return False
+
+        self._wm_log_slot_compatibility(layout_params, log, current_window_count=current_window_count)
+        if result.compatible:
+            return True
+
+        reason = "；".join(result.warnings)
+        message = (
+            "当前窗口数量 / 排列参数与槽位文件不一致，禁止使用旧槽位恢复。\n"
+            f"{reason}\n\n"
+            "如需按当前参数重排，请点击“重新生成槽位”。"
+        )
+        log(f"槽位 profile 不一致，已阻止恢复：{reason}")
+        if show_error:
+            messagebox.showwarning("槽位 profile 不一致", message)
+        return False
 
     def _wm_read_fixed_slot_config(self) -> TileConfig | None:
         self._wm_store_current_mode_values(self.wm_current_tile_mode_key)
@@ -1106,9 +1367,31 @@ class LauncherApp(tk.Tk):
     def _wm_refresh_window_slots(self) -> None:
         self._save_window_manager_settings()
         layout_params = self._wm_current_slot_layout_params()
+        if layout_params is None:
+            return
+        try:
+            current_count = len(list_game_windows(exclude_hwnds=self._wm_excluded_hwnds()))
+        except Exception as exc:
+            self._log(f"[窗口管理] 刷新槽位前识别窗口失败：{exc}")
+            messagebox.showerror("刷新槽位映射失败", str(exc))
+            return
+        target_count = layout_params.target_window_count
+        if target_count is not None and current_count != target_count:
+            confirmed = messagebox.askyesno(
+                "刷新槽位映射",
+                f"当前识别到 {current_count} 个窗口，当前 profile 目标数量为 {target_count}。\n\n"
+                "刷新槽位映射只保存当前 profile，数量不一致可能导致后续恢复失败。\n"
+                "是否仍要刷新？",
+                parent=self,
+            )
+            if not confirmed:
+                self._log(
+                    f"[窗口管理] 已取消刷新槽位映射：当前窗口数={current_count}，profile目标={target_count}"
+                )
+                return
         try:
             slots = refresh_window_slots_from_current_windows(
-                slots_path=self._wm_slots_path(),
+                slots_path=self._wm_slots_path(layout_params),
                 exclude_hwnds=self._wm_excluded_hwnds(),
                 layout_params=layout_params,
             )
@@ -1118,6 +1401,7 @@ class LauncherApp(tk.Tk):
             return
 
         self._wm_log_refresh_slot_results(slots)
+        self._log(f"[窗口管理] 当前 profile 槽位文件：{self._wm_slots_path(layout_params)}")
         if not slots:
             self._log("[窗口管理] 未识别到带编号标题的斗罗大陆H5窗口，未刷新任何槽位。")
 
@@ -1145,12 +1429,22 @@ class LauncherApp(tk.Tk):
         move_windows: bool,
         rename_windows: bool,
         log,
+        layout_params=None,
+        current_window_count: int | None = None,
     ) -> bool:
-        slots_path = self._wm_slots_path()
+        layout_params = layout_params or self._wm_current_slot_layout_params()
+        if layout_params is None:
+            return False
+        slots_path = self._wm_slots_path(layout_params)
+        if not self._wm_validate_slot_profile(
+            layout_params=layout_params,
+            current_window_count=current_window_count,
+            log=log,
+        ):
+            return False
         title_template = self.wm_title_template_var.get().strip() or None
-        log(f"检测到 {slots_path.name}，按已保存槽位恢复布局")
-        log("本次不会按 hwnd / 枚举顺序重新排序，不会覆盖 window_slots.json")
-        self._wm_log_slot_compatibility(self._wm_current_slot_layout_params(), log)
+        log(f"检测到当前 profile 槽位文件 {slots_path.name}，按已保存槽位恢复布局")
+        log("本次不会按 hwnd / 枚举顺序重新排序，不会覆盖其它 profile 槽位文件")
         try:
             results = restore_windows_by_slots(
                 slots_path=slots_path,
@@ -1204,11 +1498,13 @@ class LauncherApp(tk.Tk):
             title_template = self._wm_read_title_template()
         if title_template is None:
             return
-        if self._wm_has_saved_slots() and not force_global:
+        layout_params = self._wm_current_slot_layout_params()
+        if layout_params is not None and self._wm_has_saved_slots(layout_params) and not force_global:
             self._wm_restore_windows_by_slots(
                 move_windows=False,
                 rename_windows=True,
                 log=log,
+                layout_params=layout_params,
             )
             return
         log(f"开始自动编号标题：模板={title_template}")
@@ -1230,11 +1526,13 @@ class LauncherApp(tk.Tk):
 
     def _wm_rename_windows(self) -> None:
         self._save_window_manager_settings()
-        if self._wm_has_saved_slots():
+        layout_params = self._wm_current_slot_layout_params()
+        if layout_params is not None and self._wm_has_saved_slots(layout_params):
             self._wm_restore_windows_by_slots(
                 move_windows=False,
                 rename_windows=True,
                 log=lambda message: self._log(f"[窗口管理] {message}"),
+                layout_params=layout_params,
             )
             return
         self._wm_rename_windows_after_tile(
@@ -1261,58 +1559,47 @@ class LauncherApp(tk.Tk):
 
     def _wm_tile_windows(self) -> None:
         self._save_window_manager_settings()
-        if self._wm_has_saved_slots():
-            self._wm_restore_windows_by_slots(
-                move_windows=True,
-                rename_windows=True,
-                log=lambda message: self._log(f"窗口管理：{message}"),
-            )
-            return
-
         arrangement = self._wm_read_arrangement_config()
         if arrangement is None:
             return
         tile_mode, config = arrangement
-
+        layout_params = self._wm_slot_layout_params(
+            tile_mode,
+            config,
+            self.wm_title_template_var.get().strip(),
+        )
         try:
-            results = self._wm_run_tile(
-                tile_mode=tile_mode,
-                tile_config=config,
-                exclude_hwnds=self._wm_excluded_hwnds(),
-                log=lambda message: self._log(f"窗口管理：{message}"),
-            )
+            current_count = len(list_game_windows(exclude_hwnds=self._wm_excluded_hwnds()))
         except Exception as exc:
-            self._log(f"窗口管理：排列登录窗口失败：{exc}")
+            self._log(f"窗口管理：排列前识别窗口失败：{exc}")
             messagebox.showerror("排列登录窗口失败", str(exc))
             return
 
-        if tile_mode == WM_TILE_MODE_ROW_COUNT:
-            self._log(
-                "窗口管理：排列完成，"
-                f"排列方式={tile_mode}，单行数量={config.per_row}，"
-                f"自动缩放窗口=True，禁止超出屏幕宽度={config.prevent_overflow}，"
-                f"结果 {len(results)} 个。"
+        if self._wm_has_saved_slots(layout_params):
+            self._wm_restore_windows_by_slots(
+                move_windows=True,
+                rename_windows=True,
+                log=lambda message: self._log(f"窗口管理：{message}"),
+                layout_params=layout_params,
+                current_window_count=current_count,
             )
-        else:
-            self._log(
-                "窗口管理：排列完成，"
-                f"排列方式={tile_mode}，目标大小={config.width}x{config.height}，"
-                f"每行={config.per_row}，结果 {len(results)} 个。"
-            )
-        self._log(
-            f"窗口管理：当前排列方式={tile_mode}，识别到 {len(results)} 个窗口。"
+            return
+
+        message = (
+            f"当前 profile 尚未生成槽位：{self._wm_slots_path(layout_params).name}。\n"
+            "普通“排列窗口”不会按 hwnd / 枚举顺序重新排序。\n"
+            "如需按当前参数重排并保存槽位，请点击“重新生成槽位”。"
         )
-        self._wm_log_tile_results(results, lambda message: self._log(f"窗口管理：{message}"))
-        if self.wm_auto_rename_after_tile_var.get():
-            self._wm_rename_windows_after_tile(
-                log=lambda message: self._log(f"[窗口管理] {message}"),
-                exclude_hwnds=self._wm_excluded_hwnds(),
-            )
+        self._log(f"窗口管理：{message.replace(chr(10), ' ')}")
+        messagebox.showwarning("当前 profile 无槽位", message)
+        return
 
     def _wm_regenerate_slots(self) -> None:
         confirmed = messagebox.askyesno(
             "重新生成槽位",
-            "此操作会重新排列并重新编号全部窗口，可能覆盖 window_slots.json。\n\n是否继续？",
+            "此操作会按当前 UI 参数重新排列并重新编号全部窗口，"
+            "并覆盖当前 profile 的槽位文件。\n\n"
+            "其它 profile 槽位文件不会被覆盖。\n\n是否继续？",
             parent=self,
         )
         if not confirmed:
@@ -1325,9 +1612,15 @@ class LauncherApp(tk.Tk):
             return
         tile_mode, config = arrangement
         excluded_hwnds = self._wm_excluded_hwnds()
+        layout_params = self._wm_slot_layout_params(
+            tile_mode,
+            config,
+            self.wm_title_template_var.get().strip(),
+        )
 
         try:
             self._log(f"窗口管理：开始全局重新排列，排列方式={tile_mode}")
+            self._log(f"窗口管理：当前 profile 槽位文件={self._wm_slots_path(layout_params)}")
             results = self._wm_run_tile(
                 tile_mode=tile_mode,
                 tile_config=config,
@@ -1349,20 +1642,16 @@ class LauncherApp(tk.Tk):
 
         try:
             slots = save_current_windows_as_slots(
-                slots_path=self._wm_slots_path(),
+                slots_path=self._wm_slots_path(layout_params),
                 exclude_hwnds=excluded_hwnds,
-                layout_params=self._wm_slot_layout_params(
-                    tile_mode,
-                    config,
-                    self.wm_title_template_var.get().strip(),
-                ),
+                layout_params=layout_params,
             )
         except Exception as exc:
-            self._log(f"窗口管理：排列完成，但保存 window_slots.json 失败：{exc}")
+            self._log(f"窗口管理：排列完成，但保存当前 profile 槽位失败：{exc}")
             messagebox.showerror("保存槽位失败", str(exc))
             return
 
-        self._log(f"窗口管理：已重新生成并保存 {len(slots)} 个槽位到 {self._wm_slots_path().name}。")
+        self._log(f"窗口管理：已重新生成并保存 {len(slots)} 个槽位到 {self._wm_slots_path(layout_params)}。")
 
     def _wm_repair_window_slot(self) -> None:
         self._save_window_manager_settings()
@@ -1385,15 +1674,21 @@ class LauncherApp(tk.Tk):
             messagebox.showwarning("修复窗口", "目标槽位必须大于 0。")
             return
 
-        slots_path = self._wm_slots_path()
+        layout_params = self._wm_current_slot_layout_params()
+        if layout_params is None:
+            return
+        slots_path = self._wm_slots_path(layout_params)
+        if not has_valid_window_slots(slots_path):
+            message = (
+                f"当前 profile 尚未生成槽位：{slots_path.name}。\n"
+                "请先执行“重新生成槽位”。"
+            )
+            self._log(f"[窗口管理] 修复窗口失败：{message.replace(chr(10), ' ')}")
+            messagebox.showwarning("修复窗口", message)
+            return
         title_template = self.wm_title_template_var.get().strip() or None
         excluded_hwnds = self._wm_excluded_hwnds()
         fixed_config = self._wm_read_fixed_slot_config()
-        layout_params = (
-            self._wm_slot_layout_params(WM_TILE_MODE_FIXED, fixed_config, title_template)
-            if fixed_config is not None
-            else None
-        )
         try:
             slot, slot_source, resolve_error = resolve_window_slot_for_repair(
                 slot_no=slot_no,
@@ -1412,7 +1707,7 @@ class LauncherApp(tk.Tk):
             messagebox.showwarning("修复窗口", resolve_error)
             return
         if slot_source == "slot_file":
-            self._log(f"[窗口管理] slot {slot_no} 已从 window_slots.json 读取。")
+            self._log(f"[窗口管理] slot {slot_no} 已从当前 profile 槽位文件读取：{slots_path.name}")
         elif slot_source == "current_title":
             self._log(
                 f"[窗口管理] slot {slot_no} 已从当前窗口标题补齐："
@@ -1459,7 +1754,7 @@ class LauncherApp(tk.Tk):
             result = repair_window_slot(
                 slot_no=slot_no,
                 game_path=game_path,
-                slots_path=self._wm_slots_path(),
+                slots_path=self._wm_slots_path(layout_params),
                 title_template=title_template,
                 close_existing=close_existing,
                 exclude_hwnds=excluded_hwnds,
@@ -1472,7 +1767,7 @@ class LauncherApp(tk.Tk):
 
         slot = result.slot
         source_text = {
-            "slot_file": "window_slots.json",
+            "slot_file": "当前 profile 槽位文件",
             "current_title": "当前窗口标题",
             "fixed_config": "固定排列参数推导",
         }.get(result.slot_source, result.slot_source or "未知")
@@ -1621,6 +1916,7 @@ Write-Output $count
         path = filedialog.askopenfilename(filetypes=[("Bookmarks", "Bookmarks"), ("JSON", "*.json"), ("All files", "*.*")])
         if path:
             self.bookmark_path.set(path)
+            self._save_bookmark_settings(path)
 
     def _pick_settings(self) -> None:
         path = filedialog.askopenfilename(filetypes=[("JSON", "*.json"), ("All files", "*.*")])
@@ -1631,21 +1927,33 @@ Write-Output $count
         if self.bookmark_path.get() and Path(self.bookmark_path.get()).exists():
             self._load_accounts()
         else:
-            self._log("未自动找到浏览器收藏夹文件，请手动选择 Bookmarks 文件后点击“读取收藏夹”。")
+            current = self.bookmark_path.get().strip()
+            if current:
+                self._log(f"收藏夹路径不可读，未自动读取：{current}")
+            else:
+                self._log("未保存收藏夹路径，未自动读取。请手动选择 Bookmarks 文件后点击“读取收藏夹”。")
 
     def _load_accounts(self) -> None:
         try:
             settings = load_settings(self.settings_path.get())
             bookmark_file = self.bookmark_path.get() or settings.bookmark_file
             root_name = self.bookmark_root_name.get().strip() or settings.bookmark_root_name
+            if not bookmark_file:
+                raise ValueError(
+                    "未配置收藏夹路径。程序不会自动切换到 Chrome/Edge 候选，"
+                    f"请手动选择 Bookmarks 文件。候选：{self._bookmark_candidates_summary()}"
+                )
             level_counts = self._current_level_counts()
+            self._log(f"准备读取收藏夹：{bookmark_file}")
             self.accounts = load_accounts_from_bookmarks(
                 bookmark_file,
                 root_name,
                 settings.level_names,
                 level_counts=level_counts,
+                account_group_settings=settings.account_group_settings,
                 log=lambda message: self._log(f"收藏夹读取：{message}"),
             )
+            self._save_bookmark_settings(bookmark_file)
             self.status_by_key = {account.key: "未开始" for account in self.accounts}
             self.passport_by_key = {account.key: "" for account in self.accounts}
             self._refresh_mode_account_scope()
@@ -1653,6 +1961,12 @@ Write-Output $count
         except Exception as exc:
             messagebox.showerror("读取收藏夹失败", str(exc))
             self._log(f"读取收藏夹失败: {exc}")
+            bookmark_file = self.bookmark_path.get().strip()
+            if bookmark_file:
+                top_level = list_bookmark_top_level_dirs(bookmark_file)
+                top_level_text = "，".join(top_level) if top_level else "未检测到一级目录"
+                self._log(f"读取失败时的 Bookmarks 路径：{bookmark_file}")
+                self._log(f"检测到的一级目录：{top_level_text}")
 
     def _current_level_counts(self) -> dict[str, int]:
         counts: dict[str, int] = {}
@@ -1663,27 +1977,133 @@ Write-Output $count
     def _account_count_summary(self, accounts: list[AccountConfig] | None = None) -> str:
         source = accounts if accounts is not None else self.accounts
         parts = []
-        single_count = sum(1 for account in source if account.level == SINGLE_LEVEL_NAME)
-        if single_count:
-            parts.append(f"{SINGLE_LEVEL_NAME} {single_count} 个")
-        for level in LEVELS:
+        for level in self._account_group_order(source):
             count = sum(1 for account in source if account.level == level)
             if count:
                 parts.append(f"{level} {count} 个")
         return "分类：" + "，".join(parts) if parts else "分类：无账号"
 
+    def _account_group_order(self, accounts: list[AccountConfig] | None = None) -> tuple[str, ...]:
+        source = accounts if accounts is not None else self.accounts
+        groups: list[str] = []
+        for account in source:
+            if account.level not in groups:
+                groups.append(account.level)
+        return tuple(groups)
+
+    def _account_group_counts(self, accounts: list[AccountConfig]) -> list[tuple[str, int]]:
+        return [
+            (level, sum(1 for account in accounts if account.level == level))
+            for level in self._account_group_order(accounts)
+        ]
+
+    def _format_group_names(self, group_names: list[str]) -> str:
+        return "、".join(group_names) if group_names else "无"
+
+    def _open_account_group_settings(self) -> None:
+        if self.method_var.get() != "method1":
+            messagebox.showinfo("分组设置", "全部串行分组设置仅用于方式一收藏夹账号。")
+            return
+        group_counts = self._account_group_counts(self.accounts)
+        if not group_counts:
+            messagebox.showwarning("无账号分组", "请先读取收藏夹，再设置全部串行分组。")
+            return
+
+        include_by_group = {
+            group_name: any(account.include_in_all for account in self.accounts if account.level == group_name)
+            for group_name, _ in group_counts
+        }
+        dialog = tk.Toplevel(self)
+        dialog.title("全部串行分组设置")
+        dialog.transient(self)
+        dialog.resizable(False, False)
+
+        frame = ttk.Frame(dialog, padding=12)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(
+            frame,
+            text="勾选后，该分组会参与“全部串行”；未勾选分组仍可单独选择运行。",
+            foreground="#555555",
+        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
+
+        ttk.Label(frame, text="分组名", font=("", 9, "bold")).grid(row=1, column=0, sticky="w", padx=(0, 18))
+        ttk.Label(frame, text="账号数", font=("", 9, "bold")).grid(row=1, column=1, sticky="e", padx=(0, 18))
+        ttk.Label(frame, text="参与全部串行", font=("", 9, "bold")).grid(row=1, column=2, sticky="w")
+
+        vars_by_group: dict[str, tk.BooleanVar] = {}
+        for row_index, (group_name, count) in enumerate(group_counts, start=2):
+            ttk.Label(frame, text=group_name).grid(row=row_index, column=0, sticky="w", pady=4, padx=(0, 18))
+            ttk.Label(frame, text=f"{count} 个").grid(row=row_index, column=1, sticky="e", pady=4, padx=(0, 18))
+            var = tk.BooleanVar(value=include_by_group.get(group_name, False))
+            vars_by_group[group_name] = var
+            ttk.Checkbutton(frame, variable=var).grid(row=row_index, column=2, sticky="w", pady=4)
+
+        button_row = ttk.Frame(frame)
+        button_row.grid(row=len(group_counts) + 2, column=0, columnspan=3, sticky="e", pady=(12, 0))
+
+        def _save() -> None:
+            selected = {group_name: bool(var.get()) for group_name, var in vars_by_group.items()}
+            try:
+                self._save_account_group_settings(selected)
+            except Exception as exc:
+                messagebox.showerror("保存失败", str(exc), parent=dialog)
+                self._log(f"保存全部串行分组设置失败：{exc}")
+                return
+            dialog.destroy()
+            messagebox.showinfo("已保存", "全部串行分组设置已保存并立即生效。", parent=self)
+
+        ttk.Button(button_row, text="保存", width=10, command=_save).pack(side=tk.RIGHT, padx=(8, 0))
+        ttk.Button(button_row, text="取消", width=10, command=dialog.destroy).pack(side=tk.RIGHT)
+
+        dialog.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - dialog.winfo_width()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - dialog.winfo_height()) // 2
+        dialog.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        dialog.grab_set()
+        dialog.focus_set()
+
+    def _save_account_group_settings(self, include_by_group: dict[str, bool]) -> None:
+        settings_path = Path(self.settings_path.get())
+        data: dict[str, object] = {}
+        if settings_path.exists():
+            raw_data = json.loads(settings_path.read_text(encoding="utf-8-sig"))
+            if isinstance(raw_data, dict):
+                data = raw_data
+
+        current_settings = load_settings(settings_path).account_group_settings
+        merged = _merge_account_group_settings(current_settings, include_by_group)
+        data["account_group_settings"] = merged
+        settings_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        self.accounts = [
+            replace(
+                account,
+                include_in_all=bool(merged.get(account.level, {}).get("include_in_all", False)),
+            )
+            for account in self.accounts
+        ]
+        self._refresh_table()
+        self._refresh_account_choices()
+
+        enabled = [group_name for group_name, enabled_flag in include_by_group.items() if enabled_flag]
+        disabled = [group_name for group_name, enabled_flag in include_by_group.items() if not enabled_flag]
+        self._log("已保存全部串行分组设置：")
+        self._log(f"启用：{self._format_group_names(enabled)}")
+        self._log(f"未启用：{self._format_group_names(disabled)}")
+        self._log("说明：层级=全部只影响账号列表显示；全部串行只执行已勾选分组。")
+
     def _is_row_count_account_mode(self) -> bool:
         return self._wm_mode_key_from_label() == TILE_MODE_ROW_COUNT
 
     def _allowed_level_values(self) -> tuple[str, ...]:
-        if self._is_row_count_account_mode():
-            return (SINGLE_LEVEL_NAME,)
-        return ("全部", *LEVELS)
+        groups = self._account_group_order()
+        if groups:
+            return ("全部", *groups)
+        return ("全部", SINGLE_LEVEL_NAME, *LEVELS)
 
     def _is_account_allowed_in_current_mode(self, account: AccountConfig) -> bool:
-        if self._is_row_count_account_mode():
-            return account.level == SINGLE_LEVEL_NAME
-        return account.level in LEVELS
+        return True
 
     def _mode_allowed_accounts(self) -> list[AccountConfig]:
         return [account for account in self.accounts if self._is_account_allowed_in_current_mode(account)]
@@ -1691,8 +2111,6 @@ Write-Output $count
     def _filtered_accounts_for_ui(self) -> list[AccountConfig]:
         mode_accounts = self._mode_allowed_accounts()
         level = self.level_var.get()
-        if self._is_row_count_account_mode():
-            return [account for account in mode_accounts if account.level == SINGLE_LEVEL_NAME]
         if level == "全部":
             return mode_accounts
         return [account for account in mode_accounts if account.level == level]
@@ -1704,6 +2122,8 @@ Write-Output $count
             f"层级已切换：排列方式={self.wm_tile_mode_var.get()}，"
             f"层级={self.level_var.get()}，当前账号列表 {len(self._filtered_accounts_for_ui())} 个。"
         )
+        if self.level_var.get() == "全部":
+            self._log("层级=全部：显示所有账号；全部串行只执行已勾选分组。")
 
     def _refresh_mode_account_scope(self, log_change: bool = False) -> None:
         allowed_levels = self._allowed_level_values()
@@ -1735,8 +2155,24 @@ Write-Output $count
                 return False
 
         for account in accounts:
-            selected, _ = select_login_window_by_game_no(account.game_window_no)
+            selected, candidates = select_login_window_by_game_no(account.game_window_no)
             if selected is None:
+                h5_candidates = [window for window in candidates if "斗罗大陆H5" in window.title]
+                numbered_candidates = [
+                    window for window in h5_candidates
+                    if extract_window_number(window.title) is not None
+                ]
+                if h5_candidates and not numbered_candidates:
+                    message = (
+                        "当前检测到 H5 窗口，但窗口未编号。\n"
+                        "请先点击“重命名”或“排列窗口 + 重命名”。"
+                    )
+                    self._log(
+                        f"阻止运行：当前桌面存在 {len(h5_candidates)} 个未编号 H5 窗口，"
+                        f"目标窗口={account.game_window_no}，账号={account.display_name}"
+                    )
+                    messagebox.showwarning("窗口未编号", message)
+                    return False
                 message = f"未在当前桌面找到窗口 {account.game_window_no}，已停止，避免跨桌面运行。"
                 self._log(
                     f"阻止运行：{message} 排列方式={self.wm_tile_mode_var.get()}，"
@@ -1771,6 +2207,8 @@ Write-Output $count
         # 账号下拉框
         if is_m1:
             self._refresh_account_choices()
+        if hasattr(self, "group_settings_btn"):
+            self.group_settings_btn.configure(state=tk.NORMAL if is_m1 else tk.DISABLED)
 
     def _pick_csv_file(self) -> None:
         path = filedialog.askopenfilename(
@@ -1860,14 +2298,11 @@ Write-Output $count
                 "",
                 tk.END,
                 iid=account.key,
-                values=(
-                    account.level,
-                    account.bookmark_no,
-                    account.game_window_no,
-                    self.passport_by_key.get(account.key, ""),
-                    account.url,
-                    self.status_by_key.get(account.key, "未开始"),
-                    self.timing_by_key.get(account.key, ""),
+                values=_account_table_values(
+                    account,
+                    passport=self.passport_by_key.get(account.key, ""),
+                    status=self.status_by_key.get(account.key, "未开始"),
+                    timing=self.timing_by_key.get(account.key, ""),
                 ),
             )
 
@@ -1926,9 +2361,30 @@ Write-Output $count
         if self.method_var.get() == "method2":
             self._run_method2_all()
             return
-        accounts = self._mode_allowed_accounts()
-        if not accounts:
+        all_accounts = self._mode_allowed_accounts()
+        if not all_accounts:
             messagebox.showwarning("无账号", "请先读取收藏夹。")
+            return
+        accounts, skipped_accounts = _split_all_serial_accounts(all_accounts)
+        if accounts:
+            self._log("本次全部串行将执行：")
+            for group_name, count in self._account_group_counts(accounts):
+                self._log(f"{group_name} {count} 个")
+        if skipped_accounts:
+            self._log("本次全部串行将跳过：")
+            for group_name, count in self._account_group_counts(skipped_accounts):
+                self._log(f"{group_name} {count} 个")
+        if not accounts:
+            message = "未配置任何参与全部串行的分组，请先打开“全部串行分组设置”。"
+            self._log(f"阻止全部串行：{message}")
+            messagebox.showwarning("全部串行未配置", message)
+            return
+        invalid_accounts = [account for account in accounts if not account.include_in_all]
+        if invalid_accounts:
+            invalid_summary = self._account_count_summary(invalid_accounts)
+            message = "检测到未启用分组混入全部串行，已阻止运行。"
+            self._log(f"阻止全部串行：{message}{invalid_summary}")
+            messagebox.showwarning("全部串行分组异常", message)
             return
         if not self._validate_accounts_for_current_mode(accounts):
             return
@@ -2965,8 +3421,7 @@ else:
     def _set_status(self, account: AccountConfig, status: str) -> None:
         self.status_by_key[account.key] = status
         if self.tree.exists(account.key):
-            values = list(self.tree.item(account.key, "values"))
-            values[5] = status
+            values = _replace_account_table_value(self.tree.item(account.key, "values"), "status", status)
             # 颜色标签
             tag = ""
             if "成功" in status:
@@ -2984,15 +3439,13 @@ else:
     def _set_passport(self, account: AccountConfig, passport: str) -> None:
         self.passport_by_key[account.key] = passport
         if self.tree.exists(account.key):
-            values = list(self.tree.item(account.key, "values"))
-            values[3] = passport
+            values = _replace_account_table_value(self.tree.item(account.key, "values"), "passport", passport)
             self.tree.item(account.key, values=values)
 
     def _set_timing(self, account: AccountConfig, timing: str) -> None:
         self.timing_by_key[account.key] = timing
         if self.tree.exists(account.key):
-            values = list(self.tree.item(account.key, "values"))
-            values[6] = timing
+            values = _replace_account_table_value(self.tree.item(account.key, "values"), "timing", timing)
             self.tree.item(account.key, values=values)
 
     def _log(self, message: str) -> None:

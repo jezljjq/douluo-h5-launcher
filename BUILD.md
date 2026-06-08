@@ -158,6 +158,25 @@ pyinstaller --onedir --noconsole --name "Launcher" ^
 
 确认 exe 运行目录与 `automation_settings.json` 在同一目录。
 
+### exe 模式收藏夹路径
+
+`automation_settings.json` 中的 `bookmark_file` 是用户保存的收藏夹路径。当前默认浏览器为 Edge；没有保存路径时才使用 `Edge Default` Bookmarks。Chrome Bookmarks 只能作为候选提示，不能因为文件存在就静默覆盖用户配置。
+
+打包后 exe 读取的是 `dist\Launcher\automation_settings.json`，不应回退到源码目录配置，也不应写入默认 Chrome 路径。发布包中的默认配置当前记录：
+
+```text
+bookmark_browser=Edge
+bookmark_profile=Default
+bookmark_file=C:\Users\Administrator\AppData\Local\Microsoft\Edge\User Data\Default\Bookmarks
+```
+
+`automation_settings.json` 还保存 `account_group_settings`，用于控制哪些收藏夹分组参与“全部串行”。该字段只影响运行范围，不改变收藏夹读取结果：
+
+- `层级=全部` 仍可显示全部已读取账号。
+- `全部串行` 只运行 `include_in_all=true` 的分组。
+- 新发现分组默认不参与全部串行。
+- 发布包可以带默认配置结构，但不要把真实账号 CSV、个人运行日志、`window_slots.json` 或 `slots/` 槽位快照打进发布包。
+
 ### 串行批量模式不工作
 
 如果在源码模式下运行，请确认从项目根目录启动：`cd D:\Ai\codex\上号器 && python main.py`。

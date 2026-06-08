@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import json
 import math
 import re
@@ -212,6 +213,7 @@ class SlotEnvironment:
 @dataclass(frozen=True)
 class SlotLayoutParams:
     mode: str = "fixed"
+    target_window_count: Optional[int] = None
     window_width: Optional[int] = None
     window_height: Optional[int] = None
     per_row: Optional[int] = None
@@ -220,6 +222,7 @@ class SlotLayoutParams:
     offset_x: Optional[int] = None
     offset_y: Optional[int] = None
     title_template: str = ""
+    profile_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -339,9 +342,12 @@ def layout_params_from_tile_config(
     config: TileConfig | RowTileConfig,
     title_template: Optional[str] = None,
     mode: str = "fixed",
+    target_window_count: Optional[int] = None,
+    profile_name: str = "",
 ) -> SlotLayoutParams:
     return SlotLayoutParams(
         mode=mode,
+        target_window_count=int(target_window_count) if target_window_count is not None else None,
         window_width=config.width if isinstance(config.width, int) else None,
         window_height=config.height if isinstance(config.height, int) else None,
         per_row=int(config.per_row),
@@ -350,6 +356,7 @@ def layout_params_from_tile_config(
         offset_x=int(config.offset_x) if isinstance(config, TileConfig) else None,
         offset_y=int(config.offset_y) if isinstance(config, TileConfig) else None,
         title_template=str(title_template or ""),
+        profile_name=str(profile_name or ""),
     )
 
 
@@ -366,6 +373,7 @@ def _environment_payload(environment: SlotEnvironment) -> dict[str, object]:
 def _layout_params_payload(layout_params: SlotLayoutParams) -> dict[str, object]:
     return {
         "mode": layout_params.mode,
+        "target_window_count": layout_params.target_window_count,
         "window_width": layout_params.window_width,
         "window_height": layout_params.window_height,
         "per_row": layout_params.per_row,
@@ -374,6 +382,7 @@ def _layout_params_payload(layout_params: SlotLayoutParams) -> dict[str, object]
         "offset_x": layout_params.offset_x,
         "offset_y": layout_params.offset_y,
         "title_template": layout_params.title_template,
+        "profile_name": layout_params.profile_name,
     }
 
 
@@ -415,6 +424,7 @@ def _layout_params_from_mapping(data: object) -> Optional[SlotLayoutParams]:
         return None
     return SlotLayoutParams(
         mode=str(data.get("mode") or "fixed"),
+        target_window_count=_optional_int(data.get("target_window_count")),
         window_width=_optional_int(data.get("window_width")),
         window_height=_optional_int(data.get("window_height")),
         per_row=_optional_int(data.get("per_row")),
@@ -423,7 +433,40 @@ def _layout_params_from_mapping(data: object) -> Optional[SlotLayoutParams]:
         offset_x=_optional_int(data.get("offset_x")),
         offset_y=_optional_int(data.get("offset_y")),
         title_template=str(data.get("title_template") or ""),
+        profile_name=str(data.get("profile_name") or ""),
     )
+
+
+def _safe_profile_part(value: object, fallback: str = "unknown") -> str:
+    text = str(value or "").strip() or fallback
+    text = re.sub(r"[^0-9A-Za-z_-]+", "_", text)
+    return text.strip("_")[:80] or fallback
+
+
+def slot_profile_name(
+    layout_params: SlotLayoutParams,
+    environment: Optional[SlotEnvironment] = None,
+) -> str:
+    env = environment or get_current_slot_environment()
+    count = layout_params.target_window_count if layout_params.target_window_count is not None else "unknown"
+    mode = _safe_profile_part(layout_params.mode)
+    readable = f"{env.profile}_{count}_{mode}"
+    digest_payload = {
+        "environment": _environment_payload(env),
+        "layout_params": _layout_params_payload(layout_params),
+    }
+    digest = hashlib.sha1(
+        json.dumps(digest_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:8]
+    return f"{_safe_profile_part(readable)}_{digest}"
+
+
+def window_slots_profile_path(
+    root_dir: str | Path,
+    layout_params: SlotLayoutParams,
+    environment: Optional[SlotEnvironment] = None,
+) -> Path:
+    return Path(root_dir) / "slots" / f"{slot_profile_name(layout_params, environment=environment)}.json"
 
 
 def _is_window_cloaked(hwnd: int) -> bool:
@@ -615,6 +658,7 @@ def _read_slot_payload(slots_path: str | Path) -> dict[str, object]:
 
 def _write_slot_payload(slots_path: str | Path, data: dict[str, object]) -> None:
     path = Path(slots_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -650,9 +694,14 @@ def has_valid_window_slots(slots_path: str | Path = "window_slots.json") -> bool
 def check_window_slots_compatibility(
     slots_path: str | Path = "window_slots.json",
     current_layout_params: Optional[SlotLayoutParams] = None,
+    current_window_count: Optional[int] = None,
 ) -> SlotCompatibilityResult:
     current_environment = get_current_slot_environment()
     slot_environment, slot_layout_params = load_window_slot_metadata(slots_path)
+    try:
+        slot_count = len(load_window_slots(slots_path))
+    except Exception:
+        slot_count = 0
     warnings: List[str] = []
 
     if slot_environment is None:
@@ -677,6 +726,7 @@ def check_window_slots_compatibility(
         else:
             checks = [
                 ("mode", "排列方式"),
+                ("target_window_count", "目标窗口数量"),
                 ("window_width", "窗口宽度"),
                 ("window_height", "窗口高度"),
                 ("per_row", "每行数量"),
@@ -691,6 +741,21 @@ def check_window_slots_compatibility(
                 slot_value = getattr(slot_layout_params, attr)
                 if current_value != slot_value:
                     warnings.append(f"{label}变化：槽位={slot_value} 当前={current_value}")
+
+        if current_layout_params.target_window_count is not None and slot_count:
+            if int(current_layout_params.target_window_count) != slot_count:
+                warnings.append(
+                    f"槽位数量变化：槽位文件={slot_count} 当前目标={current_layout_params.target_window_count}"
+                )
+
+    if current_window_count is not None and slot_count:
+        if int(current_window_count) != slot_count:
+            warnings.append(f"当前窗口数量变化：槽位文件={slot_count} 当前识别={current_window_count}")
+
+    if current_window_count is not None and current_layout_params is not None:
+        target_count = current_layout_params.target_window_count
+        if target_count is not None and int(current_window_count) != int(target_count):
+            warnings.append(f"当前窗口数量与UI打开数量不一致：当前识别={current_window_count} UI目标={target_count}")
 
     return SlotCompatibilityResult(
         compatible=not warnings,
@@ -865,7 +930,9 @@ def save_current_windows_as_slots(
         environment=environment,
         layout_params=layout_params,
     )
-    Path(slots_path).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    path = Path(slots_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     return sorted(slots, key=lambda item: item.slot_no)
 
 

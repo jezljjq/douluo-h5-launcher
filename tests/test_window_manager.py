@@ -1,3 +1,4 @@
+import json
 import sys
 import tempfile
 import unittest
@@ -22,6 +23,7 @@ from douluo_launcher.window_manager import (  # noqa: E402
     load_window_slots,
     save_current_windows_as_slots,
     sort_game_windows,
+    window_slots_profile_path,
 )
 
 
@@ -220,6 +222,102 @@ class WindowManagerTests(unittest.TestCase):
 
         self.assertFalse(result.compatible)
         self.assertTrue(any("每行数量变化" in warning for warning in result.warnings))
+
+    def test_profile_slot_path_separates_window_count_and_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            environment = SlotEnvironment(2560, 1440, 96, 1.0, "2560x1440_100")
+            fixed_31 = layout_params_from_tile_config(
+                TileConfig(width=320, height=540, start_x=250, start_y=0, offset_x=320, offset_y=525, per_row=8),
+                title_template="斗罗大陆H5-{index}号",
+                mode="fixed",
+                target_window_count=31,
+            )
+            fixed_9 = layout_params_from_tile_config(
+                TileConfig(width=320, height=540, start_x=250, start_y=0, offset_x=320, offset_y=525, per_row=8),
+                title_template="斗罗大陆H5-{index}号",
+                mode="fixed",
+                target_window_count=9,
+            )
+            row_9 = SlotLayoutParams(
+                mode="row_count",
+                target_window_count=9,
+                window_width=768,
+                window_height=1056,
+                per_row=5,
+                start_x=0,
+                start_y=0,
+                title_template="斗罗大陆H5-{index}号",
+            )
+
+            fixed_31_path = window_slots_profile_path(tmp, fixed_31, environment=environment)
+            fixed_9_path = window_slots_profile_path(tmp, fixed_9, environment=environment)
+            row_9_path = window_slots_profile_path(tmp, row_9, environment=environment)
+
+        self.assertNotEqual(fixed_31_path, fixed_9_path)
+        self.assertNotEqual(fixed_31_path, row_9_path)
+        self.assertIn("2560x1440_100_31_fixed", fixed_31_path.name)
+        self.assertIn("2560x1440_100_9_row_count", row_9_path.name)
+
+    def test_check_window_slots_compatibility_blocks_slot_count_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "window_slots.json"
+            slots = {
+                str(index): {
+                    "slot_no": index,
+                    "title": f"斗罗大陆H5-{index}号",
+                    "hwnd": 1000 + index,
+                    "x": 250 + (index - 1) * 320,
+                    "y": 0,
+                    "width": 320,
+                    "height": 540,
+                }
+                for index in range(1, 10)
+            }
+            payload = {
+                "version": 1,
+                "environment": {
+                    "screen_width": 2560,
+                    "screen_height": 1440,
+                    "dpi": 96,
+                    "scale": 1.0,
+                    "profile": "2560x1440_100",
+                },
+                "layout_params": {
+                    "mode": "row_count",
+                    "target_window_count": 9,
+                    "window_width": 768,
+                    "window_height": 1056,
+                    "per_row": 5,
+                    "start_x": 0,
+                    "start_y": 0,
+                    "offset_x": None,
+                    "offset_y": None,
+                    "title_template": "斗罗大陆H5-{index}号",
+                },
+                "slots": slots,
+            }
+            path.write_text(
+                json.dumps(payload, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            current = layout_params_from_tile_config(
+                TileConfig(width=320, height=540, start_x=250, start_y=0, offset_x=320, offset_y=525, per_row=8),
+                title_template="斗罗大陆H5-{index}号",
+                mode="fixed",
+                target_window_count=31,
+            )
+
+            with mock.patch(
+                "douluo_launcher.window_manager.get_current_slot_environment",
+                return_value=SlotEnvironment(2560, 1440, 96, 1.0, "2560x1440_100"),
+            ):
+                result = check_window_slots_compatibility(path, current, current_window_count=31)
+
+        self.assertFalse(result.compatible)
+        self.assertTrue(any("排列方式变化" in warning for warning in result.warnings))
+        self.assertTrue(any("目标窗口数量变化" in warning for warning in result.warnings))
+        self.assertTrue(any("槽位数量变化" in warning for warning in result.warnings))
+        self.assertTrue(any("当前窗口数量变化" in warning for warning in result.warnings))
 
     def test_save_current_windows_as_slots_writes_environment_and_layout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

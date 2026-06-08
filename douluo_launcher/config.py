@@ -4,7 +4,7 @@ import csv
 import json
 import os
 import sys
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Iterable
 
@@ -49,6 +49,9 @@ class AccountConfig:
     bookmark_no: int
     game_window_no: int
     url: str
+    bookmark_title: str = ""
+    order_index: int = 0
+    include_in_all: bool = False
 
     @property
     def key(self) -> str:
@@ -56,7 +59,16 @@ class AccountConfig:
 
     @property
     def display_name(self) -> str:
-        return f"{self.level}-{self.bookmark_no} → 窗口{self.game_window_no}"
+        title = self.bookmark_title or str(self.bookmark_no)
+        return f"{self.level}-{title} → 窗口{self.game_window_no}"
+
+    @property
+    def group_name(self) -> str:
+        return self.level
+
+    @property
+    def window_no(self) -> int:
+        return self.game_window_no
 
 
 @dataclass
@@ -90,7 +102,16 @@ class CSVAccount:
 @dataclass(frozen=True)
 class AutomationSettings:
     bookmark_file: str = ""
+    bookmark_browser: str = ""
+    bookmark_profile: str = ""
     bookmark_root_name: str = "账号"
+    account_group_settings: dict[str, dict[str, bool]] = field(default_factory=lambda: {
+        SINGLE_LEVEL_NAME: {"include_in_all": True},
+        "第一层": {"include_in_all": True},
+        "第二层": {"include_in_all": True},
+        "第三层": {"include_in_all": True},
+        "第四层": {"include_in_all": True},
+    })
     log_level: str = "normal"
     level_names: tuple[str, str, str, str] = ("第一层", "第二层", "第三层", "第四层")
     browser: str = "chromium"
@@ -206,6 +227,7 @@ def load_accounts_from_bookmarks(
     root_name: str,
     level_names: Iterable[str] = LEVELS,
     level_counts: dict[str, int] | None = None,
+    account_group_settings: dict[str, dict[str, bool]] | None = None,
     log=None,
 ) -> list[AccountConfig]:
     path = Path(bookmark_file)
@@ -217,61 +239,218 @@ def load_accounts_from_bookmarks(
 
     root_folder = _find_bookmark_folder(data, root_name)
     if root_folder is None:
-        raise ValueError(f"收藏夹里找不到根目录: {root_name}")
+        top_level = list_bookmark_top_level_dirs(path)
+        top_level_text = "，".join(top_level) if top_level else "未检测到一级目录"
+        raise ValueError(
+            f"收藏夹里找不到根目录: {root_name}。"
+            f"当前读取路径: {path}。"
+            f"检测到的一级目录: {top_level_text}"
+        )
 
     level_order = tuple(level_names)
     counts = _normalize_level_counts(level_counts, level_order)
     accounts: list[AccountConfig] = []
-    accounts.extend(_load_single_level_accounts(root_folder, log=log))
+    accounts.extend(_load_single_level_accounts(root_folder, log=log, group_settings=account_group_settings))
 
-    for level in level_order:
-        level_folder = _find_direct_child_folder(root_folder, level)
-        if level_folder is None:
-            if log:
-                log(f"收藏夹层级不存在，已跳过：{level}")
+    for child in root_folder.get("children", []):
+        if not isinstance(child, dict) or child.get("type") != "folder":
             continue
-        children_by_no: dict[int, dict[str, object]] = {}
-        for child in level_folder.get("children", []):
-            if not isinstance(child, dict) or child.get("type") != "url":
-                continue
-            bookmark_no = _parse_bookmark_no(str(child.get("name", "")).strip(), counts[level])
-            if bookmark_no is None:
-                if log:
-                    log(f"{level} 非数字或超范围收藏项已跳过：{child.get('name', '')}")
-                continue
-            children_by_no[bookmark_no] = child
+        group_name = str(child.get("name", "")).strip()
+        if not group_name:
+            continue
+        group_accounts = _load_group_accounts(
+            child,
+            group_name=group_name,
+            counts=counts,
+            level_order=level_order,
+            group_settings=account_group_settings,
+            log=log,
+        )
+        if group_accounts:
+            accounts.extend(group_accounts)
+            if log:
+                if group_name not in DEFAULT_LEVEL_COUNTS and not _group_include_in_all(group_name, account_group_settings):
+                    log(f"发现新分组 {group_name}，默认不参与全部串行。")
+                log(f"分组：{group_name} {len(group_accounts)} 个")
+        elif log:
+            log(f"分组 {group_name} 未发现有效账号链接，已跳过。")
 
-        for bookmark_no in range(1, counts[level] + 1):
-            child = children_by_no.get(bookmark_no)
-            if child is None:
-                if log:
-                    log(f"{level} 收藏编号 {bookmark_no} 不存在，已跳过。")
+    if log:
+        single_count = sum(1 for account in accounts if account.level == SINGLE_LEVEL_NAME)
+        log(f"读取收藏夹完成：根目录名={root_name}")
+        log(f"{SINGLE_LEVEL_NAME}：{single_count} 个")
+        group_counts: dict[str, int] = {}
+        for account in accounts:
+            if account.level == SINGLE_LEVEL_NAME:
                 continue
-            accounts.append(
-                AccountConfig(
-                    level=level,
-                    bookmark_no=bookmark_no,
-                    game_window_no=compute_game_window_no(level, bookmark_no, counts, level_order),
-                    url=str(child.get("url", "")).strip(),
-                )
-            )
+            group_counts[account.level] = group_counts.get(account.level, 0) + 1
+        for group_name, count in group_counts.items():
+            log(f"分组：{group_name} {count} 个")
 
-    accounts.sort(key=lambda account: account.game_window_no)
     return accounts
 
 
-def find_default_bookmark_file() -> str:
+def _load_group_accounts(
+    folder: dict[str, object],
+    group_name: str,
+    counts: dict[str, int],
+    level_order: Iterable[str],
+    group_settings: dict[str, dict[str, bool]] | None = None,
+    log=None,
+) -> list[AccountConfig]:
+    accounts: list[AccountConfig] = []
+    order_index = 0
+    is_standard_level = group_name in LEVELS
+    for child in folder.get("children", []):
+        if not isinstance(child, dict):
+            continue
+        if child.get("type") != "url":
+            continue
+        title = str(child.get("name", "")).strip()
+        url = str(child.get("url", "")).strip()
+        if not _is_valid_account_url(url):
+            if log:
+                log(f"{group_name} 非账号链接已跳过：{title}")
+            continue
+
+        order_index += 1
+        if is_standard_level:
+            bookmark_no = _parse_bookmark_no(title, counts.get(group_name))
+            if bookmark_no is None:
+                if log:
+                    log(f"{group_name} 非数字或超范围收藏项已跳过：{title}")
+                continue
+            game_window_no = compute_game_window_no(group_name, bookmark_no, counts, level_order)
+        else:
+            bookmark_no = order_index
+            game_window_no = order_index
+
+        accounts.append(
+            AccountConfig(
+                level=group_name,
+                bookmark_no=bookmark_no,
+                game_window_no=game_window_no,
+                url=url,
+                bookmark_title=title,
+                order_index=order_index,
+                include_in_all=_group_include_in_all(group_name, group_settings),
+            )
+        )
+    return accounts
+
+
+def _group_include_in_all(
+    group_name: str,
+    group_settings: dict[str, dict[str, bool]] | None = None,
+) -> bool:
+    if group_settings and group_name in group_settings:
+        value = group_settings[group_name]
+        if isinstance(value, dict):
+            return bool(value.get("include_in_all", False))
+    defaults = AutomationSettings().account_group_settings
+    if group_name in defaults:
+        return bool(defaults[group_name].get("include_in_all", False))
+    return False
+
+
+def _is_valid_account_url(url: str) -> bool:
+    return bool(url.strip())
+
+
+@dataclass(frozen=True)
+class BookmarkCandidate:
+    browser: str
+    profile: str
+    path: str
+
+
+def find_bookmark_file_candidates() -> list[BookmarkCandidate]:
     local_app_data = os.environ.get("LOCALAPPDATA", "")
-    candidates = [
-        Path(local_app_data) / "Google" / "Chrome" / "User Data" / "Default" / "Bookmarks",
-        Path(local_app_data) / "Microsoft" / "Edge" / "User Data" / "Default" / "Bookmarks",
-        Path(local_app_data) / "Google" / "Chrome" / "User Data" / "Profile 1" / "Bookmarks",
-        Path(local_app_data) / "Microsoft" / "Edge" / "User Data" / "Profile 1" / "Bookmarks",
+    candidate_specs = [
+        ("Edge", "Default", Path(local_app_data) / "Microsoft" / "Edge" / "User Data" / "Default" / "Bookmarks"),
+        ("Chrome", "Default", Path(local_app_data) / "Google" / "Chrome" / "User Data" / "Default" / "Bookmarks"),
+        ("Edge", "Profile 1", Path(local_app_data) / "Microsoft" / "Edge" / "User Data" / "Profile 1" / "Bookmarks"),
+        ("Chrome", "Profile 1", Path(local_app_data) / "Google" / "Chrome" / "User Data" / "Profile 1" / "Bookmarks"),
     ]
-    for candidate in candidates:
-        if candidate.exists():
-            return str(candidate)
+    candidates: list[BookmarkCandidate] = []
+    for browser, profile, path in candidate_specs:
+        if path.exists():
+            candidates.append(BookmarkCandidate(browser=browser, profile=profile, path=str(path)))
+    return candidates
+
+
+def find_default_bookmark_file() -> str:
+    """返回第一个可用候选，仅用于兼容旧调用；GUI 不应直接用它覆盖用户配置。"""
+    candidates = find_bookmark_file_candidates()
+    if candidates:
+        return candidates[0].path
     return ""
+
+
+def find_preferred_bookmark_file(browser: str = "Edge", profile: str = "Default") -> str:
+    preferred_browser = browser.strip().lower()
+    preferred_profile = profile.strip().lower()
+    for candidate in find_bookmark_file_candidates():
+        if (
+            candidate.browser.strip().lower() == preferred_browser
+            and candidate.profile.strip().lower() == preferred_profile
+        ):
+            return candidate.path
+    for candidate in find_bookmark_file_candidates():
+        if candidate.browser.strip().lower() == preferred_browser:
+            return candidate.path
+    return ""
+
+
+def describe_bookmark_file(path: str | Path) -> BookmarkCandidate:
+    bookmark_path = Path(path)
+    parts = list(bookmark_path.parts)
+    lowered = [part.lower() for part in parts]
+    browser = "自定义"
+    if "microsoft" in lowered and "edge" in lowered:
+        browser = "Edge"
+    elif "google" in lowered and "chrome" in lowered:
+        browser = "Chrome"
+
+    profile = ""
+    try:
+        user_data_index = lowered.index("user data")
+        if user_data_index + 1 < len(parts):
+            profile = parts[user_data_index + 1]
+    except ValueError:
+        profile = ""
+
+    return BookmarkCandidate(browser=browser, profile=profile, path=str(bookmark_path))
+
+
+def list_bookmark_top_level_dirs(path: str | Path) -> list[str]:
+    bookmark_path = Path(path)
+    if not bookmark_path.exists():
+        return []
+    try:
+        with bookmark_path.open("r", encoding="utf-8") as file:
+            data = json.load(file)
+    except Exception:
+        return []
+
+    roots = data.get("roots") if isinstance(data, dict) else None
+    if not isinstance(roots, dict):
+        return []
+
+    names: list[str] = []
+    for root in roots.values():
+        if not isinstance(root, dict):
+            continue
+        root_name = str(root.get("name", "")).strip()
+        if root_name:
+            names.append(root_name)
+        for child in root.get("children", []):
+            if not isinstance(child, dict) or child.get("type") != "folder":
+                continue
+            child_name = str(child.get("name", "")).strip()
+            if child_name:
+                names.append(f"{root_name}/{child_name}" if root_name else child_name)
+    return names
 
 
 def load_settings(path: str | Path) -> AutomationSettings:
@@ -304,11 +483,33 @@ def load_settings(path: str | Path) -> AutomationSettings:
             normalized[key] = _normalize_region_ratio(value, key) if key.endswith("_region_ratio") else _normalize_ratio(value, key)
         elif key == "level_names":
             normalized[key] = tuple(str(item) for item in value)
+        elif key == "account_group_settings":
+            normalized[key] = _normalize_account_group_settings(value)
         elif key in ("login_state_roi", "passport_btn_region", "passport_btn_viewport", "notice_close_viewport"):
             normalized[key] = tuple(int(item) for item in value)
         else:
             normalized[key] = value
     return AutomationSettings(**normalized)
+
+
+def _normalize_account_group_settings(value: object) -> dict[str, dict[str, bool]]:
+    settings = {
+        group_name: {"include_in_all": bool(group_setting.get("include_in_all", False))}
+        for group_name, group_setting in AutomationSettings().account_group_settings.items()
+    }
+    if not isinstance(value, dict):
+        return settings
+    for raw_group_name, raw_group_setting in value.items():
+        group_name = str(raw_group_name).strip()
+        if not group_name:
+            continue
+        include_in_all = False
+        if isinstance(raw_group_setting, dict):
+            include_in_all = bool(raw_group_setting.get("include_in_all", False))
+        elif isinstance(raw_group_setting, bool):
+            include_in_all = raw_group_setting
+        settings[group_name] = {"include_in_all": include_in_all}
+    return settings
 
 
 def filter_accounts(accounts: Iterable[AccountConfig], level: str) -> list[AccountConfig]:
@@ -354,6 +555,9 @@ def _row_to_account(row: dict[str, object]) -> AccountConfig:
         bookmark_no=bookmark_no,
         game_window_no=expected_window,
         url=url,
+        bookmark_title=str(bookmark_no),
+        order_index=bookmark_no,
+        include_in_all=_group_include_in_all(level),
     )
 
 
@@ -419,8 +623,13 @@ def _find_direct_child_folder(parent: dict[str, object], folder_name: str) -> di
     return None
 
 
-def _load_single_level_accounts(root_folder: dict[str, object], log=None) -> list[AccountConfig]:
+def _load_single_level_accounts(
+    root_folder: dict[str, object],
+    log=None,
+    group_settings: dict[str, dict[str, bool]] | None = None,
+) -> list[AccountConfig]:
     accounts: list[AccountConfig] = []
+    order_index = 0
     for child in root_folder.get("children", []):
         if not isinstance(child, dict):
             continue
@@ -434,12 +643,21 @@ def _load_single_level_accounts(root_folder: dict[str, object], log=None) -> lis
             if log:
                 log(f"单层账号非数字收藏项已跳过：{name}")
             continue
+        url = str(child.get("url", "")).strip()
+        if not _is_valid_account_url(url):
+            if log:
+                log(f"单层账号无效链接已跳过：{name}")
+            continue
+        order_index += 1
         accounts.append(
             AccountConfig(
                 level=SINGLE_LEVEL_NAME,
                 bookmark_no=bookmark_no,
                 game_window_no=bookmark_no,
-                url=str(child.get("url", "")).strip(),
+                url=url,
+                bookmark_title=name,
+                order_index=order_index,
+                include_in_all=_group_include_in_all(SINGLE_LEVEL_NAME, group_settings),
             )
         )
     return sorted(accounts, key=lambda account: account.bookmark_no)

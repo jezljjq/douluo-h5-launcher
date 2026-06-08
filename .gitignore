@@ -49,6 +49,7 @@ credentials*
 大号游戏账号.csv
 window_manager_settings.json
 window_slots.json
+slots/
 automation_settings.json
 debug_ocr/m2_browser_screenshot.png
 csv_last_path.txt

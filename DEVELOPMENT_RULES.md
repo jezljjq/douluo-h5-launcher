@@ -125,6 +125,21 @@ UI 美化不得影响核心流程。
 - 全部 H5 窗口关闭后重新批量启动时，必须按当前 `window_manager_settings.json` 重新生成槽位，禁止沿用旧 `hwnd` 快照。
 - `window_slots.json` 是本地运行状态文件，不提交 Git，不进入发布包。
 - 禁止写死窗口坐标、编号、分辨率、DPI、缩放比例、窗口数量、路径或槽位号。
+- 收藏夹路径是用户配置，不是自动推断结果；启动时必须优先读取 `automation_settings.json` 中上次保存的 `bookmark_file`。
+- 当前默认浏览器为 Edge；没有保存路径时，才允许使用 `Edge Default` 作为默认收藏夹路径。
+- Chrome / Edge 自动探测只能作为候选提示，禁止因为 Chrome Bookmarks 存在就静默覆盖 Edge 或用户保存路径。
+- 保存配置时必须保留 `bookmark_file`、`bookmark_browser`、`bookmark_profile`。
+- 读取收藏夹失败时必须记录当前 Bookmarks 路径和检测到的一级目录。
+- exe 模式必须读取 exe 同级 `automation_settings.json`，不能用源码配置或默认 Chrome 路径覆盖用户配置。
+- 收藏夹账号根目录固定为用户配置的 `bookmark_root_name`，默认 `账号`；层级下拉必须动态读取该目录下真实存在的分组，禁止写死第一层到第四层作为唯一来源。
+- 根目录下纯数字收藏项作为 `单层账号`；根目录下非数字收藏项必须跳过并记录日志。
+- 自定义分组内账号标题不要求纯数字，必须按收藏夹原始顺序读取和映射窗口，禁止强行数字排序。
+- `层级=全部` 只用于账号列表显示；`全部串行` 必须重新按 `account_group_settings` 过滤，只执行 `include_in_all=true` 的分组。
+- 新发现分组默认 `include_in_all=false`，禁止自动加入全部串行。
+- 未勾选分组仍必须允许 `当前层串行` 和 `单账号运行`。
+- 方式一账号表列顺序统一为：`层级 / 收藏编号 / 窗口号 / 参与全部串行 / 本次通行证 / 链接 / 状态 / 耗时`。
+- 更新账号表时必须使用统一列定义或列名索引，禁止用旧硬编码下标把通行证、状态、耗时写入错误列。
+- UI 表格只能作为展示层，禁止把 Treeview values 下标作为上号业务数据源。
 
 ## 8. `subprocess.Popen` monkey-patch 规则
 
