@@ -1557,7 +1557,10 @@ class LauncherApp(tk.Tk):
         script = r"""
 $selfPid = $PID
 $procs = Get-CimInstance Win32_Process | Where-Object {
-    $_.ProcessId -ne $selfPid -and $_.CommandLine -like '*dm_click_helper.py*'
+    $_.ProcessId -ne $selfPid -and (
+        $_.CommandLine -like '*dm_click_helper.py*' -or
+        $_.CommandLine -like '*dm_click_helper.exe*'
+    )
 }
 $count = 0
 foreach ($p in $procs) {
@@ -1581,12 +1584,12 @@ Write-Output $count
             )
             output = (result.stdout or "").strip().splitlines()
             count = int(output[-1]) if output else 0
-            self._log(f"已清理 dm_click_helper.py 子进程 {count} 个。")
+            self._log(f"已清理 dm_click_helper 子进程 {count} 个。")
             if result.stderr:
-                self._write_file_log(f"清理 dm_click_helper.py stderr: {result.stderr.strip()[:500]}")
+                self._write_file_log(f"清理 dm_click_helper stderr: {result.stderr.strip()[:500]}")
             return count
         except Exception as exc:
-            self._log(f"清理 dm_click_helper.py 子进程失败：{exc}")
+            self._log(f"清理 dm_click_helper 子进程失败：{exc}")
             return 0
 
     def _cleanup_chromium_processes(self) -> None:

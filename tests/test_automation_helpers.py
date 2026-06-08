@@ -1,11 +1,15 @@
 import threading
+import tempfile
 import unittest
 from unittest.mock import patch
+from pathlib import Path
 
 from PIL import Image
 
+import douluo_launcher.automation as automation_module
 from douluo_launcher.automation import (
     AccountRunner,
+    _dm_helper_command,
     _ensure_playwright_browsers_path,
     extract_hex_passport,
     extract_passport_from_text,
@@ -41,6 +45,50 @@ class AutomationHelperTests(unittest.TestCase):
             expected = _ensure_playwright_browsers_path()
             self.assertIsNotNone(expected)
             self.assertEqual(str(expected), r"C:\Users\Test\AppData\Local\ms-playwright")
+
+    def test_packaged_playwright_browser_path_prefers_bundled_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            exe_dir = Path(temp_dir) / "Launcher"
+            browser_dir = exe_dir / "ms-playwright"
+            chrome = browser_dir / "chromium-9999" / "chrome-win64" / "chrome.exe"
+            chrome.parent.mkdir(parents=True)
+            chrome.write_text("", encoding="utf-8")
+            exe_path = exe_dir / "上号器.exe"
+            exe_path.write_text("", encoding="utf-8")
+
+            with patch.dict(
+                "os.environ",
+                {
+                    "LOCALAPPDATA": r"C:\Users\Test\AppData\Local",
+                    "PLAYWRIGHT_BROWSERS_PATH": r"C:\Users\Test\AppData\Local\ms-playwright",
+                },
+                clear=False,
+            ), patch.object(automation_module.sys, "frozen", True, create=True), patch.object(
+                automation_module.sys, "executable", str(exe_path)
+            ):
+                expected = _ensure_playwright_browsers_path()
+
+            self.assertEqual(expected.resolve(), browser_dir.resolve())
+
+    def test_dm_helper_command_prefers_bundled_exe(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            helper_exe = root / "dm_click_helper.exe"
+            helper_exe.write_text("", encoding="utf-8")
+
+            with patch("douluo_launcher.automation.app_root", return_value=root):
+                command = _dm_helper_command("chain", "click:1,2")
+
+        self.assertEqual(command, [str(helper_exe), "chain", "click:1,2"])
+
+    def test_dm_helper_command_falls_back_to_32bit_python(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+
+            with patch("douluo_launcher.automation.app_root", return_value=root):
+                command = _dm_helper_command("type", "abc")
+
+        self.assertEqual(command, ["py", "-3.14-32", str(root / "dm_click_helper.py"), "type", "abc"])
 
     def test_fast_submit_treats_retry_logged_in_as_success(self) -> None:
         account = AccountConfig(level="单层账号", bookmark_no=1, game_window_no=1, url="https://example.com")

@@ -93,13 +93,37 @@ scripts\build_exe.bat
 
 ### Playwright 浏览器策略
 
-当前发布包使用用户级 Playwright 浏览器缓存：
+当前发布包必须内置 Playwright Chromium：
 
 ```text
-%LOCALAPPDATA%\ms-playwright
+dist\Launcher\ms-playwright\chromium-*\chrome-win64\chrome.exe
 ```
 
-不要让 exe 依赖不存在的 `_internal\.local-browsers`。如果本机没有 Chromium 缓存，打包脚本应执行 `python -m playwright install chromium` 后再继续。
+打包脚本只在打包机器读取 `%LOCALAPPDATA%\ms-playwright` 作为源目录，并复制到 `dist\Launcher\ms-playwright`。目标机器不需要安装 Python、pip、Playwright 或 Chromium，也不应该执行 `python -m playwright install chromium`。
+
+如果打包机器缺少 Chromium 缓存，脚本必须失败并提示先在打包机器执行：
+
+```powershell
+python -m playwright install chromium
+```
+
+exe 运行时优先设置：
+
+```text
+PLAYWRIGHT_BROWSERS_PATH=<exe所在目录>\ms-playwright
+```
+
+禁止让 exe 依赖不存在的 `_internal\.local-browsers`，也禁止依赖固定用户目录如 `C:\Users\Administrator` 或 `C:\Users\34910`。
+
+### Dm helper 策略
+
+当前发布包必须内置 32 位 `dm_click_helper.exe`：
+
+```text
+dist\Launcher\dm_click_helper.exe
+```
+
+打包脚本在打包机器使用 `py -3.14-32 -m PyInstaller` 生成该 helper。目标机器不需要安装 Python 或 32 位 Python；但大漠 COM 仍必须在目标机器可用。源码模式仍保留 `dm_click_helper.py` 作为开发回退。
 
 ---
 
@@ -134,6 +158,9 @@ dist\Launcher\
 以下文件应放在 exe 同级目录，或按项目约定复制到 dist 对应目录：
 
 * automation_settings.json
+* dm_click_helper.exe
+* dm_click_helper.py
+* ms-playwright\
 * debug_ocr\template_passport_btn.png
 * README.md
 * RUN_MODE.md
@@ -159,9 +186,12 @@ dist\Launcher\
 * logs\
 * debug_ocr\_tmp\
 * debug_ocr\history\
+* window_slots.json
+* slots\
 * build\
 * __pycache__\
 * *.pyc
+* *.log
 * .venv\
 * venv\
 * 真实账号密码 CSV
@@ -184,7 +214,8 @@ dist\Launcher\
 7. 是否能创建 logs 目录。
 8. 是否能创建 debug_ocr\_tmp 目录。
 9. 单账号流程是否能正常启动。
-10. 32 位大漠点击子进程是否仍能正常调用且不弹黑框。
+10. 是否能找到 exe 同级 `dm_click_helper.exe`。
+11. 32 位大漠点击 helper 是否仍能正常调用且不弹黑框。
 
 如验证失败：
 

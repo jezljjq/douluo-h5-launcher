@@ -51,7 +51,7 @@
 | 停止任务/关闭清理 | ✅ 已验证 | 停止时终止账号子进程、清理 dm_click_helper.py 和 Chromium | [CLICK_SOLUTION.md](CLICK_SOLUTION.md) |
 | 通行证弹窗坐标缓存 | ✅ 已验证 | `debug_ocr/passport_dialog_pos_cache.json` 按 viewport 缓存 button/input/confirm，跨账号/子进程复用 | [CLICK_SOLUTION.md](CLICK_SOLUTION.md) |
 | 批量快速登录 + 统一校验 | ✅ 已验证 | 当前层/全部串行先快速提交，统一校验后只重登失败账号；9 个单层账号最终 9/9 成功 | [docs/LAUNCHER_FINAL_MILESTONE.md](docs/LAUNCHER_FINAL_MILESTONE.md) |
-| 源码 / exe 一致性 | ✅ 已验证 | exe 使用 `dist/Launcher/上号器.exe`，Playwright 浏览器路径固定为 `%LOCALAPPDATA%\ms-playwright` | [BUILD.md](BUILD.md) |
+| 源码 / exe 一致性 | ✅ 已验证 | exe 使用 `dist/Launcher/上号器.exe`，发布包内置 `ms-playwright` Chromium，不依赖目标电脑用户缓存 | [BUILD.md](BUILD.md) |
 | 防回归技能 | ✅ 已新增 | `D:\Ai\skills\launcher-regression-guard\SKILL.md`，用于修改前检查旧问题是否复发 | — |
 
 ### 2.1 当前窗口管理区能力

@@ -8,6 +8,7 @@ import time
 import ctypes
 import json
 import os
+import sys
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -35,10 +36,37 @@ _OPEN_SESSIONS: list[tuple[object, object]] = []
 _OPEN_SESSIONS_LOCK = threading.Lock()
 
 
+def _find_playwright_chromium_exe(browsers_dir: Path) -> Path | None:
+    for candidate in sorted(browsers_dir.glob("chromium-*/chrome-win64/chrome.exe")):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _dm_helper_command(*args: str) -> list[str]:
+    helper_exe = app_root() / "dm_click_helper.exe"
+    if helper_exe.exists():
+        return [str(helper_exe), *args]
+    helper_py = app_root() / "dm_click_helper.py"
+    return ["py", "-3.14-32", str(helper_py), *args]
+
+
+def _packaged_app_root() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return app_root()
+
+
 def _ensure_playwright_browsers_path() -> Path | None:
-    """Keep packaged runs from looking for Chromium under PyInstaller internals."""
+    """Prefer bundled Chromium in packaged releases, then fall back to user cache."""
     if os.name != "nt":
         return None
+
+    bundled = _packaged_app_root() / "ms-playwright"
+    if getattr(sys, "frozen", False) and bundled.exists():
+        os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(bundled)
+        return bundled
+
     localappdata = os.environ.get("LOCALAPPDATA")
     if not localappdata:
         return None
@@ -137,6 +165,7 @@ class AccountRunner:
         self._save_screenshots = (settings.log_level == "debug")
         self.last_timings: dict[str, float] = {}
         self.last_fast_submit_result = "failed"
+        self._playwright_runtime_logged = False
         _ensure_playwright_browsers_path()
 
     def run(self) -> bool:
@@ -149,6 +178,7 @@ class AccountRunner:
             self._vlog("debug", f"[窗口{self.account.game_window_no}] 打开链接: {self.account.url}")
 
             # 临时恢复原始 Popen 让 asyncio 正确子类化，导入后恢复补丁
+            self._prepare_playwright_runtime()
             _subprocess.Popen = _original_popen
             try:
                 from playwright.sync_api import sync_playwright
@@ -387,6 +417,7 @@ class AccountRunner:
                 self.update_status(self.account, "打开中")
                 self._vlog("debug", f"[窗口{self.account.game_window_no}] 打开链接: {self.account.url}")
                 # 临时恢复原始 Popen 让 asyncio 正确子类化，导入后恢复补丁
+                self._prepare_playwright_runtime()
                 _subprocess.Popen = _original_popen
                 try:
                     from playwright.sync_api import sync_playwright
@@ -777,6 +808,7 @@ class AccountRunner:
                 _t1 = _time.perf_counter()
                 self.update_status(self.account, "打开中")
                 self.log(f"[方式二] 打开链接: {csv_account.url}")
+                self._prepare_playwright_runtime()
                 _subprocess.Popen = _original_popen
                 try:
                     from playwright.sync_api import sync_playwright
@@ -1169,6 +1201,24 @@ class AccountRunner:
         x = column * (self.settings.window_width + self.settings.gap_x)
         y = row * (self.settings.window_height + self.settings.gap_y)
         return x, y
+
+    def _prepare_playwright_runtime(self) -> None:
+        browsers_dir = _ensure_playwright_browsers_path()
+        if browsers_dir is None:
+            return
+
+        bundled_dir = _packaged_app_root() / "ms-playwright"
+        is_bundled = getattr(sys, "frozen", False) and browsers_dir.resolve() == bundled_dir.resolve()
+        if is_bundled and not self._playwright_runtime_logged:
+            self.log(f"使用内置 Playwright 浏览器目录：{browsers_dir}")
+            self._playwright_runtime_logged = True
+
+        if is_bundled and _find_playwright_chromium_exe(browsers_dir) is None:
+            raise RuntimeError(
+                "发布包缺少 Playwright Chromium，请重新打包。"
+                "目标机器不应手动安装 Playwright。"
+                f"检查路径：{browsers_dir}\\chromium-*\\chrome-win64\\chrome.exe"
+            )
 
     def _click_ratio(self, page, ratio: tuple[float, float], action_name: str) -> None:
         width = self.settings.window_width
@@ -3365,9 +3415,8 @@ class AccountRunner:
         if not pos_file.exists():
             self.log(f"[窗口{self.account.game_window_no}] browser_pos.json 不存在")
             return False
-        helper = str(app_root() / "dm_click_helper.py")
         result = subprocess.run(
-            ["py", "-3.14-32", helper, "click", str(vx), str(vy), str(hold_ms)],
+            _dm_helper_command("click", str(vx), str(vy), str(hold_ms)),
             capture_output=True,
             text=True,
             timeout=10,
@@ -3385,9 +3434,8 @@ class AccountRunner:
     def _dm_chain(self, steps: list[str], label: str = "链式操作") -> bool:
         """一次子进程调用执行多个 Dm 操作（click/type），节省子进程启动开销。"""
         import subprocess
-        helper = str(app_root() / "dm_click_helper.py")
         result = subprocess.run(
-            ["py", "-3.14-32", helper, "chain", "|".join(steps)],
+            _dm_helper_command("chain", "|".join(steps)),
             capture_output=True, text=True, timeout=20,
             encoding="utf-8", errors="replace",
             creationflags=subprocess.CREATE_NO_WINDOW,
@@ -3402,9 +3450,8 @@ class AccountRunner:
     def _dm_type_text(self, text: str) -> bool:
         import subprocess
 
-        helper = str(app_root() / "dm_click_helper.py")
         result = subprocess.run(
-            ["py", "-3.14-32", helper, "type", text],
+            _dm_helper_command("type", text),
             capture_output=True,
             text=True,
             timeout=10,
@@ -3841,9 +3888,8 @@ class AccountRunner:
         if not pos_file.exists():
             self.log(f"[窗口{self.account.game_window_no}] browser_pos.json 不存在")
             return False
-        helper = str(app_root() / "dm_click_helper.py")
         result = subprocess.run(
-            ["py", "-3.14-32", helper, str(vx), str(vy)],
+            _dm_helper_command(str(vx), str(vy)),
             capture_output=True, text=True, timeout=10,
             encoding="utf-8", errors="replace",
             creationflags=subprocess.CREATE_NO_WINDOW,

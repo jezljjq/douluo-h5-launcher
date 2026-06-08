@@ -13,6 +13,40 @@ function Step([string]$Message) {
     Write-Host $Message
 }
 
+function Find-ChromiumExe([string]$BrowsersDir) {
+    if (-not (Test-Path -LiteralPath $BrowsersDir)) {
+        return $null
+    }
+    $matches = Get-ChildItem -LiteralPath $BrowsersDir -Directory -Filter "chromium-*" -ErrorAction SilentlyContinue |
+        ForEach-Object {
+            Join-Path $_.FullName "chrome-win64\chrome.exe"
+        } |
+        Where-Object {
+            Test-Path -LiteralPath $_
+        } |
+        Select-Object -First 1
+    return $matches
+}
+
+function Copy-Directory([string]$Source, [string]$Destination) {
+    if (Test-Path -LiteralPath $Destination) {
+        Remove-Item -LiteralPath $Destination -Recurse -Force
+    }
+    New-Item -ItemType Directory -Force -Path $Destination | Out-Null
+    & robocopy $Source $Destination /E /NFL /NDL /NJH /NJS /NP
+    $code = $LASTEXITCODE
+    if ($code -gt 7) {
+        Fail "robocopy failed from $Source to $Destination with exit code $code"
+    }
+    $global:LASTEXITCODE = 0
+}
+
+function Remove-IfExists([string]$Path) {
+    if (Test-Path -LiteralPath $Path) {
+        Remove-Item -LiteralPath $Path -Recurse -Force
+    }
+}
+
 $ProjectRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 Set-Location $ProjectRoot
 
@@ -22,7 +56,7 @@ $DistDir = Join-Path $ProjectRoot "dist\$InternalBuildName"
 $InternalExePath = Join-Path $DistDir "$InternalBuildName.exe"
 $ExePath = Join-Path $DistDir "$AppName.exe"
 $PlaywrightBrowsers = Join-Path $env:LOCALAPPDATA "ms-playwright"
-$env:PLAYWRIGHT_BROWSERS_PATH = $PlaywrightBrowsers
+$BundledPlaywrightBrowsers = Join-Path $DistDir "ms-playwright"
 
 Write-Host "============================================"
 Write-Host " $AppName - release build"
@@ -58,22 +92,25 @@ Write-Host "  pyinstaller: $PyInstallerVersion"
 
 & py -3.14-32 --version | Out-Null
 if ($LASTEXITCODE -ne 0) {
-    Write-Host "[WARN] 32-bit Python py -3.14-32 was not found. Dm click helper will be unavailable until it is installed."
-} else {
-    Write-Host "  32-bit Python: OK"
+    Fail "32-bit Python py -3.14-32 was not found. It is required on the build machine to package dm_click_helper.exe."
 }
+& py -3.14-32 -m PyInstaller --version | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    Fail "32-bit PyInstaller was not found. Install it on the build machine with: py -3.14-32 -m pip install pyinstaller"
+}
+Write-Host "  32-bit Python/PyInstaller: OK"
 
 Step "[2/7] Check Playwright Chromium location"
 if (-not (Test-Path -LiteralPath $PlaywrightBrowsers)) {
-    Write-Host "[WARN] $PlaywrightBrowsers does not exist."
-    Write-Host "[INFO] Installing Chromium into LOCALAPPDATA ms-playwright cache."
-    & python -m playwright install chromium
-    if ($LASTEXITCODE -ne 0) {
-        Fail "Playwright Chromium install failed. The exe may not be able to launch browser automation."
-    }
-} else {
-    Write-Host "  using LOCALAPPDATA ms-playwright cache"
+    Fail "打包机器缺少 Playwright Chromium: $PlaywrightBrowsers. 请先在打包机器执行: python -m playwright install chromium"
 }
+$SourceChromiumExe = Find-ChromiumExe $PlaywrightBrowsers
+if ($null -eq $SourceChromiumExe) {
+    Fail "打包机器缺少 Playwright Chromium chrome.exe. 请先在打包机器执行: python -m playwright install chromium"
+}
+Write-Host "  source browsers: $PlaywrightBrowsers"
+Write-Host "  source Chromium: $SourceChromiumExe"
+$env:PLAYWRIGHT_BROWSERS_PATH = $PlaywrightBrowsers
 
 Step "[3/7] Run tests"
 & python -m unittest discover -s tests -v
@@ -137,12 +174,43 @@ Write-Host "  copied: automation_settings.json"
 Copy-Item -LiteralPath "dm_click_helper.py" -Destination $DistDir -Force
 Write-Host "  copied: dm_click_helper.py"
 
+Write-Host "  building: dm_click_helper.exe (32-bit)"
+$HelperBuildDir = Join-Path $ProjectRoot "build\dm_click_helper"
+$HelperSpecDir = Join-Path $ProjectRoot "build\dm_click_helper_spec"
+& py -3.14-32 -m PyInstaller `
+    --onefile `
+    --clean `
+    -y `
+    --noconsole `
+    --name "dm_click_helper" `
+    --distpath $DistDir `
+    --workpath $HelperBuildDir `
+    --specpath $HelperSpecDir `
+    "dm_click_helper.py"
+if ($LASTEXITCODE -ne 0) {
+    Fail "32-bit dm_click_helper.exe build failed."
+}
+$HelperExe = Join-Path $DistDir "dm_click_helper.exe"
+if (-not (Test-Path -LiteralPath $HelperExe)) {
+    Fail "dm_click_helper.exe was not generated: $HelperExe"
+}
+Write-Host "  bundled: dm_click_helper.exe"
+
 $DebugDir = Join-Path $DistDir "debug_ocr"
-$TmpDir = Join-Path $DebugDir "_tmp"
-$LogsDir = Join-Path $DistDir "logs"
-New-Item -ItemType Directory -Force -Path $DebugDir, $TmpDir, $LogsDir | Out-Null
+New-Item -ItemType Directory -Force -Path $DebugDir | Out-Null
 Copy-Item -LiteralPath "debug_ocr\template_passport_btn.png" -Destination $DebugDir -Force
 Write-Host "  copied: debug_ocr\template_passport_btn.png"
+
+Write-Host "  copying: ms-playwright browser cache"
+Copy-Directory $PlaywrightBrowsers $BundledPlaywrightBrowsers
+Get-ChildItem -LiteralPath $BundledPlaywrightBrowsers -Directory -Filter "mcp-chrome-*" -ErrorAction SilentlyContinue |
+    Remove-Item -Recurse -Force
+$BundledChromiumExe = Find-ChromiumExe $BundledPlaywrightBrowsers
+if ($null -eq $BundledChromiumExe) {
+    Fail "Copied ms-playwright but no Chromium chrome.exe was found under $BundledPlaywrightBrowsers"
+}
+Write-Host "  copied: ms-playwright"
+Write-Host "  bundled Chromium: $BundledChromiumExe"
 
 $Docs = @(
     "README.md",
@@ -161,9 +229,25 @@ foreach ($Doc in $Docs) {
 }
 Write-Host "  copied: documentation"
 
+Write-Host "  cleaning release-only runtime artifacts"
+Remove-IfExists (Join-Path $DistDir "logs")
+Remove-IfExists (Join-Path $DebugDir "_tmp")
+Remove-IfExists (Join-Path $DebugDir "history")
+Remove-IfExists (Join-Path $DistDir "slots")
+Remove-IfExists (Join-Path $DistDir "window_slots.json")
+Get-ChildItem -LiteralPath $DistDir -Recurse -Filter "*.log" -File -ErrorAction SilentlyContinue | Remove-Item -Force
+Get-ChildItem -LiteralPath $DistDir -Recurse -Filter "*.csv" -File -ErrorAction SilentlyContinue | Remove-Item -Force
+Get-ChildItem -LiteralPath $DistDir -Recurse -Filter "window_slots*.json" -File -ErrorAction SilentlyContinue | Remove-Item -Force
+Get-ChildItem -LiteralPath $DistDir -Recurse -Directory -Filter "__pycache__" -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force
+Get-ChildItem -LiteralPath $DistDir -Recurse -Directory -Filter ".pytest_cache" -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force
+Get-ChildItem -LiteralPath $DistDir -Recurse -Filter "*.pyc" -File -ErrorAction SilentlyContinue | Remove-Item -Force
+
 Step "[7/7] Verify build output"
 if (-not (Test-Path -LiteralPath $ExePath)) {
     Fail "exe was not generated: $ExePath"
+}
+if (-not (Test-Path -LiteralPath $BundledChromiumExe)) {
+    Fail "bundled Chromium missing after cleanup: $BundledChromiumExe"
 }
 
 Write-Host "============================================"
@@ -171,8 +255,9 @@ Write-Host " Build succeeded"
 Write-Host "============================================"
 Write-Host "  exe: $ExePath"
 Write-Host "  dir: $DistDir"
+Write-Host "  bundled browsers: $BundledPlaywrightBrowsers"
 Write-Host ""
 Write-Host "Runtime notes:"
-Write-Host "  Playwright Chromium uses: $PlaywrightBrowsers"
-Write-Host "  Dm click helper requires 32-bit Python py -3.14-32 and registered Dm COM."
+Write-Host "  Playwright Chromium is bundled in the release directory."
+Write-Host "  Dm click helper is bundled as dm_click_helper.exe. Dm COM still must be registered on the target machine."
 exit 0

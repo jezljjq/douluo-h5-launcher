@@ -21,7 +21,7 @@
 ```powershell
 python --version
 pyinstaller --version
-py -3.14-32 --version      # 可选，大漠子进程需要
+py -3.14-32 --version      # 打包 dm_click_helper.exe 需要
 pip install -r requirements.txt
 ```
 
@@ -59,11 +59,13 @@ cd D:\Ai\codex\上号器
 dist/Launcher/
 ├── 上号器.exe                ← 主程序
 ├── automation_settings.json  ← 自动化配置（可修改）
-├── dm_click_helper.py        ← Dm 点击脚本（32 位子进程调用）
+├── dm_click_helper.exe       ← Dm 点击 helper（32 位打包产物）
+├── dm_click_helper.py        ← Dm 点击脚本（源码回退）
+├── ms-playwright/            ← 发布包内置 Playwright Chromium
+│   └── chromium-*/
+│       └── chrome-win64/chrome.exe
 ├── debug_ocr/
 │   ├── template_passport_btn.png  ← 按钮模板
-│   ├── browser_pos.json           ← 运行时坐标缓存
-│   └── _tmp/                      ← 临时截图
 ├── README.md / RUN_MODE.md / BUILD.md / ...  ← 文档
 └── _internal/                  ← PyInstaller 运行库
 ```
@@ -88,6 +90,7 @@ dist/Launcher/上号器.exe
 - `logs/`：运行日志。
 - `debug_ocr/_tmp/`、`debug_ocr/history/`：临时截图和失败现场。
 - 真实账号 CSV，例如 `大号游戏账号.csv`、`密码.csv`、`账号密码表.csv`。
+- `*.log`、`*.pyc`、`__pycache__/`、`.pytest_cache/`。
 
 打包前必须确认这些文件没有进入待提交列表，也没有被复制进发布包；发布包内如需示例账号文件，只使用 `accounts.sample.csv`。`window_manager_settings.json` 才是长期排列参数来源，`window_slots.json` 不应作为发布默认配置。
 
@@ -99,7 +102,8 @@ dist/Launcher/上号器.exe
 
 - exe 自动检测运行环境，单账号和批量均走同进程直接调用
 - 需要 Tesseract OCR 在系统 PATH 中
-- Dm 点击需要 32 位 Python (`py -3.14-32`) 和 `dm_click_helper.py` 在 exe 同级目录
+- Dm 点击优先调用 exe 同级 `dm_click_helper.exe`，目标电脑不需要安装 Python
+- 大漠 COM 仍需在目标电脑注册
 
 ### 源码模式
 
@@ -173,7 +177,7 @@ exe 模式下批量自动走同进程调用，无需额外 Python。
 
 ### 大漠点击不工作
 
-确认 32 位 Python (`py -3.14-32`) 可用，且大漠 7.2607 已注册。
+exe 发布包已内置 32 位 `dm_click_helper.exe`，目标电脑不需要安装 Python；仍需确认大漠插件已注册。源码模式下仍需要 32 位 Python (`py -3.14-32`)。
 
 ### exe 弹黑色命令行窗口
 
@@ -185,7 +189,21 @@ exe 模式下批量自动走同进程调用，无需额外 Python。
 
 ### Playwright 找不到 Chromium
 
-当前打包策略：使用系统用户级缓存 `%LOCALAPPDATA%\ms-playwright`，不把 Chromium 打进 `_internal\.local-browsers`。打包脚本会检查该目录，不存在时执行 `python -m playwright install chromium`。如果 exe 启动后仍提示找不到浏览器，先检查 `%LOCALAPPDATA%\ms-playwright` 是否存在，不要临时修改业务代码。
+当前打包策略：发布包自带 Playwright Chromium，目录为：
+
+```text
+dist\Launcher\ms-playwright\chromium-*\chrome-win64\chrome.exe
+```
+
+打包脚本会从打包机器的 `%LOCALAPPDATA%\ms-playwright` 复制整个浏览器缓存到 `dist\Launcher\ms-playwright`，并校验 `chromium-*\chrome-win64\chrome.exe` 至少存在一个。目标机器不需要安装 Playwright 或执行 `playwright install`。
+
+如果打包机器没有本地 Chromium 缓存，脚本会失败并提示先在打包机器执行：
+
+```powershell
+python -m playwright install chromium
+```
+
+exe 运行时会优先设置 `PLAYWRIGHT_BROWSERS_PATH=<exe所在目录>\ms-playwright`。如果仍提示找不到 Chromium，说明发布包缺少 `ms-playwright`，应重新打包，不要在目标机器手动安装。
 
 ### build_exe.bat 内容异常
 

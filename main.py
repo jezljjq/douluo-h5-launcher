@@ -62,10 +62,16 @@ def _collect_runtime_diagnostics() -> dict[str, object]:
     project_dir = project_root()
     debug_dir = app_dir / "debug_ocr"
     logs_dir = app_dir / "logs"
-    playwright_browsers = Path(
-        os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
-        or str(Path(os.environ.get("LOCALAPPDATA", "")) / "ms-playwright")
-    )
+    bundled_playwright_browsers = app_dir / "ms-playwright"
+    if bundled_playwright_browsers.exists():
+        playwright_browsers = bundled_playwright_browsers
+        playwright_browsers_source = "bundled"
+    else:
+        playwright_browsers = Path(
+            os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+            or str(Path(os.environ.get("LOCALAPPDATA", "")) / "ms-playwright")
+        )
+        playwright_browsers_source = "environment"
 
     def item(path: Path) -> dict[str, object]:
         return {"path": str(path), "exists": path.exists()}
@@ -98,7 +104,8 @@ def _collect_runtime_diagnostics() -> dict[str, object]:
         "app_root": str(app_dir),
         "project_root": str(project_dir),
         "automation_settings": item(app_dir / "automation_settings.json"),
-        "dm_click_helper": item(app_dir / "dm_click_helper.py"),
+        "dm_click_helper_exe": item(app_dir / "dm_click_helper.exe"),
+        "dm_click_helper_py": item(app_dir / "dm_click_helper.py"),
         "template_passport_btn": item(debug_dir / "template_passport_btn.png"),
         "browser_pos": item(debug_dir / "browser_pos.json"),
         "passport_dialog_pos_cache": item(debug_dir / "passport_dialog_pos_cache.json"),
@@ -106,6 +113,7 @@ def _collect_runtime_diagnostics() -> dict[str, object]:
         "logs_dir": item(logs_dir),
         "debug_ocr_dir": item(debug_dir),
         "playwright_browsers_path": str(playwright_browsers),
+        "playwright_browsers_source": playwright_browsers_source,
         "playwright_browsers_path_exists": playwright_browsers.exists(),
         "playwright_chromium_candidates": chromium_dirs,
         "playwright_internal_local_browsers": item(app_dir / "_internal" / "playwright" / "driver" / "package" / ".local-browsers"),
