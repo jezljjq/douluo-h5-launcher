@@ -5,6 +5,8 @@ from douluo_launcher.gui import (
     ACCOUNT_TABLE_COLUMN_INDEX,
     ACCOUNT_TABLE_COLUMNS,
     _account_table_values,
+    _build_serial_run_plan,
+    _compact_number_ranges,
     _merge_account_group_settings,
     _split_all_serial_accounts,
 )
@@ -60,6 +62,48 @@ class GuiGroupSettingsTests(unittest.TestCase):
         self.assertEqual(values[ACCOUNT_TABLE_COLUMN_INDEX["passport"]], "d40786fa")
         self.assertEqual(values[ACCOUNT_TABLE_COLUMN_INDEX["status"]], "成功")
         self.assertEqual(values[ACCOUNT_TABLE_COLUMN_INDEX["timing"]], "8.1s")
+
+    def test_current_group_plan_for_cunduan_uses_windows_1_to_9_only(self) -> None:
+        accounts = [
+            AccountConfig("存钻", index, index, f"https://example.com/z{index}", bookmark_title=f"z{index}")
+            for index in range(1, 10)
+        ]
+
+        plan = _build_serial_run_plan(accounts, visible_window_numbers=list(range(1, 10)))
+
+        self.assertEqual(plan.group_counts, (("存钻", 9),))
+        self.assertEqual(plan.required_windows, tuple(range(1, 10)))
+        self.assertEqual(plan.max_window_no, 9)
+        self.assertEqual(plan.missing_windows, ())
+
+    def test_all_serial_plan_reports_all_missing_windows_before_running(self) -> None:
+        accounts = [
+            AccountConfig("单层账号", index, index, f"https://example.com/root{index}", include_in_all=True)
+            for index in range(1, 10)
+        ] + [
+            AccountConfig("第一层", index, 9 + index, f"https://example.com/l1-{index}", include_in_all=True)
+            for index in range(1, 9)
+        ] + [
+            AccountConfig("第二层", index, 17 + index, f"https://example.com/l2-{index}", include_in_all=True)
+            for index in range(1, 9)
+        ] + [
+            AccountConfig("第三层", index, 25 + index, f"https://example.com/l3-{index}", include_in_all=True)
+            for index in range(1, 9)
+        ] + [
+            AccountConfig("第四层", index, 33 + index, f"https://example.com/l4-{index}", include_in_all=True)
+            for index in range(1, 8)
+        ] + [
+            AccountConfig("存钻", index, 40 + index, f"https://example.com/z{index}", include_in_all=True)
+            for index in range(1, 10)
+        ]
+
+        enabled, _skipped = _split_all_serial_accounts(accounts)
+        plan = _build_serial_run_plan(enabled, visible_window_numbers=list(range(1, 10)))
+
+        self.assertEqual(plan.max_window_no, 49)
+        self.assertEqual(_compact_number_ranges(plan.required_windows), "1-49")
+        self.assertEqual(_compact_number_ranges(plan.visible_windows), "1-9")
+        self.assertEqual(_compact_number_ranges(plan.missing_windows), "10-49")
 
 
 if __name__ == "__main__":

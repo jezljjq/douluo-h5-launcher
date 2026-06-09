@@ -51,6 +51,7 @@
 | 停止任务/关闭清理 | ✅ 已验证 | 停止时终止账号子进程、清理 dm_click_helper.py 和 Chromium | [CLICK_SOLUTION.md](CLICK_SOLUTION.md) |
 | 通行证弹窗坐标缓存 | ✅ 已验证 | `debug_ocr/passport_dialog_pos_cache.json` 按 viewport 缓存 button/input/confirm，跨账号/子进程复用 | [CLICK_SOLUTION.md](CLICK_SOLUTION.md) |
 | 批量快速登录 + 统一校验 | ✅ 已验证 | 当前层/全部串行先快速提交，统一校验后只重登失败账号；9 个单层账号最终 9/9 成功 | [docs/LAUNCHER_FINAL_MILESTONE.md](docs/LAUNCHER_FINAL_MILESTONE.md) |
+| 串行按钮范围与预检 | ✅ 源码验证 | 单账号/当前层/全部串行范围隔离；全部串行先生成 run_plan 并一次性校验窗口缺口 | [CURRENT_ISSUES.md](CURRENT_ISSUES.md) |
 | 源码 / exe 一致性 | ✅ 已验证 | exe 使用 `dist/Launcher/上号器.exe`，发布包内置 `ms-playwright` Chromium，不依赖目标电脑用户缓存 | [BUILD.md](BUILD.md) |
 | 防回归技能 | ✅ 已新增 | `D:\Ai\skills\launcher-regression-guard\SKILL.md`，用于修改前检查旧问题是否复发 | — |
 
@@ -78,6 +79,14 @@
 `层级=全部` 只表示账号列表显示全部已读取账号；点击 `全部串行` 时只运行 `include_in_all=true` 的分组。分组设置按钮可选择哪些分组参与全部串行，新发现分组默认不参与全部串行。该设置保存到 `automation_settings.json` 的 `account_group_settings` 字段。
 
 未勾选分组不会进入 `全部串行`，但仍可通过 `当前层串行` 单独运行，也可通过 `单账号运行` 运行其中某个账号。
+
+2026-06-09 语义修正：
+
+- `单账号运行` 只运行账号下拉框或表格选中的一个账号。
+- `当前层串行` 只运行当前层级下拉框选中的分组，不读取 `include_in_all` 勾选状态。例如层级为 `存钻` 时，只运行 `存钻 z1-z9`，只要求窗口 `1-9`。
+- `全部串行` 只运行“全部串行分组设置”中 `include_in_all=true` 的所有分组；它不等于当前层级，也不等于当前表格显示内容。
+- 当前层级不是 `全部` 时点击 `全部串行` 会先阻止并提示：如需运行当前层请点 `当前层串行`；如需运行全部启用分组请先切换层级为 `全部`。
+- `全部串行` 真正启动前会生成 run_plan，日志输出将执行分组、账号数、需要窗口、最大窗口号、当前桌面可见 H5 窗口和缺少窗口；窗口不足会立即阻止，不再跑到中途才发现窗口 10 不存在。
 
 方式一账号表当前列顺序固定为：
 
@@ -328,8 +337,8 @@ python main.py
 
 GUI 按钮：
 - **单账号运行** — 运行下拉框选中的账号
-- **当前层串行** — 逐个运行当前选择层级全部账号
-- **全部串行** — 逐个运行所有已加载账号
+- **当前层串行** — 只运行当前层级下拉框选中的分组，不受“全部串行分组设置”影响
+- **全部串行** — 只运行 `include_in_all=true` 的已启用分组；层级不是 `全部` 时会先阻止并提示语义差异
 
 当前层串行 / 全部串行使用“快速提交 + 统一校验 + 失败重登”：
 

@@ -7,7 +7,7 @@ import threading
 import time
 import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
@@ -160,6 +160,62 @@ def _split_all_serial_accounts(
     enabled = [account for account in accounts if account.include_in_all]
     skipped = [account for account in accounts if not account.include_in_all]
     return enabled, skipped
+
+
+@dataclass(frozen=True)
+class SerialRunPlan:
+    accounts: tuple[AccountConfig, ...]
+    group_counts: tuple[tuple[str, int], ...]
+    required_windows: tuple[int, ...]
+    visible_windows: tuple[int, ...]
+    missing_windows: tuple[int, ...]
+    max_window_no: int
+
+
+def _group_counts_for_accounts(accounts: list[AccountConfig] | tuple[AccountConfig, ...]) -> tuple[tuple[str, int], ...]:
+    counts: dict[str, int] = {}
+    for account in accounts:
+        counts[account.level] = counts.get(account.level, 0) + 1
+    return tuple(counts.items())
+
+
+def _compact_number_ranges(numbers: list[int] | tuple[int, ...]) -> str:
+    unique_numbers = sorted({int(number) for number in numbers})
+    if not unique_numbers:
+        return "无"
+    ranges: list[str] = []
+    start = prev = unique_numbers[0]
+    for number in unique_numbers[1:]:
+        if number == prev + 1:
+            prev = number
+            continue
+        ranges.append(str(start) if start == prev else f"{start}-{prev}")
+        start = prev = number
+    ranges.append(str(start) if start == prev else f"{start}-{prev}")
+    return "、".join(ranges)
+
+
+def _build_serial_run_plan(
+    accounts: list[AccountConfig] | tuple[AccountConfig, ...],
+    visible_window_numbers: list[int] | tuple[int, ...],
+) -> SerialRunPlan:
+    account_tuple = tuple(accounts)
+    required_windows = tuple(sorted({int(account.game_window_no) for account in account_tuple}))
+    visible_windows = tuple(sorted({int(number) for number in visible_window_numbers}))
+    visible_set = set(visible_windows)
+    missing_windows = tuple(number for number in required_windows if number not in visible_set)
+    return SerialRunPlan(
+        accounts=account_tuple,
+        group_counts=_group_counts_for_accounts(account_tuple),
+        required_windows=required_windows,
+        visible_windows=visible_windows,
+        missing_windows=missing_windows,
+        max_window_no=max(required_windows) if required_windows else 0,
+    )
+
+
+def _format_group_counts(group_counts: tuple[tuple[str, int], ...]) -> str:
+    return "、".join(f"{group} {count} 个" for group, count in group_counts) if group_counts else "无"
 
 
 class LauncherApp(tk.Tk):
@@ -2182,6 +2238,64 @@ Write-Output $count
                 return False
         return True
 
+    def _visible_h5_window_numbers(self) -> tuple[int, ...]:
+        windows = list_game_windows(exclude_hwnds=self._wm_excluded_hwnds())
+        return tuple(
+            sorted(
+                {
+                    int(window.number)
+                    for window in windows
+                    if window.number is not None
+                }
+            )
+        )
+
+    def _precheck_serial_run(self, accounts: list[AccountConfig], run_label: str) -> bool:
+        try:
+            visible_window_numbers = self._visible_h5_window_numbers()
+        except Exception as exc:
+            message = f"{run_label}预检失败：无法读取当前桌面 H5 窗口：{exc}"
+            self._log(message)
+            messagebox.showwarning("运行前预检失败", message)
+            return False
+
+        plan = _build_serial_run_plan(accounts, visible_window_numbers)
+        group_summary = _format_group_counts(plan.group_counts)
+        required_summary = _compact_number_ranges(plan.required_windows)
+        visible_summary = _compact_number_ranges(plan.visible_windows)
+        missing_summary = _compact_number_ranges(plan.missing_windows)
+
+        self._log(
+            f"{run_label} run_plan：分组={group_summary}；账号数={len(plan.accounts)}；"
+            f"需要窗口={required_summary}；最大窗口号={plan.max_window_no}；"
+            f"当前桌面窗口={visible_summary}。"
+        )
+
+        if not plan.missing_windows:
+            return True
+
+        lines = [
+            f"{run_label}预检失败：",
+            f"本次将执行分组：{group_summary}",
+            f"本次需要窗口：{required_summary}",
+            f"当前桌面只有窗口：{visible_summary}",
+            f"缺少窗口：{missing_summary}",
+        ]
+        if run_label == "全部串行":
+            lines.extend(
+                [
+                    "",
+                    "如需只运行当前层级，请选择“当前层串行”。",
+                    "如需运行全部串行，请先打开足够窗口，或在“全部串行分组设置”中取消不需要的分组。",
+                ]
+            )
+        message = "\n".join(lines)
+        for line in lines:
+            if line:
+                self._log(line)
+        messagebox.showwarning("运行前预检失败", message)
+        return False
+
     # ===== 方式二：CSV 导入 =====
 
     def _on_method_changed(self) -> None:
@@ -2332,6 +2446,8 @@ Write-Output $count
             f"单账号运行前校验：排列方式={self.wm_tile_mode_var.get()}，"
             f"层级={self.level_var.get()}，账号={account.display_name}，窗口号={account.game_window_no}"
         )
+        if not self._precheck_serial_run([account], "单账号运行"):
+            return
         if not self._validate_accounts_for_current_mode([account]):
             return
         self._log(
@@ -2352,6 +2468,9 @@ Write-Output $count
         if not accounts:
             messagebox.showwarning("无账号", f"当前层 {level} 没有账号。")
             return
+        self._log(f"当前层串行范围确认：只运行当前层级【{level}】，不读取全部串行勾选状态。")
+        if not self._precheck_serial_run(accounts, "当前层串行"):
+            return
         if not self._validate_accounts_for_current_mode(accounts):
             return
         self._log(f"当前层串行: {level}，共 {len(accounts)} 个账号，批量快速登录 + 统一校验。")
@@ -2360,6 +2479,20 @@ Write-Output $count
     def _run_all_serial(self) -> None:
         if self.method_var.get() == "method2":
             self._run_method2_all()
+            return
+        selected_level = self.level_var.get()
+        if selected_level != "全部":
+            message = (
+                f"当前层级是【{selected_level}】。\n"
+                "“全部串行”将运行所有已启用分组，不是只运行当前层级。\n"
+                f"如果只想运行【{selected_level}】，请点击“当前层串行”。\n"
+                "如需运行全部启用分组，请先切换层级为“全部”。"
+            )
+            self._log(
+                f"阻止全部串行：当前层级={selected_level}。"
+                "全部串行只代表运行 include_in_all=true 的所有分组。"
+            )
+            messagebox.showwarning("全部串行范围确认", message)
             return
         all_accounts = self._mode_allowed_accounts()
         if not all_accounts:
@@ -2385,6 +2518,8 @@ Write-Output $count
             message = "检测到未启用分组混入全部串行，已阻止运行。"
             self._log(f"阻止全部串行：{message}{invalid_summary}")
             messagebox.showwarning("全部串行分组异常", message)
+            return
+        if not self._precheck_serial_run(accounts, "全部串行"):
             return
         if not self._validate_accounts_for_current_mode(accounts):
             return
