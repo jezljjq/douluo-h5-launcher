@@ -169,6 +169,26 @@ _subprocess.Popen = lambda *a, **kw: _original_popen(*a, **{**kw, "creationflags
 
 ---
 
+## 9.1 防回归硬规则
+
+历史事故统一登记在 [ERROR_HISTORY.md](ERROR_HISTORY.md)，自动化测试映射见 [REGRESSION_TESTS.md](REGRESSION_TESTS.md)。
+
+- 每修一个 bug，必须补一条或更新一条回归测试。
+- 没有回归测试的修复，不算完成。
+- 如果某个问题无法自动化测试，必须在文档中说明原因，并给出人工验证步骤。
+- 修复旧问题时必须先检查 [ERROR_HISTORY.md](ERROR_HISTORY.md)，确认是否已有同类事故。
+- 新增测试应优先覆盖逻辑边界，避免依赖真实游戏窗口、真实账号、真实截图。
+- 防回归测试失败时，禁止提交、禁止 push、禁止打包。
+
+提交、push、打包前必须执行：
+
+```powershell
+python -m compileall -q douluo_launcher main.py
+python -m unittest discover -s tests -v
+```
+
+---
+
 ## 10. 同类问题全局排查规则
 
 修 bug 时不能只修当前看到的一处。必须先判断问题类型，然后全项目搜索同类风险点，避免修 A 漏 B。

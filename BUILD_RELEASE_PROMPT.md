@@ -48,13 +48,16 @@ D:\Ai\codex\上号器
 ```powershell
 python --version
 where python
+python -m compileall -q douluo_launcher main.py
 python -m unittest discover -s tests -v
 ```
 
-如果测试失败：
+如果编译检查或测试失败：
 
 * 立即停止打包
 * 输出失败原因
+* 禁止提交
+* 禁止 push
 * 不生成 exe
 * 不尝试绕过测试
 
@@ -99,7 +102,9 @@ scripts\build_exe.bat
 dist\Launcher\ms-playwright\chromium-*\chrome-win64\chrome.exe
 ```
 
-打包脚本只在打包机器读取 `%LOCALAPPDATA%\ms-playwright` 作为源目录，并复制到 `dist\Launcher\ms-playwright`。目标机器不需要安装 Python、pip、Playwright 或 Chromium，也不应该执行 `python -m playwright install chromium`。
+打包脚本只在打包机器读取 `%LOCALAPPDATA%\ms-playwright` 作为源目录，并复制当前 Playwright 实际需要的单个 Chromium revision 到 `dist\Launcher\ms-playwright`。脚本必须优先读取 Playwright Python 包内的 `driver\package\browsers.json` 来确定 `chromium` revision，例如 `chromium-1217`；不得把本机缓存中的所有 `chromium-*` 全量复制进发布包。
+
+打包完成后，`dist\Launcher\ms-playwright\chromium-*\chrome-win64\chrome.exe` 必须且只能匹配到 1 个。如果检测到多个 `chromium-*`，脚本必须清理旧版本或失败，禁止静默发布多个 Chromium 目录。目标机器不需要安装 Python、pip、Playwright 或 Chromium，也不应该执行 `python -m playwright install chromium`。
 
 如果打包机器缺少 Chromium 缓存，脚本必须失败并提示先在打包机器执行：
 

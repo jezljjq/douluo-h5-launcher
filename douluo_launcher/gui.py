@@ -241,6 +241,7 @@ class LauncherApp(tk.Tk):
         self._log_file = None
         self._log_file_path: Path | None = None
         self.wm_launch_thread: threading.Thread | None = None
+        self.wm_action_thread: threading.Thread | None = None
         self.running_processes: list[object] = []
         self.running_processes_lock = threading.Lock()
         self.is_closing = False
@@ -507,19 +508,24 @@ class LauncherApp(tk.Tk):
         self.wm_launch_btn = ttk.Button(window_action_row, text="批量启动窗口", width=18,
                                         command=self._wm_launch_windows)
         self.wm_launch_btn.pack(side=tk.LEFT, padx=(4, 10))
-        ttk.Button(window_action_row, text="识别窗口", width=18,
-                   command=self._wm_identify_windows).pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Button(window_action_row, text="排列窗口", width=18,
-                   command=self._wm_tile_windows).pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Button(window_action_row, text="刷新槽位映射", width=18,
-                   command=self._wm_refresh_window_slots).pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Button(window_action_row, text="重新生成槽位", width=18,
-                   command=self._wm_regenerate_slots).pack(side=tk.LEFT, padx=(0, 10))
+        self.wm_identify_btn = ttk.Button(window_action_row, text="识别窗口", width=18,
+                                          command=self._wm_identify_windows)
+        self.wm_identify_btn.pack(side=tk.LEFT, padx=(0, 10))
+        self.wm_tile_btn = ttk.Button(window_action_row, text="排列窗口", width=18,
+                                      command=self._wm_tile_windows)
+        self.wm_tile_btn.pack(side=tk.LEFT, padx=(0, 10))
+        self.wm_refresh_slots_btn = ttk.Button(window_action_row, text="刷新槽位映射", width=18,
+                                               command=self._wm_refresh_window_slots)
+        self.wm_refresh_slots_btn.pack(side=tk.LEFT, padx=(0, 10))
+        self.wm_regenerate_slots_btn = ttk.Button(window_action_row, text="重新生成槽位", width=18,
+                                                  command=self._wm_regenerate_slots)
+        self.wm_regenerate_slots_btn.pack(side=tk.LEFT, padx=(0, 10))
         ttk.Label(window_action_row, text="目标槽位").pack(side=tk.LEFT, padx=(0, 4))
         ttk.Spinbox(window_action_row, from_=1, to=99, increment=1,
                     textvariable=self.wm_repair_slot_var, width=5).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(window_action_row, text="修复窗口", width=12,
-                   command=self._wm_repair_window_slot).pack(side=tk.LEFT, padx=(0, 10))
+        self.wm_repair_slot_btn = ttk.Button(window_action_row, text="修复窗口", width=12,
+                                             command=self._wm_repair_window_slot)
+        self.wm_repair_slot_btn.pack(side=tk.LEFT, padx=(0, 10))
         tk.Button(window_action_row, text="关闭窗口", width=18, fg="#cc0000",
                   command=self._wm_close_windows, font=("", 9, "bold")).pack(side=tk.LEFT, padx=(0, 10))
 
@@ -845,6 +851,71 @@ class LauncherApp(tk.Tk):
         except Exception:
             return []
 
+    def _wm_action_buttons(self) -> list[object]:
+        buttons = []
+        for name in (
+            "wm_launch_btn",
+            "wm_tile_btn",
+            "wm_refresh_slots_btn",
+            "wm_regenerate_slots_btn",
+            "wm_repair_slot_btn",
+        ):
+            button = getattr(self, name, None)
+            if button is not None:
+                buttons.append(button)
+        return buttons
+
+    def _wm_set_actions_busy(self, busy: bool) -> None:
+        state = tk.DISABLED if busy else tk.NORMAL
+        for button in self._wm_action_buttons():
+            try:
+                button.configure(state=state)
+            except Exception:
+                pass
+
+    def _wm_has_running_action(self) -> bool:
+        return bool(
+            (self.wm_launch_thread and self.wm_launch_thread.is_alive())
+            or (self.wm_action_thread and self.wm_action_thread.is_alive())
+        )
+
+    def _wm_start_action_worker(self, name: str, target, args: tuple = ()) -> bool:
+        if self._wm_has_running_action():
+            self._log(f"[窗口管理] {name} 已阻止：已有窗口管理任务正在执行。")
+            messagebox.showwarning("窗口管理", "已有窗口管理任务正在执行，请等待完成。")
+            return False
+
+        def _run() -> None:
+            try:
+                target(*args)
+            finally:
+                self.after(0, lambda: self._wm_set_actions_busy(False))
+
+        self._wm_set_actions_busy(True)
+        self.wm_action_thread = threading.Thread(target=_run, daemon=True)
+        self.wm_action_thread.start()
+        return True
+
+    def _wm_current_window_count(self) -> int:
+        return len(list_game_windows(exclude_hwnds=self._wm_excluded_hwnds()))
+
+    def _wm_require_complete_windows(
+        self,
+        action_name: str,
+        current_count: int,
+        target_count: int | None,
+    ) -> bool:
+        if target_count is None or current_count == int(target_count):
+            return True
+        message = (
+            f"当前窗口数量不完整：目标 {int(target_count)}，当前 {current_count}。\n"
+            f"禁止{action_name}，避免覆盖原有完整槽位。\n"
+            "请先修复缺失窗口，或关闭全部窗口后重新批量启动。"
+        )
+        self._log(f"[窗口管理] {message.replace(chr(10), ' ')}")
+        messagebox.showwarning(action_name, message)
+        return False
+
     def _wm_parse_positive_dimension(self, value: str, label: str) -> int:
         text = str(value).strip()
         if not text or text.lower() == "auto":
@@ -944,8 +1015,9 @@ class LauncherApp(tk.Tk):
         return title_template
 
     def _wm_launch_windows(self) -> None:
-        if self.wm_launch_thread and self.wm_launch_thread.is_alive():
-            self._log("[窗口管理] 批量启动正在进行中。")
+        if self._wm_has_running_action():
+            self._log("[窗口管理] 批量启动已阻止：已有窗口管理任务正在执行。")
+            messagebox.showwarning("批量启动窗口", "已有窗口管理任务正在执行，请等待完成。")
             return
 
         game_path = self.wm_game_path_var.get().strip().strip('"')
@@ -1019,7 +1091,7 @@ class LauncherApp(tk.Tk):
             if title_template is None:
                 return
 
-        self.wm_launch_btn.configure(state=tk.DISABLED)
+        self._wm_set_actions_busy(True)
         self.wm_launch_thread = threading.Thread(
             target=self._wm_launch_windows_worker,
             args=(
@@ -1187,12 +1259,13 @@ class LauncherApp(tk.Tk):
                         slots_path=self._wm_slots_path(layout_params),
                         exclude_hwnds=excluded_hwnds,
                         layout_params=layout_params,
+                        expected_count=target_count,
                     )
                     log(f"已按当前 profile 保存槽位快照：{len(slots)} 个，路径={self._wm_slots_path(layout_params)}")
                 except Exception as exc:
                     log(f"启动后自动排列失败：{exc}")
         finally:
-            self.after(0, lambda: self.wm_launch_btn.configure(state=tk.NORMAL))
+            self.after(0, lambda: self._wm_set_actions_busy(False))
 
     def _wm_wait_for_windows_stable(
         self,
@@ -1432,34 +1505,36 @@ class LauncherApp(tk.Tk):
             messagebox.showerror("刷新槽位映射失败", str(exc))
             return
         target_count = layout_params.target_window_count
-        if target_count is not None and current_count != target_count:
-            confirmed = messagebox.askyesno(
-                "刷新槽位映射",
-                f"当前识别到 {current_count} 个窗口，当前 profile 目标数量为 {target_count}。\n\n"
-                "刷新槽位映射只保存当前 profile，数量不一致可能导致后续恢复失败。\n"
-                "是否仍要刷新？",
-                parent=self,
-            )
-            if not confirmed:
-                self._log(
-                    f"[窗口管理] 已取消刷新槽位映射：当前窗口数={current_count}，profile目标={target_count}"
-                )
-                return
-        try:
-            slots = refresh_window_slots_from_current_windows(
-                slots_path=self._wm_slots_path(layout_params),
-                exclude_hwnds=self._wm_excluded_hwnds(),
-                layout_params=layout_params,
-            )
-        except Exception as exc:
-            self._log(f"[窗口管理] 刷新槽位映射失败：{exc}")
-            messagebox.showerror("刷新槽位映射失败", str(exc))
+        if not self._wm_require_complete_windows("刷新槽位映射", current_count, target_count):
             return
 
-        self._wm_log_refresh_slot_results(slots)
-        self._log(f"[窗口管理] 当前 profile 槽位文件：{self._wm_slots_path(layout_params)}")
+        self._wm_start_action_worker(
+            "刷新槽位映射",
+            self._wm_refresh_window_slots_worker,
+            (layout_params, target_count),
+        )
+
+    def _wm_refresh_window_slots_worker(self, layout_params, target_count: int | None) -> None:
+        try:
+            self._queue_log("[窗口管理] 开始刷新槽位映射：只扫描当前完整窗口，不移动、不重命名。")
+            slots_path = self._wm_slots_path(layout_params)
+            self._queue_log(f"[窗口管理] 当前 profile 槽位文件：{slots_path}")
+            slots = refresh_window_slots_from_current_windows(
+                slots_path=slots_path,
+                exclude_hwnds=self._wm_excluded_hwnds(),
+                layout_params=layout_params,
+                expected_count=target_count,
+            )
+        except Exception as exc:
+            error = str(exc)
+            self._queue_log(f"[窗口管理] 刷新槽位映射失败：{error}")
+            self.after(0, lambda: messagebox.showerror("刷新槽位映射失败", error))
+            return
+
+        self.after(0, lambda: self._wm_log_refresh_slot_results(slots))
+        self._queue_log(f"[窗口管理] 当前 profile 槽位文件：{self._wm_slots_path(layout_params)}")
         if not slots:
-            self._log("[窗口管理] 未识别到带编号标题的斗罗大陆H5窗口，未刷新任何槽位。")
+            self._queue_log("[窗口管理] 未识别到带编号标题的斗罗大陆H5窗口，未刷新任何槽位。")
 
     def _wm_log_slot_restore_results(self, results, log) -> None:
         for result in results:
@@ -1630,14 +1705,20 @@ class LauncherApp(tk.Tk):
             self._log(f"窗口管理：排列前识别窗口失败：{exc}")
             messagebox.showerror("排列登录窗口失败", str(exc))
             return
+        if not self._wm_require_complete_windows("排列窗口", current_count, layout_params.target_window_count):
+            return
 
         if self._wm_has_saved_slots(layout_params):
-            self._wm_restore_windows_by_slots(
-                move_windows=True,
-                rename_windows=True,
-                log=lambda message: self._log(f"窗口管理：{message}"),
+            if not self._wm_validate_slot_profile(
                 layout_params=layout_params,
                 current_window_count=current_count,
+                log=lambda message: self._log(f"窗口管理：{message}"),
+            ):
+                return
+            self._wm_start_action_worker(
+                "排列窗口",
+                self._wm_tile_windows_worker,
+                (layout_params,),
             )
             return
 
@@ -1650,18 +1731,34 @@ class LauncherApp(tk.Tk):
         messagebox.showwarning("当前 profile 无槽位", message)
         return
 
-    def _wm_regenerate_slots(self) -> None:
-        confirmed = messagebox.askyesno(
-            "重新生成槽位",
-            "此操作会按当前 UI 参数重新排列并重新编号全部窗口，"
-            "并覆盖当前 profile 的槽位文件。\n\n"
-            "其它 profile 槽位文件不会被覆盖。\n\n是否继续？",
-            parent=self,
-        )
-        if not confirmed:
-            self._log("窗口管理：已取消重新生成槽位。")
+    def _wm_tile_windows_worker(self, layout_params) -> None:
+        def log(message: str) -> None:
+            self._queue_log(f"窗口管理：{message}")
+
+        slots_path = self._wm_slots_path(layout_params)
+        title_template = self.wm_title_template_var.get().strip() or None
+        try:
+            log(f"检测到当前 profile 槽位文件 {slots_path.name}，按已保存槽位恢复布局")
+            log("本次不会按 hwnd / 枚举顺序重新排序，不会覆盖其它 profile 槽位文件")
+            results = restore_windows_by_slots(
+                slots_path=slots_path,
+                title_template=title_template,
+                exclude_hwnds=self._wm_excluded_hwnds(),
+                move_windows=True,
+                rename_windows=True,
+            )
+        except Exception as exc:
+            error = str(exc)
+            log(f"按槽位恢复失败：{error}")
+            self.after(0, lambda: messagebox.showerror("槽位恢复失败", error))
             return
 
+        self._wm_log_slot_restore_results(results, log)
+        success_count = sum(1 for result in results if result.success)
+        failed_count = len(results) - success_count
+        log(f"按槽位恢复完成：成功 {success_count}，失败 {failed_count}")
+
+    def _wm_regenerate_slots(self) -> None:
         self._save_window_manager_settings()
         arrangement = self._wm_read_arrangement_config()
         if arrangement is None:
@@ -1673,25 +1770,61 @@ class LauncherApp(tk.Tk):
             config,
             self.wm_title_template_var.get().strip(),
         )
-
         try:
-            self._log(f"窗口管理：开始全局重新排列，排列方式={tile_mode}")
-            self._log(f"窗口管理：当前 profile 槽位文件={self._wm_slots_path(layout_params)}")
+            current_count = len(list_game_windows(exclude_hwnds=excluded_hwnds))
+        except Exception as exc:
+            self._log(f"窗口管理：重新生成槽位前识别窗口失败：{exc}")
+            messagebox.showerror("重新生成槽位失败", str(exc))
+            return
+        target_count = layout_params.target_window_count
+        if not self._wm_require_complete_windows("重新生成槽位", current_count, target_count):
+            return
+
+        confirmed = messagebox.askyesno(
+            "重新生成槽位",
+            "此操作会按当前 UI 参数重新排列并重新编号全部窗口，"
+            "并覆盖当前 profile 的槽位文件。\n\n"
+            f"当前检测到 {current_count} 个窗口，目标数量 {target_count}，数量一致。\n"
+            "其它 profile 槽位文件不会被覆盖。\n\n是否继续？",
+            parent=self,
+        )
+        if not confirmed:
+            self._log("窗口管理：已取消重新生成槽位。")
+            return
+
+        self._wm_start_action_worker(
+            "重新生成槽位",
+            self._wm_regenerate_slots_worker,
+            (tile_mode, config, excluded_hwnds, layout_params, target_count),
+        )
+
+    def _wm_regenerate_slots_worker(
+        self,
+        tile_mode: str,
+        config: TileConfig | RowTileConfig,
+        excluded_hwnds: list[int],
+        layout_params,
+        target_count: int | None,
+    ) -> None:
+        try:
+            self._queue_log(f"窗口管理：开始全局重新排列，排列方式={tile_mode}")
+            self._queue_log(f"窗口管理：当前 profile 槽位文件={self._wm_slots_path(layout_params)}")
             results = self._wm_run_tile(
                 tile_mode=tile_mode,
                 tile_config=config,
                 exclude_hwnds=excluded_hwnds,
-                log=lambda message: self._log(f"窗口管理：{message}"),
+                log=lambda message: self._queue_log(f"窗口管理：{message}"),
             )
         except Exception as exc:
-            self._log(f"窗口管理：重新生成槽位失败：{exc}")
-            messagebox.showerror("重新生成槽位失败", str(exc))
+            error = str(exc)
+            self._queue_log(f"窗口管理：重新生成槽位失败：{error}")
+            self.after(0, lambda: messagebox.showerror("重新生成槽位失败", error))
             return
 
-        self._wm_log_tile_results(results, lambda message: self._log(f"窗口管理：{message}"))
+        self._wm_log_tile_results(results, lambda message: self._queue_log(f"窗口管理：{message}"))
         if self.wm_auto_rename_after_tile_var.get():
             self._wm_rename_windows_after_tile(
-                log=lambda message: self._log(f"[窗口管理] {message}"),
+                log=lambda message: self._queue_log(f"[窗口管理] {message}"),
                 exclude_hwnds=excluded_hwnds,
                 force_global=True,
             )
@@ -1701,13 +1834,15 @@ class LauncherApp(tk.Tk):
                 slots_path=self._wm_slots_path(layout_params),
                 exclude_hwnds=excluded_hwnds,
                 layout_params=layout_params,
+                expected_count=target_count,
             )
         except Exception as exc:
-            self._log(f"窗口管理：排列完成，但保存当前 profile 槽位失败：{exc}")
-            messagebox.showerror("保存槽位失败", str(exc))
+            error = str(exc)
+            self._queue_log(f"窗口管理：排列完成，但保存当前 profile 槽位失败：{error}")
+            self.after(0, lambda: messagebox.showerror("保存槽位失败", error))
             return
 
-        self._log(f"窗口管理：已重新生成并保存 {len(slots)} 个槽位到 {self._wm_slots_path(layout_params)}。")
+        self._queue_log(f"窗口管理：已重新生成并保存 {len(slots)} 个槽位到 {self._wm_slots_path(layout_params)}。")
 
     def _wm_repair_window_slot(self) -> None:
         self._save_window_manager_settings()
@@ -1733,18 +1868,16 @@ class LauncherApp(tk.Tk):
         layout_params = self._wm_current_slot_layout_params()
         if layout_params is None:
             return
-        slots_path = self._wm_slots_path(layout_params)
-        if not has_valid_window_slots(slots_path):
-            message = (
-                f"当前 profile 尚未生成槽位：{slots_path.name}。\n"
-                "请先执行“重新生成槽位”。"
-            )
-            self._log(f"[窗口管理] 修复窗口失败：{message.replace(chr(10), ' ')}")
+        target_count = layout_params.target_window_count
+        if target_count is not None and slot_no > int(target_count):
+            message = f"目标槽位 {slot_no} 超出当前目标窗口数 {target_count}。"
+            self._log(f"[窗口管理] 修复窗口失败：{message}")
             messagebox.showwarning("修复窗口", message)
             return
+        slots_path = self._wm_slots_path(layout_params)
         title_template = self.wm_title_template_var.get().strip() or None
         excluded_hwnds = self._wm_excluded_hwnds()
-        fixed_config = self._wm_read_fixed_slot_config()
+        fixed_config = self._wm_read_fixed_slot_config() if layout_params.mode == "fixed" else None
         try:
             slot, slot_source, resolve_error = resolve_window_slot_for_repair(
                 slot_no=slot_no,
@@ -1764,6 +1897,10 @@ class LauncherApp(tk.Tk):
             return
         if slot_source == "slot_file":
             self._log(f"[窗口管理] slot {slot_no} 已从当前 profile 槽位文件读取：{slots_path.name}")
+        elif slot_source == "slot_backup":
+            self._log(f"[窗口管理] slot {slot_no} 已从当前 profile 最近备份槽位文件读取。")
+        elif slot_source == "legacy_slot_file":
+            self._log(f"[窗口管理] slot {slot_no} 已从 legacy window_slots.json 读取。")
         elif slot_source == "current_title":
             self._log(
                 f"[窗口管理] slot {slot_no} 已从当前窗口标题补齐："
@@ -1786,11 +1923,11 @@ class LauncherApp(tk.Tk):
                 self._log(f"[窗口管理] 已取消修复 slot {slot_no}。")
                 return
 
-        threading.Thread(
-            target=self._wm_repair_window_slot_worker,
-            args=(slot_no, game_path, close_existing, title_template, excluded_hwnds, fixed_config, layout_params),
-            daemon=True,
-        ).start()
+        self._wm_start_action_worker(
+            "修复窗口",
+            self._wm_repair_window_slot_worker,
+            (slot_no, game_path, close_existing, title_template, excluded_hwnds, fixed_config, layout_params),
+        )
 
     def _wm_repair_window_slot_worker(
         self,
@@ -1824,6 +1961,8 @@ class LauncherApp(tk.Tk):
         slot = result.slot
         source_text = {
             "slot_file": "当前 profile 槽位文件",
+            "slot_backup": "当前 profile 最近备份槽位文件",
+            "legacy_slot_file": "legacy window_slots.json",
             "current_title": "当前窗口标题",
             "fixed_config": "固定排列参数推导",
         }.get(result.slot_source, result.slot_source or "未知")
@@ -1831,10 +1970,13 @@ class LauncherApp(tk.Tk):
         log(f"读取 slot {slot_no}：x={slot.x} y={slot.y} w={slot.width} h={slot.height}")
         log(f"旧 hwnd={result.old_hwnd if result.old_hwnd else '无'}")
         if result.success:
-            log("仅启动 1 个新窗口")
-            log(f"检测到新 hwnd={result.new_hwnd}")
-            log(f"新窗口已移动到 slot {slot_no}")
-            log(f"新窗口已重命名为窗口 {slot_no}：{result.new_title}")
+            if result.slot.status == "已存在":
+                log(f"当前桌面已存在窗口 {slot_no}，未启动新窗口，只更新 slot {slot_no} 映射")
+            else:
+                log("仅启动 1 个新窗口")
+                log(f"检测到新 hwnd={result.new_hwnd}")
+                log(f"新窗口已移动到 slot {slot_no}")
+                log(f"新窗口已重命名为窗口 {slot_no}：{result.new_title}")
             log(f"slot {slot_no} 补位完成")
         elif result.requires_close_confirmation:
             log(f"slot {slot_no} 旧窗口仍存在，需确认后关闭旧窗口再补位：{result.error}")

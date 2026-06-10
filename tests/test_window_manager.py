@@ -21,6 +21,8 @@ from douluo_launcher.window_manager import (  # noqa: E402
     layout_params_from_tile_config,
     load_window_slot_metadata,
     load_window_slots,
+    refresh_window_slots_from_current_windows,
+    resolve_window_slot_for_repair,
     save_current_windows_as_slots,
     sort_game_windows,
     window_slots_profile_path,
@@ -346,6 +348,132 @@ class WindowManagerTests(unittest.TestCase):
         self.assertEqual(loaded_environment, environment)
         self.assertEqual(loaded_layout, layout_params)
         self.assertEqual(loaded_slots[0].hwnd, 200)
+
+    def test_save_current_windows_as_slots_blocks_expected_count_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "window_slots.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "slots": {
+                            str(index): {
+                                "slot_no": index,
+                                "title": f"斗罗大陆H5-{index}号",
+                                "hwnd": 1000 + index,
+                                "x": index,
+                                "y": 0,
+                                "width": 320,
+                                "height": 540,
+                            }
+                            for index in range(1, 32)
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            windows = [
+                GameWindow(hwnd=2000 + index, title=f"斗罗大陆H5-{index}号", number=index)
+                for index in range(1, 31)
+            ]
+
+            with mock.patch("douluo_launcher.window_manager.list_game_windows", return_value=windows):
+                with self.assertRaisesRegex(ValueError, "目标 31，当前 30"):
+                    save_current_windows_as_slots(path, expected_count=31)
+
+            self.assertEqual(len(load_window_slots(path)), 31)
+
+    def test_refresh_window_slots_blocks_expected_count_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "window_slots.json"
+            path.write_text(
+                json.dumps({"version": 1, "slots": {}}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            windows = [
+                GameWindow(hwnd=2000 + index, title=f"斗罗大陆H5-{index}号", number=index)
+                for index in range(1, 31)
+            ]
+
+            with mock.patch("douluo_launcher.window_manager.list_game_windows", return_value=windows):
+                with self.assertRaisesRegex(ValueError, "目标 31，当前 30"):
+                    refresh_window_slots_from_current_windows(path, expected_count=31)
+
+            self.assertEqual(load_window_slots(path), [])
+
+    def test_slot_write_creates_backup_before_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "window_slots.json"
+            first = [GameWindow(hwnd=201, title="斗罗大陆H5-1号", number=1)]
+            second = [GameWindow(hwnd=202, title="斗罗大陆H5-1号", number=1)]
+
+            with mock.patch("douluo_launcher.window_manager.list_game_windows", return_value=first):
+                save_current_windows_as_slots(path, expected_count=1)
+            with mock.patch("douluo_launcher.window_manager.list_game_windows", return_value=second):
+                save_current_windows_as_slots(path, expected_count=1)
+
+            backups = list((Path(tmp) / "backups").glob("window_slots_*.json"))
+            self.assertEqual(len(backups), 1)
+            self.assertIn('"hwnd": 201', backups[0].read_text(encoding="utf-8"))
+            self.assertFalse(path.with_name("window_slots.json.tmp").exists())
+            self.assertEqual(load_window_slots(path)[0].hwnd, 202)
+
+    def test_resolve_repair_slot_uses_recent_backup_before_fixed_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            slots_dir = Path(tmp) / "slots"
+            backups_dir = slots_dir / "backups"
+            backups_dir.mkdir(parents=True)
+            path = slots_dir / "profile.json"
+            path.write_text(json.dumps({"version": 1, "slots": {}}, ensure_ascii=False), encoding="utf-8")
+            backup = backups_dir / "profile_20260610_010203.json"
+            backup.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "slots": {
+                            "29": {
+                                "slot_no": 29,
+                                "title": "斗罗大陆H5-29号",
+                                "hwnd": 2900,
+                                "x": 1530,
+                                "y": 1575,
+                                "width": 320,
+                                "height": 540,
+                            }
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            fixed = TileConfig(width=320, height=540, start_x=250, start_y=0, offset_x=320, offset_y=525, per_row=8)
+
+            with mock.patch("douluo_launcher.window_manager.list_game_windows", return_value=[]):
+                slot, source, error = resolve_window_slot_for_repair(29, path, fixed_config=fixed)
+
+            self.assertEqual(error, "")
+            self.assertEqual(source, "slot_backup")
+            self.assertEqual(slot.x, 1530)
+
+    def test_resolve_repair_slot_uses_fixed_config_without_writing_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "slots" / "profile.json"
+            fixed = TileConfig(width=320, height=540, start_x=250, start_y=0, offset_x=320, offset_y=525, per_row=8)
+
+            with mock.patch("douluo_launcher.window_manager.list_game_windows", return_value=[]):
+                slot, source, error = resolve_window_slot_for_repair(
+                    29,
+                    path,
+                    title_template="斗罗大陆H5-{index}号",
+                    fixed_config=fixed,
+                )
+
+            self.assertEqual(error, "")
+            self.assertEqual(source, "fixed_config")
+            self.assertEqual((slot.x, slot.y, slot.width, slot.height), (1530, 1575, 320, 540))
+            self.assertEqual(slot.title, "斗罗大陆H5-29号")
+            self.assertFalse(path.exists())
 
 
 if __name__ == "__main__":

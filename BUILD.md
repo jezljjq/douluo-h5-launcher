@@ -214,7 +214,9 @@ exe 发布包已内置 32 位 `dm_click_helper.exe`，目标电脑不需要安�
 dist\Launcher\ms-playwright\chromium-*\chrome-win64\chrome.exe
 ```
 
-打包脚本会从打包机器的 `%LOCALAPPDATA%\ms-playwright` 复制整个浏览器缓存到 `dist\Launcher\ms-playwright`，并校验 `chromium-*\chrome-win64\chrome.exe` 至少存在一个。目标机器不需要安装 Playwright 或执行 `playwright install`。
+打包脚本会从打包机器的 `%LOCALAPPDATA%\ms-playwright` 中选择当前 Playwright 实际需要的一个 Chromium 目录复制到 `dist\Launcher\ms-playwright`。目标机器不需要安装 Playwright 或执行 `playwright install`。
+
+当前发布包只允许携带一个 Chromium 目录。打包脚本会读取 Playwright Python 包内的 `driver\package\browsers.json`，识别 `chromium` revision，例如 `chromium-1217`，只复制该目录到 `dist\Launcher\ms-playwright`。如果本机缓存里同时存在旧版本 Chromium，例如 `chromium-1208`，脚本必须排除旧目录；打包后 `dist\Launcher\ms-playwright\chromium-*\chrome-win64\chrome.exe` 必须且只能匹配到 1 个。
 
 如果打包机器没有本地 Chromium 缓存，脚本会失败并提示先在打包机器执行：
 

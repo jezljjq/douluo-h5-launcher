@@ -36,10 +36,18 @@ _OPEN_SESSIONS: list[tuple[object, object]] = []
 _OPEN_SESSIONS_LOCK = threading.Lock()
 
 
+def _find_playwright_chromium_exes(browsers_dir: Path) -> list[Path]:
+    return [
+        candidate
+        for candidate in sorted(browsers_dir.glob("chromium-*/chrome-win64/chrome.exe"))
+        if candidate.is_file()
+    ]
+
+
 def _find_playwright_chromium_exe(browsers_dir: Path) -> Path | None:
-    for candidate in sorted(browsers_dir.glob("chromium-*/chrome-win64/chrome.exe")):
-        if candidate.is_file():
-            return candidate
+    candidates = _find_playwright_chromium_exes(browsers_dir)
+    if len(candidates) == 1:
+        return candidates[0]
     return None
 
 
@@ -1212,6 +1220,17 @@ class AccountRunner:
         if is_bundled and not self._playwright_runtime_logged:
             self.log(f"使用内置 Playwright 浏览器目录：{browsers_dir}")
             self._playwright_runtime_logged = True
+
+        if is_bundled:
+            chromium_exes = _find_playwright_chromium_exes(browsers_dir)
+            if len(chromium_exes) != 1:
+                candidates = "；".join(str(path) for path in chromium_exes) or "无"
+                raise RuntimeError(
+                    "发布包 Playwright Chromium 数量异常，请重新打包。"
+                    "目标机器不应手动安装 Playwright。"
+                    f"检查路径：{browsers_dir}\\chromium-*\\chrome-win64\\chrome.exe；"
+                    f"当前候选数量={len(chromium_exes)}；候选={candidates}"
+                )
 
         if is_bundled and _find_playwright_chromium_exe(browsers_dir) is None:
             raise RuntimeError(

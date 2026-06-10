@@ -11,6 +11,7 @@ from douluo_launcher.automation import (
     AccountRunner,
     _dm_helper_command,
     _ensure_playwright_browsers_path,
+    _find_playwright_chromium_exe,
     extract_hex_passport,
     extract_passport_from_text,
 )
@@ -69,6 +70,16 @@ class AutomationHelperTests(unittest.TestCase):
                 expected = _ensure_playwright_browsers_path()
 
             self.assertEqual(expected.resolve(), browser_dir.resolve())
+
+    def test_bundled_playwright_chromium_must_be_unique(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            browser_dir = Path(temp_dir) / "ms-playwright"
+            for revision in ("chromium-1208", "chromium-1217"):
+                chrome = browser_dir / revision / "chrome-win64" / "chrome.exe"
+                chrome.parent.mkdir(parents=True, exist_ok=True)
+                chrome.write_text("", encoding="utf-8")
+
+            self.assertIsNone(_find_playwright_chromium_exe(browser_dir))
 
     def test_dm_helper_command_prefers_bundled_exe(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

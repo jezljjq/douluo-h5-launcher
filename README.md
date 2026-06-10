@@ -47,13 +47,13 @@
 | CSV 导入 | ✅ 稳定 | encoding 自动检测 + 路径记忆 | — |
 | 耗时统计 | ✅ 已实现 | 分阶段计时 + 日志+表格双显示 | — |
 | 截图/日志清理 | ✅ 已实现 | _error/ 保留10张，logs/ 保留2份 | — |
-| 窗口管理区 | ✅ 已接入 | 批量启动、识别、按槽位恢复排列、关闭、重命名、单窗口补位、参数记忆 | [docs/WINDOW_MANAGER_AND_PASSPORT_MILESTONE.md](docs/WINDOW_MANAGER_AND_PASSPORT_MILESTONE.md) |
+| 窗口管理区 | ✅ 已接入 | 批量启动、识别、按槽位恢复排列、关闭、重命名、单窗口补位、槽位完整性保护、参数记忆 | [docs/WINDOW_MANAGER_AND_PASSPORT_MILESTONE.md](docs/WINDOW_MANAGER_AND_PASSPORT_MILESTONE.md) |
 | 停止任务/关闭清理 | ✅ 已验证 | 停止时终止账号子进程、清理 dm_click_helper.py 和 Chromium | [CLICK_SOLUTION.md](CLICK_SOLUTION.md) |
 | 通行证弹窗坐标缓存 | ✅ 已验证 | `debug_ocr/passport_dialog_pos_cache.json` 按 viewport 缓存 button/input/confirm，跨账号/子进程复用 | [CLICK_SOLUTION.md](CLICK_SOLUTION.md) |
 | 批量快速登录 + 统一校验 | ✅ 已验证 | 当前层/全部串行先快速提交，统一校验后只重登失败账号；9 个单层账号最终 9/9 成功 | [docs/LAUNCHER_FINAL_MILESTONE.md](docs/LAUNCHER_FINAL_MILESTONE.md) |
 | 串行按钮范围与预检 | ✅ 源码验证 | 单账号/当前层/全部串行范围隔离；全部串行先生成 run_plan 并一次性校验窗口缺口 | [CURRENT_ISSUES.md](CURRENT_ISSUES.md) |
 | 源码 / exe 一致性 | ✅ 已验证 | exe 使用 `dist/Launcher/上号器.exe`，发布包内置 `ms-playwright` Chromium，不依赖目标电脑用户缓存 | [BUILD.md](BUILD.md) |
-| 防回归技能 | ✅ 已新增 | `D:\Ai\skills\launcher-regression-guard\SKILL.md`，用于修改前检查旧问题是否复发 | — |
+| 防回归体系 | ✅ 已加固 | 历史事故台账 + 自动化测试映射 + 打包前硬检查；没有回归测试的修复不算完成 | [ERROR_HISTORY.md](ERROR_HISTORY.md), [REGRESSION_TESTS.md](REGRESSION_TESTS.md) |
 
 ### 2.0.1 收藏夹路径规则
 
@@ -186,6 +186,16 @@
 只有点击高风险操作“重新生成槽位”并二次确认后，才允许全局排序、全局排列、全局重命名并覆盖 `window_slots.json`。
 
 全部 H5 窗口已经关闭后再执行“批量启动窗口”时，属于新窗口会话：程序不会沿用旧 `hwnd` 快照恢复，而是按当前 `window_manager_settings.json` 的窗口管理参数重新排列、重命名并生成新的 `window_slots.json`。
+
+2026-06-10 槽位保护规则：
+
+- 当前 profile 目标窗口数为 31 时，当前只识别到 30 个窗口，禁止“重新生成槽位”和“刷新槽位映射”，防止用不完整窗口覆盖完整槽位。
+- `save_current_windows_as_slots` / `refresh_window_slots_from_current_windows` 底层也会校验 expected_count，绕过 GUI 时仍不能写入不完整槽位。
+- 覆盖当前 profile 槽位文件前会先备份到 `slots/backups/`，再写 `.tmp`，最后 replace 到正式文件；写入失败不会破坏旧文件。
+- “修复窗口”不再依赖当前完整映射。解析 slot 顺序为：当前 profile 槽位文件 → 当前 profile 最近备份 → legacy `window_slots.json` → 当前桌面同编号窗口 → 固定参数推导。
+- 固定参数模式下可根据 slot_no、每行数量、起点、偏移和窗口宽高推导缺失 slot 坐标，例如 slot 29 可直接推导到第 4 行第 5 列。
+- 修复窗口只启动 1 个新窗口并只 upsert 目标 slot，不移动其它窗口，不全量覆盖槽位文件。
+- “重新生成槽位”“刷新槽位映射”“排列窗口”“修复窗口”“批量启动窗口”执行期间会禁用相关按钮，长耗时操作在 worker 线程中执行，避免 Tkinter 主线程卡死。
 
 ---
 
@@ -416,10 +426,27 @@ OpenCV: 4.13.0（模板匹配 + 视觉定位）
 11. [CURRENT_ISSUES.md](CURRENT_ISSUES.md) — 当前问题和限制
 12. [NEXT_STEPS.md](NEXT_STEPS.md) — 后续方向
 13. [KNOWN_BUGS.md](KNOWN_BUGS.md) — 重复踩坑记录
-14. [DEVELOPMENT_RULES.md](DEVELOPMENT_RULES.md) — 项目开发规则
-15. [DOC_UPDATE_PROMPT.md](DOC_UPDATE_PROMPT.md) — 文档整理通用指令（每次整理文档前必读）
-16. [BUILD_RELEASE_PROMPT.md](BUILD_RELEASE_PROMPT.md) — 打包发布通用指令（每次打包前必读）
-17. [docs/WINDOW_MANAGER_AND_PASSPORT_MILESTONE.md](docs/WINDOW_MANAGER_AND_PASSPORT_MILESTONE.md) — 窗口管理与通行证阶段总结
+14. [ERROR_HISTORY.md](ERROR_HISTORY.md) — 历史回归问题台账，记录禁止复发的问题
+15. [REGRESSION_TESTS.md](REGRESSION_TESTS.md) — 防回归测试映射和打包前检查命令
+16. [DEVELOPMENT_RULES.md](DEVELOPMENT_RULES.md) — 项目开发规则
+17. [DOC_UPDATE_PROMPT.md](DOC_UPDATE_PROMPT.md) — 文档整理通用指令（每次整理文档前必读）
+18. [BUILD_RELEASE_PROMPT.md](BUILD_RELEASE_PROMPT.md) — 打包发布通用指令（每次打包前必读）
+19. [docs/WINDOW_MANAGER_AND_PASSPORT_MILESTONE.md](docs/WINDOW_MANAGER_AND_PASSPORT_MILESTONE.md) — 窗口管理与通行证阶段总结
+
+---
+
+## 9.1 防回归检查
+
+以后每修一个 bug，必须在 [ERROR_HISTORY.md](ERROR_HISTORY.md) 登记历史问题，并在 [REGRESSION_TESTS.md](REGRESSION_TESTS.md) 记录对应测试。没有回归测试的修复，不算完成。
+
+提交、push、打包前必须执行：
+
+```powershell
+python -m compileall -q douluo_launcher main.py
+python -m unittest discover -s tests -v
+```
+
+如果回归测试失败，禁止提交、禁止 push、禁止打包。
 
 ---
 

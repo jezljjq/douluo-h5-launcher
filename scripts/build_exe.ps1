@@ -28,6 +28,44 @@ function Find-ChromiumExe([string]$BrowsersDir) {
     return $matches
 }
 
+function Get-ChromiumDirs([string]$BrowsersDir) {
+    if (-not (Test-Path -LiteralPath $BrowsersDir)) {
+        return @()
+    }
+    return @(Get-ChildItem -LiteralPath $BrowsersDir -Directory -Filter "chromium-*" -ErrorAction SilentlyContinue)
+}
+
+function Get-PlaywrightChromiumDirName() {
+    $code = @'
+import json
+from pathlib import Path
+import playwright
+
+path = Path(playwright.__file__).resolve().parent / 'driver' / 'package' / 'browsers.json'
+data = json.loads(path.read_text(encoding='utf-8'))
+for browser in data.get("browsers", []):
+    if browser.get('name') == 'chromium':
+        revision = str(browser.get('revision') or '').strip()
+        if revision:
+            print('chromium-' + revision)
+            raise SystemExit(0)
+raise SystemExit(2)
+'@
+    $tempScript = Join-Path ([System.IO.Path]::GetTempPath()) ("launcher_playwright_revision_{0}.py" -f ([System.Guid]::NewGuid().ToString("N")))
+    try {
+        Set-Content -LiteralPath $tempScript -Value $code -Encoding UTF8
+        $output = & python $tempScript 2>$null
+        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($output)) {
+            return $null
+        }
+        return ($output | Select-Object -First 1).Trim()
+    } finally {
+        if (Test-Path -LiteralPath $tempScript) {
+            Remove-Item -LiteralPath $tempScript -Force
+        }
+    }
+}
+
 function Copy-Directory([string]$Source, [string]$Destination) {
     if (Test-Path -LiteralPath $Destination) {
         Remove-Item -LiteralPath $Destination -Recurse -Force
@@ -104,11 +142,35 @@ Step "[2/7] Check Playwright Chromium location"
 if (-not (Test-Path -LiteralPath $PlaywrightBrowsers)) {
     Fail "打包机器缺少 Playwright Chromium: $PlaywrightBrowsers. 请先在打包机器执行: python -m playwright install chromium"
 }
-$SourceChromiumExe = Find-ChromiumExe $PlaywrightBrowsers
+$ExpectedChromiumDirName = Get-PlaywrightChromiumDirName
+if ([string]::IsNullOrWhiteSpace($ExpectedChromiumDirName)) {
+    $availableChromiumDirs = Get-ChromiumDirs $PlaywrightBrowsers | Sort-Object Name
+    if ($availableChromiumDirs.Count -eq 0) {
+        Fail "无法从 Playwright browsers.json 识别 Chromium revision，且本地没有 chromium-* 目录。请先执行: python -m playwright install chromium"
+    }
+    $expectedDir = $availableChromiumDirs | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    $ExpectedChromiumDirName = $expectedDir.Name
+    Write-Host "  warning: browsers.json revision not found; selected latest local Chromium: $ExpectedChromiumDirName"
+} else {
+    Write-Host "  expected Chromium from Playwright browsers.json: $ExpectedChromiumDirName"
+}
+$SourceChromiumDir = Join-Path $PlaywrightBrowsers $ExpectedChromiumDirName
+$SourceChromiumExe = Join-Path $SourceChromiumDir "chrome-win64\chrome.exe"
 if ($null -eq $SourceChromiumExe) {
     Fail "打包机器缺少 Playwright Chromium chrome.exe. 请先在打包机器执行: python -m playwright install chromium"
 }
+if (-not (Test-Path -LiteralPath $SourceChromiumExe)) {
+    Fail "打包机器缺少当前 Playwright 需要的 Chromium: $SourceChromiumExe. 请先执行: python -m playwright install chromium"
+}
+$allSourceChromiumDirs = Get-ChromiumDirs $PlaywrightBrowsers | Sort-Object Name
+$excludedChromiumDirs = @($allSourceChromiumDirs | Where-Object { $_.Name -ne $ExpectedChromiumDirName } | ForEach-Object { $_.Name })
 Write-Host "  source browsers: $PlaywrightBrowsers"
+Write-Host "  selected Chromium dir: $ExpectedChromiumDirName"
+if ($excludedChromiumDirs.Count -gt 0) {
+    Write-Host "  excluded old Chromium dirs: $($excludedChromiumDirs -join ', ')"
+} else {
+    Write-Host "  excluded old Chromium dirs: none"
+}
 Write-Host "  source Chromium: $SourceChromiumExe"
 $env:PLAYWRIGHT_BROWSERS_PATH = $PlaywrightBrowsers
 
@@ -201,15 +263,32 @@ New-Item -ItemType Directory -Force -Path $DebugDir | Out-Null
 Copy-Item -LiteralPath "debug_ocr\template_passport_btn.png" -Destination $DebugDir -Force
 Write-Host "  copied: debug_ocr\template_passport_btn.png"
 
-Write-Host "  copying: ms-playwright browser cache"
-Copy-Directory $PlaywrightBrowsers $BundledPlaywrightBrowsers
-Get-ChildItem -LiteralPath $BundledPlaywrightBrowsers -Directory -Filter "mcp-chrome-*" -ErrorAction SilentlyContinue |
-    Remove-Item -Recurse -Force
-$BundledChromiumExe = Find-ChromiumExe $BundledPlaywrightBrowsers
+Write-Host "  copying: selected ms-playwright Chromium"
+Remove-IfExists $BundledPlaywrightBrowsers
+New-Item -ItemType Directory -Force -Path $BundledPlaywrightBrowsers | Out-Null
+$BundledChromiumDir = Join-Path $BundledPlaywrightBrowsers $ExpectedChromiumDirName
+Copy-Directory $SourceChromiumDir $BundledChromiumDir
+$bundledChromiumDirs = Get-ChromiumDirs $BundledPlaywrightBrowsers | Sort-Object Name
+if ($bundledChromiumDirs.Count -gt 1) {
+    $unexpected = @($bundledChromiumDirs | Where-Object { $_.Name -ne $ExpectedChromiumDirName })
+    foreach ($dir in $unexpected) {
+        Write-Host "  removing unexpected Chromium dir from release: $($dir.Name)"
+        Remove-Item -LiteralPath $dir.FullName -Recurse -Force
+    }
+    $bundledChromiumDirs = Get-ChromiumDirs $BundledPlaywrightBrowsers | Sort-Object Name
+}
+if ($bundledChromiumDirs.Count -ne 1) {
+    Fail "发布包 ms-playwright 中 Chromium 目录数量异常：$($bundledChromiumDirs.Count)。必须且只能有 1 个 chromium-*。"
+}
+$BundledChromiumExe = Join-Path $bundledChromiumDirs[0].FullName "chrome-win64\chrome.exe"
 if ($null -eq $BundledChromiumExe) {
     Fail "Copied ms-playwright but no Chromium chrome.exe was found under $BundledPlaywrightBrowsers"
 }
+if (-not (Test-Path -LiteralPath $BundledChromiumExe)) {
+    Fail "Copied selected Chromium but chrome.exe was not found: $BundledChromiumExe"
+}
 Write-Host "  copied: ms-playwright"
+Write-Host "  bundled Chromium dirs count: $($bundledChromiumDirs.Count)"
 Write-Host "  bundled Chromium: $BundledChromiumExe"
 
 $Docs = @(
