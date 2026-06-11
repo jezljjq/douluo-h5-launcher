@@ -15,6 +15,7 @@
 | Python (32-bit) | 3.14.4 | `py -3.14-32` 可调用 |
 | PyInstaller | 6.20.0+ | `pip install pyinstaller` |
 | Tesseract OCR | 任意 | 需在 PATH 中或配置路径 |
+| tkinterdnd2 | 0.5.0+ | `pip install -r requirements.txt`，用于游戏图标拖拽 |
 
 ### 依赖检查
 
@@ -104,6 +105,8 @@ dist/Launcher/上号器.exe
 - 需要 Tesseract OCR 在系统 PATH 中
 - Dm 点击优先调用 exe 同级 `dm_click_helper.exe`，目标电脑不需要安装 Python
 - 大漠 COM 仍需在目标电脑注册
+- 游戏图标拖拽依赖 `tkinterdnd2` 的 tkdnd 资源，打包脚本必须包含 `--collect-all tkinterdnd2`
+- 如果用户主动以管理员身份运行 exe，普通资源管理器拖拽可能被 Windows 权限隔离拦截；正常双击运行可拖入桌面快捷方式
 
 ### 源码模式
 
@@ -139,7 +142,9 @@ dist/Launcher/上号器.exe
 pyinstaller --onedir --noconsole --name "Launcher" ^
     --add-data "automation_settings.json;." ^
     --add-data "debug_ocr\template_passport_btn.png;debug_ocr" ^
+    --collect-all tkinterdnd2 ^
     --hidden-import PIL --hidden-import pytesseract --hidden-import cv2 ^
+    --hidden-import tkinterdnd2 ^
     --hidden-import win32com --hidden-import win32gui --hidden-import win32con ^
     --hidden-import playwright.sync_api ^
     --hidden-import douluo_launcher ^
@@ -160,14 +165,14 @@ pyinstaller --onedir --noconsole --name "Launcher" ^
 
 ### exe 模式收藏夹路径
 
-`automation_settings.json` 中的 `bookmark_file` 是用户保存的收藏夹路径。当前默认浏览器为 Edge；没有保存路径时才使用 `Edge Default` Bookmarks。Chrome Bookmarks 只能作为候选提示，不能因为文件存在就静默覆盖用户配置。
+`automation_settings.json` 中的 `bookmark_file` 是用户保存的收藏夹路径。没有保存路径时，程序会扫描 Edge / Chrome 候选并让用户在界面中选择；不能因为某个浏览器 Bookmarks 文件存在就静默覆盖用户配置。
 
 打包后 exe 读取的是 `dist\Launcher\automation_settings.json`，不应回退到源码目录配置，也不应写入默认 Chrome 路径。发布包中的默认配置当前记录：
 
 ```text
-bookmark_browser=Edge
-bookmark_profile=Default
-bookmark_file=C:\Users\Administrator\AppData\Local\Microsoft\Edge\User Data\Default\Bookmarks
+bookmark_browser=
+bookmark_profile=
+bookmark_file=
 ```
 
 `automation_settings.json` 还保存 `account_group_settings`，用于控制哪些收藏夹分组参与“全部串行”。该字段只影响运行范围，不改变收藏夹读取结果：

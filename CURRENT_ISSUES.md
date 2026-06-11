@@ -12,7 +12,8 @@
 - 方式二：账号密码 + 通行证上号流程曾通过验证。
 - OCR、公告关闭、Dm 输入、Playwright 流程曾通过回归验证。
 - 窗口识别、排列、关闭曾通过验证。
-- 窗口排列/关闭权限不足问题已定位为管理员权限问题，并已处理默认管理员启动相关逻辑。
+- 窗口排列/关闭权限不足问题已定位为管理员权限问题；但 GUI 默认不能启动时自动管理员提权，否则普通资源管理器无法拖入桌面游戏图标。
+- 游戏路径拖拽当前采用 `tkinterdnd2`，原生 `WM_DROPFILES` 闪退方案禁止回退。
 - 停止任务和关闭程序清理子进程问题已验证通过。
 - 文件级通行证弹窗坐标缓存已验证生效，可跨账号、跨源码模式子进程复用。
 - 合并 Dm chain 已验证生效，命中缓存后链路为 `click 通行证按钮 → wait → click 输入框 → type 通行证 → click 确认`。
@@ -130,9 +131,9 @@ OCR 兜底规则：
 当前已修复收藏夹路径被 Chrome 候选静默覆盖的问题。
 
 - 程序启动时优先使用 `automation_settings.json` 中保存的 `bookmark_file`。
-- 当前默认浏览器为 Edge；没有保存路径时，默认使用 `Edge Default` 的 Bookmarks。
-- Chrome / Edge 自动探测只作为候选日志，不允许 Chrome 静默覆盖 Edge。
-- 保存配置时会记录 `bookmark_file`、`bookmark_browser`、`bookmark_profile`。
+- 没有保存路径时，程序会扫描 Edge / Chrome 候选并让用户在界面选择；多个候选时不静默覆盖。
+- Chrome / Edge 自动探测只作为候选，不允许任何浏览器静默覆盖用户保存路径。
+- 保存配置时会记录 `bookmark_file`、`bookmark_browser`、`bookmark_profile`、`bookmark_root_path`、`bookmark_root_display_name`。
 - 读取收藏夹失败时会输出当前读取路径和检测到的一级目录，便于判断是否选错浏览器或 profile。
 - exe 模式同样读取 `dist\Launcher\automation_settings.json`，不能回退覆盖为源码配置或默认 Chrome 路径。
 
@@ -140,8 +141,8 @@ OCR 兜底规则：
 
 当前已完成动态分组读取和全部串行分组自选。
 
-- 收藏夹根目录为 `账号`。
-- 层级下拉会动态读取 `账号` 目录下真实存在的子目录，不再写死第一层到第四层。
+- 收藏夹账号目录不再强制叫 `账号`，由“账号目录”下拉选择 Bookmarks 中扫描到的候选。
+- 层级下拉会动态读取当前账号目录下真实存在的子目录，不再写死第一层到第四层。
 - `存钻`、`备用`、`小号` 等自定义分组只要包含有效游戏链接就会显示。
 - 自定义分组内账号标题不要求纯数字，`z1` / `z2` 等会按收藏夹原始顺序读取和映射窗口。
 - 根目录下数字收藏项继续作为 `单层账号`；根目录下非数字收藏项，例如 `JS`，会跳过并记录日志。
@@ -173,8 +174,8 @@ OCR 兜底规则：
 
 源码验证：
 
-- `python -m unittest discover -s tests -v`：44 tests OK。
-- `python -m compileall .\douluo_launcher .\tests .\main.py`：通过。
+- `python -m unittest discover -s tests -v`：94 tests OK。
+- `python -m compileall -q douluo_launcher main.py tools\drag_drop_poc.py`：通过。
 
 仍未现场验证：
 

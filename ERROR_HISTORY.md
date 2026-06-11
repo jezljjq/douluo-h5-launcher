@@ -157,3 +157,88 @@
 - `tests/test_config.py::ConfigTests::test_load_bookmarks_supports_dynamic_custom_groups_in_original_order`
 - `tests/test_gui_group_settings.py::GuiGroupSettingsTests::test_split_all_serial_accounts_only_enables_include_in_all_groups`
 
+## 9. 配置区路径和收藏夹写死问题
+
+历史问题：
+
+客户不知道 `X5Game.exe`、桌面快捷方式、浏览器 `Bookmarks` 文件和账号目录的真实位置；程序如果继续要求手动输入 `账号` 根目录，会导致普通客户无法配置。
+
+防回归规则：
+
+- 游戏路径不能写死，必须支持 exe、lnk 快捷方式和游戏安装目录。
+- `.lnk` 必须解析真实目标 exe，不能把 `.lnk` 本身保存为游戏路径。
+- 收藏夹文件路径不能写死；Edge / Chrome `Default` 和 `Profile *` 只能作为候选。
+- 账号目录不能强制叫 `账号`；必须扫描 Bookmarks 内所有包含有效游戏链接的目录。
+- 游戏链接直接放在收藏栏或其它收藏夹时必须支持。
+- 自动扫描不能静默覆盖用户保存选择；多个候选时必须由用户选择。
+- 主界面必须保持客户模式：游戏程序、自动查找收藏夹、收藏夹候选、账号目录、读取账号。
+- `Bookmarks` 原始路径、`bookmark_root_path`、兼容目录名和自动化设置路径必须放入默认折叠的高级配置。
+- 收藏夹候选和账号目录候选必须显示客户可读文本，禁止把原始路径或内部 JSON root path 放在主界面下拉里。
+
+测试：
+
+- `tests/test_path_utils.py::PathUtilsTests::test_exe_path_is_accepted`
+- `tests/test_path_utils.py::PathUtilsTests::test_lnk_resolves_to_target_exe`
+- `tests/test_path_utils.py::PathUtilsTests::test_lnk_target_missing_is_rejected`
+- `tests/test_path_utils.py::PathUtilsTests::test_lnk_target_not_exe_is_rejected`
+- `tests/test_path_utils.py::PathUtilsTests::test_folder_finds_x5game_exe`
+- `tests/test_path_utils.py::PathUtilsTests::test_folder_without_x5game_exe_is_rejected`
+- `tests/test_path_utils.py::PathUtilsTests::test_invalid_file_uses_customer_friendly_message`
+- `tests/test_bookmark_discovery.py::BookmarkDiscoveryTests::test_scans_edge_default_profile1_and_chrome_default`
+- `tests/test_bookmark_discovery.py::BookmarkDiscoveryTests::test_multiple_bookmark_candidates_do_not_silently_override_saved_path`
+- `tests/test_bookmark_discovery.py::BookmarkDiscoveryTests::test_direct_links_on_bookmark_bar_are_detected`
+- `tests/test_bookmark_discovery.py::BookmarkDiscoveryTests::test_direct_links_on_other_bookmarks_are_detected`
+- `tests/test_bookmark_discovery.py::BookmarkDiscoveryTests::test_root_name_not_account_is_detected_and_loadable`
+- `tests/test_gui_group_settings.py::GuiGroupSettingsTests::test_bookmark_file_candidate_label_hides_raw_path`
+- `tests/test_gui_group_settings.py::GuiGroupSettingsTests::test_game_program_status_uses_customer_text`
+
+## 10. 收藏候选与账号目录错配问题
+
+历史问题：
+
+切换“收藏候选”后，账号目录下拉仍保留上一个 Bookmarks 文件扫描出的目录，导致界面出现 `Chrome - Default` 配 `Edge` 的 `收藏栏 / 账号 / 存钻`。读取时又退回按最后目录名“存钻”搜索，最终在错误的 Chrome Bookmarks 中找根目录，运行区还继续显示上一次成功加载的第一层账号。
+
+防回归规则：
+
+- 切换收藏候选 Bookmarks 文件时，必须清空账号目录候选、当前账号目录选择、`bookmark_root_path`、`bookmark_root_display_name` 和旧账号列表。
+- 每个账号目录候选必须绑定自己的 `bookmark_file_path` 和结构化 `root_path`。
+- 读取账号前必须校验账号目录候选所属 Bookmarks 文件与当前收藏候选一致。
+- 读取账号必须使用结构化 `root_path` 定位目录，禁止只用显示文本最后一段目录名，例如“存钻”。
+- 读取失败时必须清空或明确标记旧账号列表，不能让用户误以为下方第一层数据属于当前选择。
+- 账号加载成功后，运行区层级和账号下拉必须来自当前账号数据；当前只读取 `存钻` 时，不能继续显示 `第一层`。
+
+测试：
+
+- `tests/test_gui_group_settings.py::GuiGroupSettingsTests::test_bookmark_root_candidate_must_belong_to_current_bookmark_file`
+- `tests/test_gui_group_settings.py::GuiGroupSettingsTests::test_empty_accounts_do_not_show_hardcoded_first_layer`
+- `tests/test_gui_group_settings.py::GuiGroupSettingsTests::test_single_loaded_group_defaults_to_that_group`
+- `tests/test_bookmark_discovery.py::BookmarkDiscoveryTests::test_same_named_directories_are_loaded_by_root_path_not_name`
+
+## 11. 游戏路径拖拽闪退与管理员权限阻断
+
+历史问题：
+
+将桌面 `.lnk` 快捷方式拖进“游戏程序”输入框后，程序直接闪退。根因是原生 `WM_DROPFILES` 子类化 Tk / ttk 控件不稳定，崩溃发生在底层窗口过程，Python 无法正常捕获异常。
+
+后续独立 POC 已验证公开库 `tkinterdnd2` 可以稳定接收拖入路径并解析 `.lnk -> E:\Program Files\DLH5\X5Game.exe`。主程序仍拖不进去的根因是 `main.py` 启动时自动管理员提权，Windows UIPI 会阻止普通资源管理器向管理员权限窗口拖入文件。
+
+防回归规则：
+
+- 禁止默认启用原生 `WM_DROPFILES` 游戏路径拖拽。
+- 当前正式拖拽实现使用 `tkinterdnd2`，禁止回退到会闪退的原生 `WM_DROPFILES`。
+- GUI 默认不得启动时自动管理员提权，否则普通资源管理器拖拽会被系统权限隔离拦截。
+- 客户主路径支持拖入桌面游戏图标、`.lnk`、`.exe` 和游戏安装目录；“选择游戏图标/程序”按钮作为兜底。
+- `.lnk` 必须解析 `TargetPath`，保存真实 exe，禁止保存 `.lnk`。
+- 输入框和“已识别游戏程序”状态必须来自同一份路径，不能一个空、一个显示已识别。
+- PyInstaller 打包必须收集 `tkinterdnd2` 资源，否则 exe 可能无法注册拖拽。
+
+测试：
+
+- `tests/test_gui_group_settings.py::GuiGroupSettingsTests::test_raw_native_game_path_drag_drop_is_disabled_to_avoid_tk_crash`
+- `tests/test_gui_group_settings.py::GuiGroupSettingsTests::test_game_program_hint_reflects_tkinterdnd2_drag_support`
+- `tests/test_gui_group_settings.py::GuiGroupSettingsTests::test_game_path_drop_uses_first_dropped_path_and_drop_source`
+- `tests/test_gui_group_settings.py::GuiGroupSettingsTests::test_drop_invalid_file_uses_drag_wording`
+- `tests/test_gui_group_settings.py::GuiGroupSettingsTests::test_game_program_input_and_status_share_same_saved_path`
+- `tests/test_gui_group_settings.py::GuiGroupSettingsTests::test_game_program_empty_path_has_empty_input_and_unselected_status`
+- `tests/test_path_utils.py::PathUtilsTests::test_lnk_resolves_to_target_exe`
+- `tests/test_main_startup.py::MainStartupTests::test_gui_startup_does_not_auto_elevate_so_file_drop_works`

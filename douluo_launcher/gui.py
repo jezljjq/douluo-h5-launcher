@@ -11,9 +11,17 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+except Exception:
+    DND_FILES = None
+    TkinterDnD = None
+
 from .automation import AccountRunner
 from .config import (
     AccountConfig,
+    BookmarkCandidate,
+    BookmarkRootCandidate,
     CSVAccount,
     LEVELS,
     SELECTABLE_LEVELS,
@@ -21,15 +29,19 @@ from .config import (
     STATUSES,
     app_root,
     describe_bookmark_file,
+    find_bookmark_root_candidate_by_path,
     find_bookmark_file_candidates,
-    find_preferred_bookmark_file,
     project_root,
     list_bookmark_top_level_dirs,
+    load_accounts_from_bookmark_root,
     load_accounts_from_bookmarks,
     load_csv_accounts,
     load_settings,
+    scan_bookmark_root_candidates,
+    select_bookmark_candidate_for_startup,
 )
 from .dm_client import diagnose_dm_environment_with_32bit_python, select_login_window_by_game_no
+from .path_utils import first_dropped_file_path, resolve_game_executable_path
 from .version import APP_VERSION
 from .window_manager import (
     RowTileConfig,
@@ -120,6 +132,70 @@ def _account_table_values(
         status,
         timing,
     )
+
+
+def _format_bookmark_file_candidate_label(candidate: BookmarkCandidate, root_count: int | None = None) -> str:
+    if root_count is None:
+        return candidate.display_name
+    return f"{candidate.display_name} - 发现 {root_count} 个账号目录"
+
+
+def _format_game_program_status(path: str) -> str:
+    clean_path = str(path or "").strip()
+    if clean_path:
+        return f"已识别游戏程序：{clean_path}"
+    return "未选择游戏程序"
+
+
+def _game_program_display_values(path: str) -> tuple[str, str]:
+    clean_path = str(path or "").strip()
+    return clean_path, _format_game_program_status(clean_path)
+
+
+def _should_enable_native_game_path_drag_drop() -> bool:
+    """Raw WM_DROPFILES is disabled because it can crash Tk; use tkinterdnd2 instead."""
+    return False
+
+
+def _is_tkinterdnd2_available() -> bool:
+    return DND_FILES is not None and TkinterDnD is not None
+
+
+def _game_program_hint_text() -> str:
+    if _is_tkinterdnd2_available():
+        return "可拖入桌面游戏图标、快捷方式或 X5Game.exe，也可点击按钮选择。"
+    return "点击“选择游戏图标/程序”，可选择桌面快捷方式或 X5Game.exe。"
+
+
+def _account_group_order_for_accounts(accounts: list[AccountConfig] | tuple[AccountConfig, ...]) -> tuple[str, ...]:
+    groups: list[str] = []
+    for account in accounts:
+        if account.level not in groups:
+            groups.append(account.level)
+    return tuple(groups)
+
+
+def _allowed_level_values_for_accounts(accounts: list[AccountConfig] | tuple[AccountConfig, ...]) -> tuple[str, ...]:
+    groups = _account_group_order_for_accounts(accounts)
+    if not groups:
+        return ("未读取",)
+    return ("全部", *groups)
+
+
+def _default_level_for_allowed_values(current_level: str, allowed_levels: tuple[str, ...]) -> str:
+    if current_level in allowed_levels:
+        return current_level
+    if len(allowed_levels) == 2 and allowed_levels[0] == "全部":
+        return allowed_levels[1]
+    return allowed_levels[0] if allowed_levels else ""
+
+
+def _normalize_path_for_compare(path: str | Path) -> str:
+    return os.path.normcase(os.path.normpath(str(path or "").strip()))
+
+
+def _root_candidate_belongs_to_bookmark_file(candidate: BookmarkRootCandidate, bookmark_file: str | Path) -> bool:
+    return _normalize_path_for_compare(candidate.bookmark_file) == _normalize_path_for_compare(bookmark_file)
 
 
 def _replace_account_table_value(values: object, column: str, value: str) -> list[object]:
@@ -218,7 +294,10 @@ def _format_group_counts(group_counts: tuple[tuple[str, int], ...]) -> str:
     return "、".join(f"{group} {count} 个" for group, count in group_counts) if group_counts else "无"
 
 
-class LauncherApp(tk.Tk):
+_TK_BASE = TkinterDnD.Tk if TkinterDnD is not None else tk.Tk
+
+
+class LauncherApp(_TK_BASE):
     def __init__(self) -> None:
         super().__init__()
         self.title(f"上号器 — 前台串行模式 v{APP_VERSION}")
@@ -249,6 +328,15 @@ class LauncherApp(tk.Tk):
         self.settings_path = tk.StringVar(value=str(app_root() / "automation_settings.json"))
         self.bookmark_path = tk.StringVar(value="")
         self.bookmark_root_name = tk.StringVar(value="账号")
+        self.bookmark_root_path = tk.StringVar(value="")
+        self.bookmark_root_display_name = tk.StringVar(value="")
+        self.bookmark_file_candidate_var = tk.StringVar(value="")
+        self.bookmark_root_candidate_var = tk.StringVar(value="")
+        self.bookmark_file_candidates = []
+        self.bookmark_root_candidates = []
+        self.bookmark_file_candidate_by_label: dict[str, object] = {}
+        self.bookmark_root_candidate_by_label: dict[str, object] = {}
+        self.advanced_config_visible = tk.BooleanVar(value=False)
         self.level_var = tk.StringVar(value="第一层")
         self.account_var = tk.StringVar(value="")
         self.max_workers_var = tk.IntVar(value=4)
@@ -259,6 +347,9 @@ class LauncherApp(tk.Tk):
         self.csv_path = tk.StringVar(value="")
         self.level_count_vars = {level: tk.IntVar(value=8) for level in LEVELS}
         self.wm_game_path_var = tk.StringVar(value="")
+        self.wm_game_status_var = tk.StringVar(value=_format_game_program_status(""))
+        self.wm_game_hint_var = tk.StringVar(value=_game_program_hint_text())
+        self.wm_game_path_var.trace_add("write", lambda *_: self._sync_game_program_status())
         self.wm_launch_count_var = tk.IntVar(value=31)
         self.wm_launch_interval_var = tk.IntVar(value=300)
         self.wm_auto_tile_after_launch_var = tk.BooleanVar(value=True)
@@ -292,6 +383,7 @@ class LauncherApp(tk.Tk):
         self._log_admin_status_warning()
         self._log_startup_dm_environment()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.after(300, self._enable_game_path_drag_drop)
 
     def _apply_settings_defaults(self) -> None:
         try:
@@ -301,10 +393,12 @@ class LauncherApp(tk.Tk):
         if settings.bookmark_file:
             self.bookmark_path.set(settings.bookmark_file)
         else:
-            edge_bookmark = find_preferred_bookmark_file("Edge", "Default")
-            if edge_bookmark:
-                self.bookmark_path.set(edge_bookmark)
+            selection = select_bookmark_candidate_for_startup("", find_bookmark_file_candidates())
+            if selection.candidate is not None:
+                self.bookmark_path.set(selection.candidate.path)
         self.bookmark_root_name.set(settings.bookmark_root_name)
+        self.bookmark_root_path.set(settings.bookmark_root_path)
+        self.bookmark_root_display_name.set(settings.bookmark_root_display_name)
         self.max_workers_var.set(settings.max_workers)
         self.notice_outside_x_var.set(settings.notice_close_outside_ratio[0])
         self.notice_outside_y_var.set(settings.notice_close_outside_ratio[1])
@@ -314,7 +408,7 @@ class LauncherApp(tk.Tk):
         if not candidates:
             return "未检测到 Chrome / Edge Bookmarks 候选"
         return "；".join(
-            f"{candidate.browser} {candidate.profile or '默认'}: {candidate.path}"
+            candidate.display_name
             for candidate in candidates
         )
 
@@ -340,16 +434,20 @@ class LauncherApp(tk.Tk):
                 )
             return
 
-        edge_bookmark = find_preferred_bookmark_file("Edge", "Default")
-        if edge_bookmark:
-            self.bookmark_path.set(edge_bookmark)
-            self._save_bookmark_settings(edge_bookmark)
-            self._log(f"当前未保存收藏夹路径，已按默认浏览器使用 Edge Default：{edge_bookmark}")
+        candidates = find_bookmark_file_candidates()
+        selection = select_bookmark_candidate_for_startup("", candidates)
+        if selection.candidate is not None:
+            self.bookmark_path.set(selection.candidate.path)
+            self._save_bookmark_settings(selection.candidate.path)
+            self._log(
+                f"当前未保存收藏夹路径，已自动选择唯一候选："
+                f"{selection.candidate.display_name}: {selection.candidate.path}"
+            )
             return
 
         self._log(
-            "当前未保存收藏夹路径，且未检测到 Edge Default Bookmarks。"
-            f"请手动选择；检测到候选：{self._bookmark_candidates_summary()}"
+            "当前未保存收藏夹路径。"
+            f"请点击“自动查找收藏夹”后选择候选；检测到候选：{self._bookmark_candidates_summary()}"
         )
 
     def _save_bookmark_settings(self, bookmark_file: str) -> None:
@@ -368,6 +466,8 @@ class LauncherApp(tk.Tk):
             data["bookmark_browser"] = info.browser
             data["bookmark_profile"] = info.profile
             data["bookmark_root_name"] = self.bookmark_root_name.get().strip() or data.get("bookmark_root_name", "账号")
+            data["bookmark_root_path"] = self.bookmark_root_path.get().strip()
+            data["bookmark_root_display_name"] = self.bookmark_root_display_name.get().strip()
             path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
             self._log(
                 f"已保存收藏夹配置：browser={info.browser}, "
@@ -386,13 +486,29 @@ class LauncherApp(tk.Tk):
         window_frame.columnconfigure(1, weight=1)
 
         # 第1行：游戏路径
-        ttk.Label(window_frame, text="游戏路径", width=10, anchor="e").grid(
+        ttk.Label(window_frame, text="游戏程序", width=10, anchor="e").grid(
             row=0, column=0, sticky="e", padx=(4, 6), pady=3
         )
-        ttk.Entry(window_frame, textvariable=self.wm_game_path_var).grid(
+        self.wm_game_path_box = ttk.Frame(window_frame)
+        self.wm_game_path_box.grid(
             row=0, column=1, columnspan=12, sticky="ew", padx=4, pady=3
         )
-        ttk.Button(window_frame, text="选择", width=8, command=self._pick_game_path).grid(
+        self.wm_game_path_box.columnconfigure(0, weight=1)
+        self.wm_game_path_entry = ttk.Entry(self.wm_game_path_box, textvariable=self.wm_game_path_var)
+        self.wm_game_path_entry.grid(row=0, column=0, sticky="ew")
+        self.wm_game_hint_label = ttk.Label(
+            self.wm_game_path_box,
+            textvariable=self.wm_game_hint_var,
+            foreground="#006666",
+        )
+        self.wm_game_hint_label.grid(row=1, column=0, sticky="w", pady=(2, 0))
+        self.wm_game_status_label = ttk.Label(
+            self.wm_game_path_box,
+            textvariable=self.wm_game_status_var,
+            foreground="#666666",
+        )
+        self.wm_game_status_label.grid(row=2, column=0, sticky="w", pady=(2, 0))
+        ttk.Button(window_frame, text="选择游戏图标/程序", width=16, command=self._pick_game_path).grid(
             row=0, column=13, sticky="ew", padx=4, pady=3
         )
 
@@ -535,38 +651,99 @@ class LauncherApp(tk.Tk):
         config_frame.columnconfigure(1, weight=1)
 
         method_row = ttk.Frame(config_frame)
-        method_row.grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 6))
+        method_row.grid(row=0, column=0, columnspan=5, sticky="w", pady=(0, 6))
         ttk.Label(method_row, text="上号方式").pack(side=tk.LEFT, padx=(4, 8))
         ttk.Radiobutton(method_row, text="方式一：通行证上号", variable=self.method_var, value="method1",
                         command=self._on_method_changed).pack(side=tk.LEFT, padx=(0, 24))
         ttk.Radiobutton(method_row, text="方式二：账号密码 + 通行证上号", variable=self.method_var, value="method2",
                         command=self._on_method_changed).pack(side=tk.LEFT)
 
-        self._method1_row1 = ttk.Label(config_frame, text="收藏文件", width=12, anchor="e")
+        self._method1_row1 = ttk.Label(config_frame, text="浏览器收藏夹", width=12, anchor="e")
         self._method1_row1.grid(row=1, column=0, sticky="e", padx=(4, 6), pady=3)
-        self._method1_bookmark_entry = ttk.Entry(config_frame, textvariable=self.bookmark_path)
-        self._method1_bookmark_entry.grid(row=1, column=1, sticky="ew", padx=4, pady=3)
-        self._method1_btn_pick = ttk.Button(config_frame, text="选择", width=8, command=self._pick_bookmark_file)
-        self._method1_btn_pick.grid(row=1, column=2, padx=4, pady=3)
-        self._method1_btn_load = ttk.Button(config_frame, text="读取收藏夹", command=self._load_accounts)
-        self._method1_btn_load.grid(row=1, column=3, padx=4, pady=3)
+        self._method1_btn_auto_bookmark = ttk.Button(
+            config_frame,
+            text="自动查找收藏夹",
+            command=self._auto_find_bookmarks,
+        )
+        self._method1_btn_auto_bookmark.grid(row=1, column=1, sticky="w", padx=4, pady=3)
+        self._method1_btn_load = ttk.Button(config_frame, text="读取账号", command=self._load_accounts)
+        self._method1_btn_load.grid(row=1, column=2, sticky="w", padx=4, pady=3)
 
-        self._method1_row2a = ttk.Label(config_frame, text="根目录名", width=12, anchor="e")
+        self._method1_row2a = ttk.Label(config_frame, text="收藏候选", width=12, anchor="e")
         self._method1_row2a.grid(row=2, column=0, sticky="e", padx=(4, 6), pady=3)
-        self._method1_root_entry = ttk.Entry(config_frame, textvariable=self.bookmark_root_name)
-        self._method1_root_entry.grid(row=2, column=1, sticky="ew", padx=4, pady=3)
+        self._method1_bookmark_candidate_combo = ttk.Combobox(
+            config_frame,
+            textvariable=self.bookmark_file_candidate_var,
+            state="readonly",
+            values=(),
+        )
+        self._method1_bookmark_candidate_combo.grid(row=2, column=1, columnspan=4, sticky="ew", padx=4, pady=3)
+        self._method1_bookmark_candidate_combo.bind("<<ComboboxSelected>>", lambda _: self._on_bookmark_candidate_selected())
 
-        self._method1_row3a = ttk.Label(config_frame, text="自动化设置", width=12, anchor="e")
+        self._method1_row3a = ttk.Label(config_frame, text="账号目录", width=12, anchor="e")
         self._method1_row3a.grid(row=3, column=0, sticky="e", padx=(4, 6), pady=3)
-        self._method1_settings_entry = ttk.Entry(config_frame, textvariable=self.settings_path)
+        self._method1_root_combo = ttk.Combobox(
+            config_frame,
+            textvariable=self.bookmark_root_candidate_var,
+            state="readonly",
+            values=(),
+        )
+        self._method1_root_combo.grid(row=3, column=1, columnspan=4, sticky="ew", padx=4, pady=3)
+        self._method1_root_combo.bind("<<ComboboxSelected>>", lambda _: self._on_bookmark_root_candidate_selected())
+
+        self._method1_advanced_toggle_btn = ttk.Button(
+            config_frame,
+            text="显示高级配置",
+            command=self._toggle_advanced_config,
+        )
+        self._method1_advanced_toggle_btn.grid(row=4, column=1, sticky="w", padx=4, pady=(4, 3))
+
+        self._method1_advanced_frame = ttk.LabelFrame(config_frame, text="高级配置", padding=4)
+        self._method1_advanced_frame.grid(row=5, column=0, columnspan=5, sticky="ew", padx=4, pady=(0, 4))
+        self._method1_advanced_frame.columnconfigure(1, weight=1)
+
+        self._method1_bookmark_path_label = ttk.Label(
+            self._method1_advanced_frame, text="收藏文件路径", width=14, anchor="e"
+        )
+        self._method1_bookmark_path_label.grid(row=0, column=0, sticky="e", padx=(4, 6), pady=3)
+        self._method1_bookmark_entry = ttk.Entry(self._method1_advanced_frame, textvariable=self.bookmark_path)
+        self._method1_bookmark_entry.grid(row=0, column=1, sticky="ew", padx=4, pady=3)
+        self._method1_btn_pick = ttk.Button(
+            self._method1_advanced_frame,
+            text="手动选择 Bookmarks",
+            command=self._pick_bookmark_file,
+        )
+        self._method1_btn_pick.grid(row=0, column=2, padx=4, pady=3)
+
+        self._method1_root_path_label = ttk.Label(
+            self._method1_advanced_frame, text="bookmark_root_path", width=14, anchor="e"
+        )
+        self._method1_root_path_label.grid(row=1, column=0, sticky="e", padx=(4, 6), pady=3)
+        self._method1_root_path_entry = ttk.Entry(self._method1_advanced_frame, textvariable=self.bookmark_root_path)
+        self._method1_root_path_entry.grid(row=1, column=1, columnspan=2, sticky="ew", padx=4, pady=3)
+
+        self._method1_root_name_label = ttk.Label(
+            self._method1_advanced_frame, text="兼容目录名", width=14, anchor="e"
+        )
+        self._method1_root_name_label.grid(row=2, column=0, sticky="e", padx=(4, 6), pady=3)
+        self._method1_root_name_entry = ttk.Entry(self._method1_advanced_frame, textvariable=self.bookmark_root_name)
+        self._method1_root_name_entry.grid(row=2, column=1, columnspan=2, sticky="ew", padx=4, pady=3)
+
+        self._method1_row4a = ttk.Label(self._method1_advanced_frame, text="自动化设置", width=14, anchor="e")
+        self._method1_row4a.grid(row=3, column=0, sticky="e", padx=(4, 6), pady=3)
+        self._method1_settings_entry = ttk.Entry(self._method1_advanced_frame, textvariable=self.settings_path)
         self._method1_settings_entry.grid(row=3, column=1, sticky="ew", padx=4, pady=3)
-        self._method1_btn_settings = ttk.Button(config_frame, text="选择", width=8, command=self._pick_settings)
+        self._method1_btn_settings = ttk.Button(
+            self._method1_advanced_frame, text="选择", width=8, command=self._pick_settings
+        )
         self._method1_btn_settings.grid(row=3, column=2, padx=4, pady=3)
 
-        self._method1_level_count_label = ttk.Label(config_frame, text="每层数量", width=12, anchor="e")
+        self._method1_level_count_label = ttk.Label(
+            self._method1_advanced_frame, text="每层数量", width=14, anchor="e"
+        )
         self._method1_level_count_label.grid(row=4, column=0, sticky="e", padx=(4, 6), pady=3)
-        self._method1_level_count_frame = ttk.Frame(config_frame)
-        self._method1_level_count_frame.grid(row=4, column=1, columnspan=3, sticky="w", padx=4, pady=3)
+        self._method1_level_count_frame = ttk.Frame(self._method1_advanced_frame)
+        self._method1_level_count_frame.grid(row=4, column=1, columnspan=2, sticky="w", padx=4, pady=3)
         for level in LEVELS:
             ttk.Label(self._method1_level_count_frame, text=level).pack(side=tk.LEFT, padx=(0, 4))
             ttk.Spinbox(
@@ -577,6 +754,7 @@ class LauncherApp(tk.Tk):
                 textvariable=self.level_count_vars[level],
                 width=5,
             ).pack(side=tk.LEFT, padx=(0, 12))
+        self._method1_advanced_frame.grid_remove()
 
         self._method2_row1 = ttk.Label(config_frame, text="CSV文件", width=12, anchor="e")
         self._method2_csv_entry = ttk.Entry(config_frame, textvariable=self.csv_path)
@@ -720,20 +898,114 @@ class LauncherApp(tk.Tk):
             self._debug_visible.set(True)
             self._debug_toggle_btn.configure(text="▾ 调试")
 
+    def _toggle_advanced_config(self) -> None:
+        self.advanced_config_visible.set(not self.advanced_config_visible.get())
+        self._sync_advanced_config_visibility()
+
+    def _sync_advanced_config_visibility(self) -> None:
+        if not hasattr(self, "_method1_advanced_frame"):
+            return
+        is_method1 = self.method_var.get() == "method1"
+        visible = bool(self.advanced_config_visible.get()) and is_method1
+        if visible:
+            self._method1_advanced_frame.grid()
+            self._method1_advanced_toggle_btn.configure(text="隐藏高级配置")
+        else:
+            self._method1_advanced_frame.grid_remove()
+            self._method1_advanced_toggle_btn.configure(text="显示高级配置")
+
+    def _set_game_program_path(self, path: str) -> None:
+        entry_value, status_text = _game_program_display_values(path)
+        self.wm_game_path_var.set(entry_value)
+        self.wm_game_status_var.set(status_text)
+
+    def _sync_game_program_status(self) -> None:
+        if not hasattr(self, "wm_game_status_var"):
+            return
+        self.wm_game_status_var.set(_format_game_program_status(self.wm_game_path_var.get()))
+
     def _pick_game_path(self) -> None:
         path = filedialog.askopenfilename(
             title="选择游戏程序或快捷方式",
-            filetypes=[("程序或快捷方式", "*.exe *.lnk"), ("EXE", "*.exe"), ("Shortcut", "*.lnk"), ("All files", "*.*")],
+            filetypes=[
+                ("游戏程序或快捷方式", "*.exe *.lnk"),
+                ("游戏程序", "*.exe"),
+                ("快捷方式", "*.lnk"),
+                ("所有文件", "*.*"),
+            ],
         )
+        if not path:
+            folder = filedialog.askdirectory(title="或选择游戏安装目录")
+            path = folder
         if path:
-            self.wm_game_path_var.set(path)
-            self._save_window_manager_settings()
+            self._apply_game_path_input(path)
+
+    def _enable_game_path_drag_drop(self) -> None:
+        self.wm_game_hint_var.set(_game_program_hint_text())
+        if not _is_tkinterdnd2_available():
+            self._log("[窗口管理] tkinterdnd2 不可用，拖拽未启用；可点击“选择游戏图标/程序”选择 exe 或 lnk。")
+            return
+
+        registered = 0
+        targets = [
+            getattr(self, "wm_game_path_box", None),
+            getattr(self, "wm_game_path_entry", None),
+            getattr(self, "wm_game_hint_label", None),
+            getattr(self, "wm_game_status_label", None),
+        ]
+        for widget in targets:
+            if widget is None:
+                continue
+            try:
+                widget.drop_target_register(DND_FILES)
+                widget.dnd_bind("<<Drop>>", self._on_game_path_drop)
+                registered += 1
+            except Exception as exc:
+                self._log(f"[窗口管理] 注册游戏路径拖拽目标失败：{exc}")
+
+        if registered:
+            self._log("[窗口管理] 已启用游戏程序拖拽：支持桌面快捷方式、exe、游戏安装目录。")
+        else:
+            self.wm_game_hint_var.set("点击“选择游戏图标/程序”，可选择桌面快捷方式或 X5Game.exe。")
+            self._log("[窗口管理] 游戏路径拖拽启用失败；请点击“选择游戏图标/程序”选择 exe 或 lnk。")
+
+    def _on_game_path_drop(self, event: object) -> str:
+        raw_data = str(getattr(event, "data", "") or "")
+        path = first_dropped_file_path(raw_data, splitlist=self.tk.splitlist)
+        if not path:
+            self._log("[窗口管理] 未识别到拖入路径。")
+            return str(getattr(event, "action", "copy") or "copy")
+        self._log(f"[窗口管理] 拖入游戏路径：{path}")
+        self._apply_game_path_input(path, source="drop")
+        return str(getattr(event, "action", "copy") or "copy")
+
+    def _apply_game_path_input(self, raw_path: str, source: str = "select") -> bool:
+        def customer_message(message: str) -> str:
+            clean_message = message or "请选择游戏程序 exe、游戏快捷方式或游戏安装目录。"
+            if source == "drop" and clean_message.startswith("请选择"):
+                return clean_message.replace("请选择", "请拖入", 1)
+            return clean_message
+
+        try:
+            result = resolve_game_executable_path(raw_path)
+        except Exception as exc:
+            message = customer_message(str(exc))
+            self._log(f"[窗口管理] 游戏路径无效：{message}")
+            messagebox.showwarning("游戏路径无效", message)
+            return False
+        self._set_game_program_path(result.path)
+        self._save_window_manager_settings()
+        if result.message:
+            self._log(f"[窗口管理] {result.message}")
+        if source == "drop":
+            self._log(f"[窗口管理] 已通过拖拽识别游戏程序：{result.path}")
+        return True
 
     def _load_window_manager_settings(self) -> None:
         settings, error = load_window_manager_settings()
         self.wm_fixed_mode_settings = settings.fixed_mode
         self.wm_row_count_mode_settings = settings.row_count_mode
-        self.wm_game_path_var.set(settings.game_path)
+        self._set_game_program_path(settings.game_path)
         self.wm_launch_interval_var.set(settings.launch_interval)
         self.wm_auto_tile_after_launch_var.set(settings.auto_tile_after_launch)
         self.wm_auto_rename_after_tile_var.set(settings.auto_rename_after_tile)
@@ -2113,8 +2385,197 @@ Write-Output $count
     def _pick_bookmark_file(self) -> None:
         path = filedialog.askopenfilename(filetypes=[("Bookmarks", "Bookmarks"), ("JSON", "*.json"), ("All files", "*.*")])
         if path:
+            self._clear_bookmark_root_selection(clear_legacy=True)
+            self._clear_loaded_accounts("收藏夹文件已切换，请重新选择账号目录并读取账号。")
             self.bookmark_path.set(path)
+            self._refresh_bookmark_root_candidates(auto_select=True, allow_legacy_migration=False)
             self._save_bookmark_settings(path)
+
+    def _auto_find_bookmarks(self) -> None:
+        candidates = find_bookmark_file_candidates()
+        self.bookmark_file_candidates = candidates
+        self.bookmark_file_candidate_by_label = {}
+        for candidate in candidates:
+            root_count = len(scan_bookmark_root_candidates(candidate.path, candidate.browser, candidate.profile))
+            base_label = _format_bookmark_file_candidate_label(candidate, root_count=root_count)
+            label = base_label
+            suffix = 2
+            while label in self.bookmark_file_candidate_by_label:
+                label = f"{base_label} ({suffix})"
+                suffix += 1
+            self.bookmark_file_candidate_by_label[label] = candidate
+        labels = list(self.bookmark_file_candidate_by_label)
+        self._method1_bookmark_candidate_combo["values"] = labels
+        self._log(f"已自动查找收藏夹：发现 {len(candidates)} 个浏览器收藏夹候选")
+        if not candidates:
+            message = "未自动找到可用收藏夹账号目录，请手动选择 Bookmarks 文件。"
+            self._log(message)
+            messagebox.showinfo("自动查找收藏夹", message)
+            return
+
+        saved_path = self.bookmark_path.get().strip()
+        selection = select_bookmark_candidate_for_startup(saved_path, candidates)
+        if selection.candidate is not None:
+            label = next(
+                label for label, candidate in self.bookmark_file_candidate_by_label.items()
+                if candidate == selection.candidate
+            )
+            self.bookmark_file_candidate_var.set(label)
+            self._clear_bookmark_root_selection(clear_legacy=True)
+            self._clear_loaded_accounts("收藏夹候选已自动选择，请重新读取账号。")
+            self.bookmark_path.set(selection.candidate.path)
+            self._log(f"已自动选择唯一收藏夹候选：{selection.candidate.display_name}")
+            self._refresh_bookmark_root_candidates(auto_select=True, allow_legacy_migration=False)
+            self._save_bookmark_settings(selection.candidate.path)
+            return
+
+        if saved_path:
+            for label, candidate in self.bookmark_file_candidate_by_label.items():
+                if str(candidate.path).lower() == saved_path.lower():
+                    self.bookmark_file_candidate_var.set(label)
+                    break
+            self._log("已保留当前保存的收藏夹路径，自动扫描不会静默覆盖。")
+            self._refresh_bookmark_root_candidates(auto_select=True)
+        elif len(candidates) > 1:
+            self._log("检测到多个收藏夹候选，请在下拉框中选择。")
+
+    def _on_bookmark_candidate_selected(self) -> None:
+        candidate = self.bookmark_file_candidate_by_label.get(self.bookmark_file_candidate_var.get())
+        if candidate is None:
+            return
+        current_path = self.bookmark_path.get().strip()
+        if _normalize_path_for_compare(current_path) != _normalize_path_for_compare(candidate.path):
+            self._clear_bookmark_root_selection(clear_legacy=True)
+            self._clear_loaded_accounts("收藏夹候选已切换，请重新选择账号目录并读取账号。")
+        self.bookmark_path.set(candidate.path)
+        self._log(f"已选择收藏夹：{candidate.display_name}")
+        self._refresh_bookmark_root_candidates(auto_select=True, allow_legacy_migration=False)
+        self._save_bookmark_settings(candidate.path)
+
+    def _clear_bookmark_root_selection(self, clear_legacy: bool = False) -> None:
+        self.bookmark_root_candidates = []
+        self.bookmark_root_candidate_by_label = {}
+        self.bookmark_root_candidate_var.set("")
+        self.bookmark_root_path.set("")
+        self.bookmark_root_display_name.set("")
+        if clear_legacy:
+            self.bookmark_root_name.set("")
+        if hasattr(self, "_method1_root_combo"):
+            self._method1_root_combo["values"] = ()
+
+    def _clear_loaded_accounts(self, reason: str) -> None:
+        self.accounts = []
+        self.status_by_key.clear()
+        self.passport_by_key.clear()
+        self.timing_by_key.clear()
+        if hasattr(self, "level_box"):
+            self._refresh_mode_account_scope()
+        if reason:
+            self._status_left.set(reason)
+            self._log(reason)
+
+    def _refresh_bookmark_root_candidates(
+        self,
+        auto_select: bool = False,
+        allow_legacy_migration: bool = True,
+    ) -> None:
+        bookmark_file = self.bookmark_path.get().strip()
+        if not bookmark_file or not Path(bookmark_file).exists():
+            self._clear_bookmark_root_selection(clear_legacy=False)
+            return
+
+        info = describe_bookmark_file(bookmark_file)
+        candidates = scan_bookmark_root_candidates(bookmark_file, browser=info.browser, profile=info.profile)
+        self.bookmark_root_candidates = candidates
+        self.bookmark_root_candidate_by_label = {
+            candidate.display_label: candidate
+            for candidate in candidates
+        }
+        labels = list(self.bookmark_root_candidate_by_label)
+        self._method1_root_combo["values"] = labels
+        self._log(f"已扫描账号目录：发现 {len(candidates)} 个可用目录")
+        if not candidates:
+            self._clear_bookmark_root_selection(clear_legacy=False)
+            return
+
+        saved_root_path = self.bookmark_root_path.get().strip()
+        if saved_root_path:
+            for label, candidate in self.bookmark_root_candidate_by_label.items():
+                if candidate.root_path == saved_root_path:
+                    self.bookmark_root_candidate_var.set(label)
+                    self.bookmark_root_display_name.set(candidate.display_name)
+                    self.bookmark_root_name.set(candidate.display_name.split(" / ")[-1].replace("（直接链接）", ""))
+                    return
+            self._log("保存的账号目录路径已不存在，请重新选择账号目录。")
+            self.bookmark_root_path.set("")
+
+        legacy_root_name = self.bookmark_root_name.get().strip() if allow_legacy_migration else ""
+        if legacy_root_name:
+            matches = [
+                candidate for candidate in candidates
+                if candidate.display_name.split(" / ")[-1].replace("（直接链接）", "") == legacy_root_name
+            ]
+            if len(matches) == 1:
+                candidate = matches[0]
+                self.bookmark_root_candidate_var.set(candidate.display_label)
+                self._apply_bookmark_root_candidate(candidate, save=True)
+                self._log(f"已将旧目录名配置迁移为账号目录：{candidate.display_label}")
+                return
+            if len(matches) > 1:
+                self._log(f"旧目录名“{legacy_root_name}”匹配到多个账号目录，请手动选择。")
+
+        if auto_select and len(candidates) == 1:
+            candidate = candidates[0]
+            label = candidate.display_label
+            self.bookmark_root_candidate_var.set(label)
+            self._apply_bookmark_root_candidate(candidate, save=False)
+            self._log(f"已选择账号目录：{candidate.display_name}，{candidate.link_count}个账号")
+        elif auto_select:
+            self._log("检测到多个账号目录候选，请在账号目录下拉框中选择。")
+
+    def _on_bookmark_root_candidate_selected(self) -> None:
+        candidate = self.bookmark_root_candidate_by_label.get(self.bookmark_root_candidate_var.get())
+        if candidate is None:
+            return
+        bookmark_file = self.bookmark_path.get().strip()
+        if not _root_candidate_belongs_to_bookmark_file(candidate, bookmark_file):
+            self._clear_bookmark_root_selection(clear_legacy=True)
+            self._clear_loaded_accounts("当前账号目录候选不属于当前收藏夹文件，请重新选择账号目录。")
+            messagebox.showwarning("账号目录不匹配", "当前账号目录候选不属于当前收藏夹文件，请重新选择账号目录。")
+            return
+        self._clear_loaded_accounts("账号目录已切换，请点击“读取账号”。")
+        self._apply_bookmark_root_candidate(candidate, save=True)
+        self._log(f"已选择账号目录：{candidate.display_name}，{candidate.link_count}个账号")
+
+    def _apply_bookmark_root_candidate(self, candidate, save: bool) -> None:
+        self.bookmark_root_path.set(candidate.root_path)
+        self.bookmark_root_display_name.set(candidate.display_name)
+        self.bookmark_root_name.set(candidate.display_name.split(" / ")[-1].replace("（直接链接）", ""))
+        if save:
+            self._save_bookmark_settings(candidate.bookmark_file)
+
+    def _selected_bookmark_root_candidate_for_load(
+        self,
+        bookmark_file: str,
+        root_path: str,
+    ) -> BookmarkRootCandidate | None:
+        selected_label = self.bookmark_root_candidate_var.get().strip()
+        if selected_label:
+            candidate = self.bookmark_root_candidate_by_label.get(selected_label)
+            if candidate is None:
+                raise ValueError("当前账号目录候选已失效，请重新选择账号目录。")
+            if not _root_candidate_belongs_to_bookmark_file(candidate, bookmark_file):
+                raise ValueError("当前账号目录候选不属于当前收藏夹文件，请重新选择账号目录。")
+            return candidate
+
+        if root_path:
+            candidate = find_bookmark_root_candidate_by_path(bookmark_file, root_path)
+            if candidate is None:
+                self._refresh_bookmark_root_candidates(auto_select=False, allow_legacy_migration=False)
+                raise ValueError("保存的账号目录路径不存在，请在账号目录下拉框中重新选择。")
+            return candidate
+
+        return None
 
     def _pick_settings(self) -> None:
         path = filedialog.askopenfilename(filetypes=[("JSON", "*.json"), ("All files", "*.*")])
@@ -2123,6 +2584,7 @@ Write-Output $count
 
     def _load_default_config_if_present(self) -> None:
         if self.bookmark_path.get() and Path(self.bookmark_path.get()).exists():
+            self._refresh_bookmark_root_candidates(auto_select=True)
             self._load_accounts()
         else:
             current = self.bookmark_path.get().strip()
@@ -2136,6 +2598,7 @@ Write-Output $count
             settings = load_settings(self.settings_path.get())
             bookmark_file = self.bookmark_path.get() or settings.bookmark_file
             root_name = self.bookmark_root_name.get().strip() or settings.bookmark_root_name
+            root_path = self.bookmark_root_path.get().strip() or settings.bookmark_root_path
             if not bookmark_file:
                 raise ValueError(
                     "未配置收藏夹路径。程序不会自动切换到 Chrome/Edge 候选，"
@@ -2143,20 +2606,37 @@ Write-Output $count
                 )
             level_counts = self._current_level_counts()
             self._log(f"准备读取收藏夹：{bookmark_file}")
-            self.accounts = load_accounts_from_bookmarks(
-                bookmark_file,
-                root_name,
-                settings.level_names,
-                level_counts=level_counts,
-                account_group_settings=settings.account_group_settings,
-                log=lambda message: self._log(f"收藏夹读取：{message}"),
-            )
+            root_candidate = self._selected_bookmark_root_candidate_for_load(bookmark_file, root_path)
+            if root_candidate is not None:
+                bookmark_file = root_candidate.bookmark_file
+                root_path = root_candidate.root_path
+                self.accounts = load_accounts_from_bookmark_root(
+                    bookmark_file,
+                    root_path,
+                    settings.level_names,
+                    level_counts=level_counts,
+                    account_group_settings=settings.account_group_settings,
+                    log=lambda message: self._log(f"收藏夹读取：{message}"),
+                )
+            elif self.bookmark_root_candidates:
+                raise ValueError("请先在账号目录下拉框中选择当前收藏夹对应的账号目录。")
+            else:
+                self.accounts = load_accounts_from_bookmarks(
+                    bookmark_file,
+                    root_name,
+                    settings.level_names,
+                    level_counts=level_counts,
+                    account_group_settings=settings.account_group_settings,
+                    log=lambda message: self._log(f"收藏夹读取：{message}"),
+                )
             self._save_bookmark_settings(bookmark_file)
             self.status_by_key = {account.key: "未开始" for account in self.accounts}
             self.passport_by_key = {account.key: "" for account in self.accounts}
+            self.timing_by_key = {account.key: "" for account in self.accounts}
             self._refresh_mode_account_scope()
             self._log(f"已从收藏夹读取 {len(self.accounts)} 个账号链接。{self._account_count_summary()}")
         except Exception as exc:
+            self._clear_loaded_accounts("读取收藏夹失败，账号列表已清空，请重新选择收藏夹和账号目录。")
             messagebox.showerror("读取收藏夹失败", str(exc))
             self._log(f"读取收藏夹失败: {exc}")
             bookmark_file = self.bookmark_path.get().strip()
@@ -2183,11 +2663,7 @@ Write-Output $count
 
     def _account_group_order(self, accounts: list[AccountConfig] | None = None) -> tuple[str, ...]:
         source = accounts if accounts is not None else self.accounts
-        groups: list[str] = []
-        for account in source:
-            if account.level not in groups:
-                groups.append(account.level)
-        return tuple(groups)
+        return _account_group_order_for_accounts(tuple(source))
 
     def _account_group_counts(self, accounts: list[AccountConfig]) -> list[tuple[str, int]]:
         return [
@@ -2295,10 +2771,7 @@ Write-Output $count
         return self._wm_mode_key_from_label() == TILE_MODE_ROW_COUNT
 
     def _allowed_level_values(self) -> tuple[str, ...]:
-        groups = self._account_group_order()
-        if groups:
-            return ("全部", *groups)
-        return ("全部", SINGLE_LEVEL_NAME, *LEVELS)
+        return _allowed_level_values_for_accounts(tuple(self._mode_allowed_accounts()))
 
     def _is_account_allowed_in_current_mode(self, account: AccountConfig) -> bool:
         return True
@@ -2327,7 +2800,7 @@ Write-Output $count
         allowed_levels = self._allowed_level_values()
         self.level_box["values"] = allowed_levels
         if self.level_var.get() not in allowed_levels:
-            self.level_var.set(allowed_levels[0] if allowed_levels else "")
+            self.level_var.set(_default_level_for_allowed_values(self.level_var.get(), allowed_levels))
         self.account_var.set("")
         self.account_box["values"] = ()
         for item in self.tree.selection():
@@ -2444,11 +2917,21 @@ Write-Output $count
         mode = self.method_var.get()
         is_m1 = (mode == "method1")
         # 方式一控件
-        for w in (self._method1_row1, self._method1_bookmark_entry, self._method1_btn_pick,
-                  self._method1_btn_load, self._method1_row2a, self._method1_root_entry,
-                  self._method1_row3a, self._method1_settings_entry, self._method1_btn_settings,
-                  self._method1_level_count_label, self._method1_level_count_frame):
+        for w in (
+            self._method1_row1,
+            self._method1_btn_auto_bookmark,
+            self._method1_btn_load,
+            self._method1_row2a,
+            self._method1_bookmark_candidate_combo,
+            self._method1_row3a,
+            self._method1_root_combo,
+            self._method1_advanced_toggle_btn,
+        ):
             w.grid() if is_m1 else w.grid_remove()
+        if is_m1:
+            self._sync_advanced_config_visibility()
+        else:
+            self._method1_advanced_frame.grid_remove()
         # 方式二控件
         for w in (self._method2_row1, self._method2_csv_entry, self._method2_btn_pick,
                   self._method2_btn_import):

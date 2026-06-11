@@ -105,6 +105,8 @@ class AutomationSettings:
     bookmark_browser: str = ""
     bookmark_profile: str = ""
     bookmark_root_name: str = "账号"
+    bookmark_root_path: str = ""
+    bookmark_root_display_name: str = ""
     account_group_settings: dict[str, dict[str, bool]] = field(default_factory=lambda: {
         SINGLE_LEVEL_NAME: {"include_in_all": True},
         "第一层": {"include_in_all": True},
@@ -363,20 +365,74 @@ class BookmarkCandidate:
     profile: str
     path: str
 
+    @property
+    def display_name(self) -> str:
+        return f"{self.browser} - {self.profile or '默认'}"
 
-def find_bookmark_file_candidates() -> list[BookmarkCandidate]:
-    local_app_data = os.environ.get("LOCALAPPDATA", "")
-    candidate_specs = [
-        ("Edge", "Default", Path(local_app_data) / "Microsoft" / "Edge" / "User Data" / "Default" / "Bookmarks"),
-        ("Chrome", "Default", Path(local_app_data) / "Google" / "Chrome" / "User Data" / "Default" / "Bookmarks"),
-        ("Edge", "Profile 1", Path(local_app_data) / "Microsoft" / "Edge" / "User Data" / "Profile 1" / "Bookmarks"),
-        ("Chrome", "Profile 1", Path(local_app_data) / "Google" / "Chrome" / "User Data" / "Profile 1" / "Bookmarks"),
+
+@dataclass(frozen=True)
+class BookmarkStartupSelection:
+    candidate: BookmarkCandidate | None
+    reason: str
+
+
+@dataclass(frozen=True)
+class BookmarkRootCandidate:
+    bookmark_file: str
+    browser: str
+    profile: str
+    root_path: str
+    display_name: str
+    link_count: int
+    child_group_count: int
+    order: int
+    direct_links: bool = False
+
+    @property
+    def display_label(self) -> str:
+        detail = f"{self.link_count}个账号"
+        if self.child_group_count:
+            detail += f"，包含{self.child_group_count}个分组"
+        return f"{self.display_name} - {detail}"
+
+
+def find_bookmark_file_candidates(local_app_data: str | Path | None = None) -> list[BookmarkCandidate]:
+    local_root = Path(local_app_data or os.environ.get("LOCALAPPDATA", ""))
+    browser_specs = [
+        ("Edge", local_root / "Microsoft" / "Edge" / "User Data"),
+        ("Chrome", local_root / "Google" / "Chrome" / "User Data"),
     ]
     candidates: list[BookmarkCandidate] = []
-    for browser, profile, path in candidate_specs:
-        if path.exists():
-            candidates.append(BookmarkCandidate(browser=browser, profile=profile, path=str(path)))
+    seen: set[str] = set()
+    for browser, user_data in browser_specs:
+        profiles: list[Path] = []
+        default = user_data / "Default"
+        if default.exists():
+            profiles.append(default)
+        if user_data.exists():
+            profiles.extend(sorted(user_data.glob("Profile *"), key=lambda item: item.name.lower()))
+        for profile_dir in profiles:
+            bookmark_file = profile_dir / "Bookmarks"
+            normalized = str(bookmark_file).lower()
+            if normalized in seen or not bookmark_file.exists():
+                continue
+            seen.add(normalized)
+            candidates.append(
+                BookmarkCandidate(browser=browser, profile=profile_dir.name, path=str(bookmark_file))
+            )
     return candidates
+
+
+def select_bookmark_candidate_for_startup(
+    saved_path: str,
+    candidates: list[BookmarkCandidate] | tuple[BookmarkCandidate, ...],
+) -> BookmarkStartupSelection:
+    clean_saved = str(saved_path or "").strip()
+    if clean_saved:
+        return BookmarkStartupSelection(candidate=None, reason="keep_saved")
+    if len(candidates) == 1:
+        return BookmarkStartupSelection(candidate=candidates[0], reason="unique_candidate")
+    return BookmarkStartupSelection(candidate=None, reason="choose_required")
 
 
 def find_default_bookmark_file() -> str:
@@ -451,6 +507,131 @@ def list_bookmark_top_level_dirs(path: str | Path) -> list[str]:
             if child_name:
                 names.append(f"{root_name}/{child_name}" if root_name else child_name)
     return names
+
+
+def scan_bookmark_root_candidates(
+    bookmark_file: str | Path,
+    browser: str = "",
+    profile: str = "",
+) -> list[BookmarkRootCandidate]:
+    path = Path(bookmark_file)
+    if not path.exists():
+        return []
+    try:
+        with path.open("r", encoding="utf-8") as file:
+            data = json.load(file)
+    except Exception:
+        return []
+
+    roots = data.get("roots") if isinstance(data, dict) else None
+    if not isinstance(roots, dict):
+        return []
+    info = describe_bookmark_file(path)
+    browser_name = browser or info.browser
+    profile_name = profile or info.profile
+    candidates: list[BookmarkRootCandidate] = []
+    order = 0
+
+    def add_candidate(
+        root_path: str,
+        display_name: str,
+        link_count: int,
+        child_group_count: int,
+        direct_links: bool,
+    ) -> None:
+        nonlocal order
+        if link_count <= 0:
+            return
+        order += 1
+        candidates.append(
+            BookmarkRootCandidate(
+                bookmark_file=str(path),
+                browser=browser_name,
+                profile=profile_name,
+                root_path=root_path,
+                display_name=display_name,
+                link_count=link_count,
+                child_group_count=child_group_count,
+                order=order,
+                direct_links=direct_links,
+            )
+        )
+
+    def walk_folder(node: dict[str, object], node_path: str, display_parts: list[str]) -> None:
+        display_name = " / ".join(part for part in display_parts if part)
+        direct_count = _direct_valid_link_count(node)
+        total_count = _recursive_valid_link_count(node)
+        child_group_count = _direct_child_group_count(node)
+        is_root = node_path.count("/") == 1
+        if is_root and direct_count:
+            add_candidate(
+                f"{node_path}::direct",
+                f"{display_name}（直接链接）",
+                direct_count,
+                0,
+                True,
+            )
+        if total_count:
+            if not (is_root and direct_count and total_count == direct_count):
+                add_candidate(node_path, display_name, total_count, child_group_count, False)
+        for index, child in enumerate(node.get("children", [])):
+            if not isinstance(child, dict) or child.get("type") != "folder":
+                continue
+            child_name = str(child.get("name", "")).strip() or f"未命名{index + 1}"
+            walk_folder(child, f"{node_path}/children/{index}", [*display_parts, child_name])
+
+    for root_key, root in roots.items():
+        if not isinstance(root, dict):
+            continue
+        root_name = str(root.get("name", "")).strip() or str(root_key)
+        walk_folder(root, f"roots/{root_key}", [root_name])
+    return candidates
+
+
+def find_bookmark_root_candidate_by_path(
+    bookmark_file: str | Path,
+    root_path: str,
+) -> BookmarkRootCandidate | None:
+    clean_path = str(root_path or "").strip()
+    if not clean_path:
+        return None
+    for candidate in scan_bookmark_root_candidates(bookmark_file):
+        if candidate.root_path == clean_path:
+            return candidate
+    return None
+
+
+def load_accounts_from_bookmark_root(
+    bookmark_file: str | Path,
+    root_path: str,
+    level_names: Iterable[str] = LEVELS,
+    level_counts: dict[str, int] | None = None,
+    account_group_settings: dict[str, dict[str, bool]] | None = None,
+    log=None,
+) -> list[AccountConfig]:
+    path = Path(bookmark_file)
+    if not path.exists():
+        raise FileNotFoundError(f"收藏夹文件不存在: {path}")
+    with path.open("r", encoding="utf-8") as file:
+        data = json.load(file)
+    node, direct_only = _find_bookmark_node_by_root_path(data, root_path)
+    if node is None:
+        raise ValueError(f"保存的账号目录路径不存在，请重新扫描选择：{root_path}")
+    level_order = tuple(level_names)
+    counts = _normalize_level_counts(level_counts, level_order)
+    is_browser_root = _strip_direct_suffix(root_path).count("/") == 1
+    accounts = _load_accounts_from_selected_bookmark_node(
+        node,
+        selected_group_name="" if is_browser_root else str(node.get("name", "")).strip(),
+        direct_only=direct_only,
+        counts=counts,
+        level_order=level_order,
+        group_settings=account_group_settings,
+        log=log,
+    )
+    if log:
+        log(f"读取收藏夹完成：账号目录={root_path}")
+    return accounts
 
 
 def load_settings(path: str | Path) -> AutomationSettings:
@@ -621,6 +802,130 @@ def _find_direct_child_folder(parent: dict[str, object], folder_name: str) -> di
         if isinstance(child, dict) and child.get("type") == "folder" and child.get("name") == folder_name:
             return child
     return None
+
+
+def _strip_direct_suffix(root_path: str) -> str:
+    text = str(root_path or "").strip()
+    return text[:-8] if text.endswith("::direct") else text
+
+
+def _find_bookmark_node_by_root_path(
+    data: dict[str, object],
+    root_path: str,
+) -> tuple[dict[str, object] | None, bool]:
+    direct_only = str(root_path or "").strip().endswith("::direct")
+    clean_path = _strip_direct_suffix(root_path)
+    parts = [part for part in clean_path.split("/") if part]
+    if len(parts) < 2 or parts[0] != "roots":
+        return None, direct_only
+    roots = data.get("roots") if isinstance(data, dict) else None
+    if not isinstance(roots, dict):
+        return None, direct_only
+    node = roots.get(parts[1])
+    if not isinstance(node, dict):
+        return None, direct_only
+    index = 2
+    while index < len(parts):
+        if parts[index] != "children" or index + 1 >= len(parts):
+            return None, direct_only
+        try:
+            child_index = int(parts[index + 1])
+        except ValueError:
+            return None, direct_only
+        children = node.get("children", [])
+        if not isinstance(children, list) or child_index < 0 or child_index >= len(children):
+            return None, direct_only
+        child = children[child_index]
+        if not isinstance(child, dict):
+            return None, direct_only
+        node = child
+        index += 2
+    return node, direct_only
+
+
+def _direct_valid_link_count(folder: dict[str, object]) -> int:
+    count = 0
+    for child in folder.get("children", []):
+        if not isinstance(child, dict) or child.get("type") != "url":
+            continue
+        if _is_valid_account_url(str(child.get("url", "")).strip()):
+            count += 1
+    return count
+
+
+def _recursive_valid_link_count(folder: dict[str, object]) -> int:
+    count = _direct_valid_link_count(folder)
+    for child in folder.get("children", []):
+        if isinstance(child, dict) and child.get("type") == "folder":
+            count += _recursive_valid_link_count(child)
+    return count
+
+
+def _direct_child_group_count(folder: dict[str, object]) -> int:
+    count = 0
+    for child in folder.get("children", []):
+        if not isinstance(child, dict) or child.get("type") != "folder":
+            continue
+        if _recursive_valid_link_count(child) > 0:
+            count += 1
+    return count
+
+
+def _has_valid_child_groups(folder: dict[str, object]) -> bool:
+    return _direct_child_group_count(folder) > 0
+
+
+def _load_accounts_from_selected_bookmark_node(
+    root_folder: dict[str, object],
+    selected_group_name: str,
+    direct_only: bool,
+    counts: dict[str, int],
+    level_order: Iterable[str],
+    group_settings: dict[str, dict[str, bool]] | None = None,
+    log=None,
+) -> list[AccountConfig]:
+    if direct_only:
+        return _load_single_level_accounts(root_folder, log=log, group_settings=group_settings)
+
+    accounts: list[AccountConfig] = []
+    has_child_groups = _has_valid_child_groups(root_folder)
+    if selected_group_name and not has_child_groups:
+        accounts.extend(
+            _load_group_accounts(
+                root_folder,
+                group_name=selected_group_name,
+                counts=counts,
+                level_order=level_order,
+                group_settings=group_settings,
+                log=log,
+            )
+        )
+        return accounts
+
+    accounts.extend(_load_single_level_accounts(root_folder, log=log, group_settings=group_settings))
+    for child in root_folder.get("children", []):
+        if not isinstance(child, dict) or child.get("type") != "folder":
+            continue
+        group_name = str(child.get("name", "")).strip()
+        if not group_name:
+            continue
+        group_accounts = _load_group_accounts(
+            child,
+            group_name=group_name,
+            counts=counts,
+            level_order=level_order,
+            group_settings=group_settings,
+            log=log,
+        )
+        if group_accounts:
+            accounts.extend(group_accounts)
+            if log:
+                if group_name not in DEFAULT_LEVEL_COUNTS and not _group_include_in_all(group_name, group_settings):
+                    log(f"发现新分组 {group_name}，默认不参与全部串行。")
+                log(f"分组：{group_name} {len(group_accounts)} 个")
+        elif log:
+            log(f"分组 {group_name} 未发现有效账号链接，已跳过。")
+    return accounts
 
 
 def _load_single_level_accounts(

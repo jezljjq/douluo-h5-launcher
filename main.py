@@ -55,6 +55,11 @@ def _ensure_admin_on_startup() -> bool:
     return True
 
 
+def _should_auto_elevate_gui_on_startup() -> bool:
+    """Keep the GUI at the launcher's privilege level so Explorer drag-drop works."""
+    return False
+
+
 def _collect_runtime_diagnostics() -> dict[str, object]:
     from douluo_launcher.config import app_root, project_root
 
@@ -216,7 +221,7 @@ def main() -> None:
         _run_account_action_child(Path(sys.argv[index + 1]))
         return
 
-    if not _ensure_admin_on_startup():
+    if _should_auto_elevate_gui_on_startup() and not _ensure_admin_on_startup():
         return
 
     from douluo_launcher.gui import LauncherApp

@@ -125,13 +125,28 @@ UI 美化不得影响核心流程。
 - 全部 H5 窗口关闭后重新批量启动时，必须按当前 `window_manager_settings.json` 重新生成槽位，禁止沿用旧 `hwnd` 快照。
 - `window_slots.json` 是本地运行状态文件，不提交 Git，不进入发布包。
 - 禁止写死窗口坐标、编号、分辨率、DPI、缩放比例、窗口数量、路径或槽位号。
+- 游戏路径不能写死；必须支持拖入或选择 exe、lnk 快捷方式和游戏安装目录，快捷方式只能保存解析后的真实 exe。
+- 当前正式拖拽方案是公开库 `tkinterdnd2`。原生 `WM_DROPFILES` 拖拽实现已导致 Tk 窗口闪退，禁止启用、禁止回退。
+- Windows 会阻止普通资源管理器向管理员权限窗口拖入文件；GUI 默认不得在启动时自动管理员提权，否则会破坏游戏图标拖拽。
+- 游戏图标拖拽只能使用 `tkinterdnd2`、`windnd` 或公开 Windows API 的独立实现；禁止反编译、破解、复制或提取任何第三方闭源脚本/程序实现。
+- 配置区默认必须是客户模式：普通客户只需要点击“选择游戏图标/程序”、点击“自动查找收藏夹”、选择账号目录、点击“读取账号”。
+- `Bookmarks` 原始路径、`bookmark_root_path`、兼容目录名、自动化设置路径和每层数量属于高级配置，必须默认折叠，禁止堆在主界面。
+- 收藏夹候选下拉只能显示 `Edge - Default - 发现 N 个账号目录` 这类客户可读文本，禁止直接显示 `C:\Users\...\Bookmarks` 原始路径。
+- 账号目录下拉只能显示 `收藏栏 / 斗罗大陆 - 31个账号，包含4个分组` 这类客户可读文本，禁止显示内部 JSON root path。
 - 收藏夹路径是用户配置，不是自动推断结果；启动时必须优先读取 `automation_settings.json` 中上次保存的 `bookmark_file`。
-- 当前默认浏览器为 Edge；没有保存路径时，才允许使用 `Edge Default` 作为默认收藏夹路径。
-- Chrome / Edge 自动探测只能作为候选提示，禁止因为 Chrome Bookmarks 存在就静默覆盖 Edge 或用户保存路径。
-- 保存配置时必须保留 `bookmark_file`、`bookmark_browser`、`bookmark_profile`。
+- Chrome / Edge 自动探测只能作为候选提示，禁止因为 Chrome Bookmarks 存在就静默覆盖用户保存路径。
+- 多个 Bookmarks 或账号目录候选时必须让用户选择；只有保存路径缺失且唯一候选时才允许自动选择并记录日志。
+- 保存配置时必须保留 `bookmark_file`、`bookmark_browser`、`bookmark_profile`、`bookmark_root_path`、`bookmark_root_display_name`。
+- 切换收藏候选时必须清空旧账号目录候选和旧账号列表；禁止出现 Chrome 候选配 Edge 账号目录。
+- 账号目录候选必须绑定 `bookmark_file_path` 和结构化 `root_path`；读取前必须校验它属于当前 Bookmarks 文件。
+- 读取账号必须用结构化 `root_path` 定位目录，禁止只用显示文本最后一段目录名如 `存钻`。
+- 读取失败时必须清空或明确标记旧账号列表，禁止继续静默显示上一次成功读取的 `第一层` 数据。
+- 运行区层级必须来自当前已加载账号；未读取时不能显示硬编码 `第一层`，只加载 `存钻` 时默认层级应切到 `存钻`。
 - 读取收藏夹失败时必须记录当前 Bookmarks 路径和检测到的一级目录。
 - exe 模式必须读取 exe 同级 `automation_settings.json`，不能用源码配置或默认 Chrome 路径覆盖用户配置。
-- 收藏夹账号根目录固定为用户配置的 `bookmark_root_name`，默认 `账号`；层级下拉必须动态读取该目录下真实存在的分组，禁止写死第一层到第四层作为唯一来源。
+- 收藏夹账号目录不能强制叫 `账号`；必须允许从 Bookmarks 内扫描出的账号目录候选下拉选择。
+- 游戏链接直接放在收藏栏或其它收藏夹时必须支持，不能因为没有目录就判失败。
+- 老配置 `bookmark_root_name="账号"` 仍需尽量兼容，但保存了 `bookmark_root_path` 时必须优先按路径恢复。
 - 根目录下纯数字收藏项作为 `单层账号`；根目录下非数字收藏项必须跳过并记录日志。
 - 自定义分组内账号标题不要求纯数字，必须按收藏夹原始顺序读取和映射窗口，禁止强行数字排序。
 - `层级=全部` 只用于账号列表显示；`全部串行` 必须重新按 `account_group_settings` 过滤，只执行 `include_in_all=true` 的分组。
