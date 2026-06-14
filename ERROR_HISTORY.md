@@ -242,3 +242,24 @@
 - `tests/test_gui_group_settings.py::GuiGroupSettingsTests::test_game_program_empty_path_has_empty_input_and_unselected_status`
 - `tests/test_path_utils.py::PathUtilsTests::test_lnk_resolves_to_target_exe`
 - `tests/test_main_startup.py::MainStartupTests::test_gui_startup_does_not_auto_elevate_so_file_drop_works`
+
+## 12. 辅助软件标题误识别为游戏窗口
+
+历史问题：
+
+桌面同时存在 31 个真实 `X5Game.exe` 游戏窗口和 1 个辅助软件窗口。辅助软件标题以 `斗罗大陆H5` 开头，例如 `斗罗大陆H5 电脑版全自动辅助...`。旧逻辑用 `title.startswith("斗罗大陆")`、`"斗罗大陆H5" in title` 等模糊标题规则识别窗口，导致辅助软件被算成第 32 个窗口，排列窗口时报 `目标 31，当前 32`。
+
+防回归规则：
+
+- 窗口管理、槽位保存、槽位刷新、重排、补位、关闭、批量启动前检测、串行运行前预检必须统一使用 `douluo_launcher.window_manager.is_game_window()` / `list_game_windows()`。
+- 配置了游戏程序路径时，必须读取 hwnd 所属进程 exe 路径，只有进程路径等于配置的 `X5Game.exe` 才能进入游戏窗口候选。
+- 编号窗口标题只允许严格匹配 `^斗罗大陆H5-(\d+)号$`。
+- 未编号窗口只允许在显式 `allow_unnumbered=True` 时识别精确标题 `斗罗大陆H5`。
+- 标题包含 `辅助`、`全自动辅助`、`任务开关`、`公共设置`、`日常设置`、`代理设置`、`上号器`、`工具` 时必须排除。
+- 禁止回退到包含匹配、前缀匹配或从标题中任意提取数字。
+
+测试：
+
+- `tests/test_window_manager.py::WindowManagerTests::test_is_game_window_uses_strict_title_and_excludes_helpers`
+- `tests/test_window_manager.py::WindowManagerTests::test_is_game_window_filters_by_configured_game_exe_path`
+- `tests/test_window_manager.py::WindowManagerTests::test_31_game_windows_plus_helper_counts_as_31`

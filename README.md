@@ -53,6 +53,7 @@
 | 批量快速登录 + 统一校验 | ✅ 已验证 | 当前层/全部串行先快速提交，统一校验后只重登失败账号；9 个单层账号最终 9/9 成功 | [docs/LAUNCHER_FINAL_MILESTONE.md](docs/LAUNCHER_FINAL_MILESTONE.md) |
 | 串行按钮范围与预检 | ✅ 源码验证 | 单账号/当前层/全部串行范围隔离；全部串行先生成 run_plan 并一次性校验窗口缺口 | [CURRENT_ISSUES.md](CURRENT_ISSUES.md) |
 | 配置区易用性 | ✅ 已实现 | 客户模式只暴露选择游戏图标/程序、自动查收藏夹、账号目录下拉；技术路径放入高级配置 | [REGRESSION_TESTS.md](REGRESSION_TESTS.md) |
+| 游戏窗口识别过滤 | ✅ 已修复 | 统一使用进程 exe 路径 + 严格标题模板过滤，辅助软件标题包含斗罗大陆H5 也不会计入游戏窗口 | [ERROR_HISTORY.md](ERROR_HISTORY.md), [REGRESSION_TESTS.md](REGRESSION_TESTS.md) |
 | 源码 / exe 一致性 | ✅ 已验证 | exe 使用 `dist/Launcher/上号器.exe`，发布包内置 `ms-playwright` Chromium，不依赖目标电脑用户缓存 | [BUILD.md](BUILD.md) |
 | 防回归体系 | ✅ 已加固 | 历史事故台账 + 自动化测试映射 + 打包前硬检查；没有回归测试的修复不算完成 | [ERROR_HISTORY.md](ERROR_HISTORY.md), [REGRESSION_TESTS.md](REGRESSION_TESTS.md) |
 
@@ -158,6 +159,19 @@
 
 窗口管理参数记忆保存到上号器项目内部独立配置文件 `window_manager_settings.json`。当前已通过源码模式现场验证：关闭全部 H5 窗口后重新批量启动 31 个窗口，会按当前 `window_manager_settings.json` 的固定排列参数重新排列、重命名并生成新的槽位快照。
 
+### 2.1.0 游戏窗口识别规则
+
+所有窗口管理入口必须统一使用 `douluo_launcher.window_manager.is_game_window()` / `list_game_windows()` 过滤窗口，禁止各处自行用标题包含判断。
+
+- 配置了游戏程序路径时，优先读取 hwnd 对应进程 exe 路径，并与配置中的真实 `X5Game.exe` 路径比对；进程路径不一致的窗口不能作为游戏窗口。
+- 已编号游戏窗口标题必须严格匹配 `^斗罗大陆H5-(\d+)号$`，例如 `斗罗大陆H5-1号`、`斗罗大陆H5-31号`。
+- 未编号窗口只允许在明确允许未编号场景下识别精确标题 `斗罗大陆H5`。
+- 辅助软件、上号器自身、工具窗口、任务开关等窗口即使标题包含 `斗罗大陆H5`，也必须排除。
+- 禁止回退到 `title.startswith("斗罗大陆")`、`"斗罗大陆H5" in title` 或从标题任意位置提取数字。
+- 修改窗口识别逻辑后必须运行 `tests/test_window_manager.py` 中的辅助软件误识别防回归测试，以及完整 `python -m unittest discover -s tests -v`。
+
+历史事故：桌面有 31 个真实游戏窗口和 1 个标题以 `斗罗大陆H5` 开头的辅助软件时，旧逻辑把辅助软件计入第 32 个窗口，导致排列窗口提示 `目标 31，当前 32`。当前防回归要求：同场景识别结果必须是 31，辅助软件不能被移动、重命名或写入槽位文件。
+
 ### 2.1.1 窗口槽位机制
 
 窗口号现在应理解为固定槽位 `slot`，而不是“当前枚举窗口列表里的第几个”。例如 `slot 11` 表示 11 号窗口的位置、大小、标题、账号映射和当前运行状态。
@@ -183,7 +197,7 @@
 
 刷新槽位映射：
 
-- 只枚举当前桌面可见、标题中带编号的斗罗大陆H5窗口。
+- 只枚举当前桌面可见、通过统一游戏窗口过滤函数确认的严格编号斗罗大陆H5窗口。
 - 读取当前 `hwnd`、标题、坐标和尺寸，并写入 `window_slots.json`。
 - 不移动窗口。
 - 不重命名窗口。

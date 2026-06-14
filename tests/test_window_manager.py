@@ -24,6 +24,7 @@ from douluo_launcher.window_manager import (  # noqa: E402
     refresh_window_slots_from_current_windows,
     resolve_window_slot_for_repair,
     save_current_windows_as_slots,
+    is_game_window,
     sort_game_windows,
     window_slots_profile_path,
 )
@@ -31,17 +32,84 @@ from douluo_launcher.window_manager import (  # noqa: E402
 
 class WindowManagerTests(unittest.TestCase):
     def test_extract_window_number(self) -> None:
-        self.assertEqual(extract_window_number("斗罗大陆H5-1号甲战区"), 1)
-        self.assertEqual(extract_window_number("斗罗大陆H5-31号甲战区"), 31)
-        self.assertEqual(extract_window_number("斗罗大陆H5_8号"), 8)
+        self.assertEqual(extract_window_number("斗罗大陆H5-1号"), 1)
+        self.assertEqual(extract_window_number("斗罗大陆H5-31号"), 31)
+        self.assertIsNone(extract_window_number("斗罗大陆H5-1号甲战区"))
+        self.assertIsNone(extract_window_number("斗罗大陆H5_8号"))
         self.assertIsNone(extract_window_number("斗罗大陆H5"))
+
+    def test_is_game_window_uses_strict_title_and_excludes_helpers(self) -> None:
+        self.assertTrue(is_game_window(1, "斗罗大陆H5-1号"))
+        self.assertTrue(is_game_window(2, "斗罗大陆H5-31号"))
+        self.assertFalse(is_game_window(3, "斗罗大陆H5 电脑版全自动辅助"))
+        self.assertFalse(is_game_window(4, "斗罗大陆H5 辅助工具"))
+        self.assertFalse(is_game_window(5, "上号器 —— 前台串行模式"))
+        self.assertFalse(is_game_window(6, "斗罗大陆H5"))
+        self.assertTrue(is_game_window(7, "斗罗大陆H5", allow_unnumbered=True))
+
+    def test_is_game_window_filters_by_configured_game_exe_path(self) -> None:
+        configured = r"E:\Program Files\DLH5\X5Game.exe"
+        process_paths = {
+            1: configured,
+            2: configured.lower(),
+            31: configured,
+            100: r"E:\Tools\斗罗大陆H5辅助.exe",
+            101: r"D:\Tools\launcher.exe",
+            102: configured,
+        }
+
+        def process_path(hwnd: int) -> str:
+            return process_paths.get(hwnd, "")
+
+        titles = [
+            (1, "斗罗大陆H5-1号"),
+            (2, "斗罗大陆H5-2号"),
+            (31, "斗罗大陆H5-31号"),
+            (100, "斗罗大陆H5 电脑版全自动辅助"),
+            (101, "上号器 —— 前台串行模式"),
+            (102, "斗罗大陆H5 辅助工具"),
+        ]
+
+        accepted = [
+            hwnd
+            for hwnd, title in titles
+            if is_game_window(
+                hwnd,
+                title,
+                configured_game_exe_path=configured,
+                process_path_getter=process_path,
+            )
+        ]
+
+        self.assertEqual(accepted, [1, 2, 31])
+
+    def test_31_game_windows_plus_helper_counts_as_31(self) -> None:
+        configured = r"E:\Program Files\DLH5\X5Game.exe"
+        process_paths = {index: configured for index in range(1, 32)}
+        process_paths[99] = r"E:\Tools\斗罗大陆H5辅助.exe"
+
+        titles = [(index, f"斗罗大陆H5-{index}号") for index in range(1, 32)]
+        titles.append((99, "斗罗大陆H5 电脑版全自动辅助"))
+
+        count = sum(
+            1
+            for hwnd, title in titles
+            if is_game_window(
+                hwnd,
+                title,
+                configured_game_exe_path=configured,
+                process_path_getter=lambda value: process_paths[value],
+            )
+        )
+
+        self.assertEqual(count, 31)
 
     def test_sort_game_windows_uses_numeric_order(self) -> None:
         windows = [
-            GameWindow(hwnd=10, title="斗罗大陆H5-10号甲战区", number=10),
-            GameWindow(hwnd=2, title="斗罗大陆H5-2号甲战区", number=2),
-            GameWindow(hwnd=1, title="斗罗大陆H5-1号甲战区", number=1),
-            GameWindow(hwnd=11, title="斗罗大陆H5-11号甲战区", number=11),
+            GameWindow(hwnd=10, title="斗罗大陆H5-10号", number=10),
+            GameWindow(hwnd=2, title="斗罗大陆H5-2号", number=2),
+            GameWindow(hwnd=1, title="斗罗大陆H5-1号", number=1),
+            GameWindow(hwnd=11, title="斗罗大陆H5-11号", number=11),
         ]
 
         sorted_numbers = [window.number for window in sort_game_windows(windows)]

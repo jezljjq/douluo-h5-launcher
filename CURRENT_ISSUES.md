@@ -26,6 +26,7 @@
 - 固定参数排列和行数列数排列均已支持。
 - 单层账号和四层账号已隔离。
 - 已新增 `D:\Ai\skills\launcher-regression-guard\SKILL.md` 防回归技能。
+- 2026-06-15 已修复辅助软件误识别为游戏窗口：窗口识别统一走 `is_game_window()` / `list_game_windows()`，配置了游戏程序路径时按 hwnd 进程 exe 路径过滤，编号窗口严格匹配 `斗罗大陆H5-数字号`，标题包含辅助/工具/上号器等关键字的窗口不进入游戏窗口集合。
 
 ### 后续仍需扩大样本验证
 
@@ -118,6 +119,7 @@ OCR 兜底规则：
 - “修复窗口”不再要求当前 profile 槽位文件完整。slot 解析顺序为：当前 profile 文件、最近备份、legacy `window_slots.json`、当前桌面同编号窗口、固定参数推导。
 - 固定参数推导公式：`row=(slot_no-1)//per_row`，`col=(slot_no-1)%per_row`，`x=start_x+col*offset_x`，`y=start_y+row*offset_y`，宽高使用当前固定参数。
 - “重新生成槽位”“刷新槽位映射”“排列窗口”“修复窗口”“批量启动窗口”会禁用相关按钮；长耗时排列、重命名、扫描、保存放到 worker 线程，避免 UI 未响应。
+- 游戏窗口识别已收紧：禁止使用 `title.startswith("斗罗大陆")` 或 `"斗罗大陆H5" in title` 等模糊匹配；31 个真实 `X5Game.exe` 游戏窗口 + 1 个标题以 `斗罗大陆H5` 开头的辅助软件时，识别结果必须是 31，辅助软件不能被移动、重命名、写入 `window_slots.json` 或 profile 槽位。
 
 剩余风险：
 
@@ -174,7 +176,7 @@ OCR 兜底规则：
 
 源码验证：
 
-- `python -m unittest discover -s tests -v`：94 tests OK。
+- `python -m unittest discover -s tests -v`：97 tests OK。
 - `python -m compileall -q douluo_launcher main.py tools\drag_drop_poc.py`：通过。
 
 仍未现场验证：
