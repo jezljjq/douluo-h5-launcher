@@ -26,6 +26,7 @@ from douluo_launcher.window_manager import (
     SlotEnvironment,
     SlotLayoutParams,
     TileConfig,
+    TileResult,
     WindowRect,
     check_window_slots_compatibility,
     layout_params_from_tile_config,
@@ -259,6 +260,53 @@ class WindowSlotRegressionTests(unittest.TestCase):
             warning.assert_called_once()
             self.assertIn("当前已检测到 31 个窗口", warning.call_args.args[1])
             self.assertIsNone(fake.wm_launch_thread)
+
+    def test_regenerate_slots_does_not_save_when_move_fails(self) -> None:
+        layout_params = layout_params_from_tile_config(
+            TileConfig(width=320, height=540, start_x=250, start_y=0, offset_x=320, offset_y=525, per_row=8),
+            title_template="斗罗大陆H5-{index}号",
+            target_window_count=31,
+        )
+        failed = TileResult(
+            window=_window(1),
+            x=250,
+            y=0,
+            success=False,
+            error="窗口移动失败：Windows 拒绝访问。",
+            width=320,
+            height=540,
+        )
+        fake = SimpleNamespace(
+            logs=[],
+            wm_auto_rename_after_tile_var=SimpleNamespace(get=lambda: True),
+            slot_path=Path(tempfile.gettempdir()) / "failed_move_profile.json",
+        )
+        fake._queue_log = lambda message: fake.logs.append(message)
+        fake._wm_slots_path = lambda layout: fake.slot_path
+        fake._wm_run_tile = lambda **kwargs: [failed]
+        fake._wm_log_tile_results = lambda results, log: [log(result.error) for result in results if not result.success]
+        fake._wm_rename_windows_after_tile = mock.Mock()
+        fake.after = lambda delay, callback: callback()
+        fake._wm_set_actions_busy = lambda busy: None
+
+        with (
+            mock.patch("douluo_launcher.gui.save_current_windows_as_slots") as save_slots,
+            mock.patch("douluo_launcher.gui.messagebox.showerror") as show_error,
+        ):
+            LauncherApp._wm_regenerate_slots_worker(
+                fake,
+                WM_TILE_MODE_FIXED,
+                TileConfig(width=320, height=540, start_x=250, start_y=0, offset_x=320, offset_y=525, per_row=8),
+                [],
+                layout_params,
+                31,
+                "D:/dummy/game.exe",
+            )
+
+        save_slots.assert_not_called()
+        fake._wm_rename_windows_after_tile.assert_not_called()
+        show_error.assert_called_once()
+        self.assertTrue(any("未写入槽位" in line for line in fake.logs))
 
     def test_all_serial_plan_reports_missing_windows_before_any_run(self) -> None:
         accounts = [

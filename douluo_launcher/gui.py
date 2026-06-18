@@ -45,6 +45,7 @@ from .path_utils import first_dropped_file_path, resolve_game_executable_path
 from .version import APP_VERSION
 from .window_manager import (
     GAME_TITLE_KEYWORD,
+    WINDOW_DETECTION_LOG_PATH,
     RowTileConfig,
     TileConfig,
     calculate_row_tile_plan,
@@ -83,6 +84,28 @@ WM_POLL_INTERVAL_SECONDS = 0.5
 WM_FINAL_DELAY_SECONDS = 1
 WM_TILE_MODE_FIXED = "固定参数排列"
 WM_TILE_MODE_ROW_COUNT = "根据行数排列"
+
+
+def _safe_wm_expected_window_size(owner) -> tuple[int, int] | None:
+    getter = getattr(owner, "_wm_expected_window_size_filter", None)
+    if not callable(getter):
+        return None
+    try:
+        return getter()
+    except Exception:
+        return None
+
+
+def _safe_wm_title_template(owner) -> str | None:
+    var = getattr(owner, "wm_title_template_var", None)
+    if var is None:
+        return None
+    try:
+        value = str(var.get()).strip()
+    except Exception:
+        return None
+    return value or None
+
 
 ACCOUNT_TABLE_COLUMNS = (
     "level",
@@ -1127,6 +1150,25 @@ class LauncherApp(_TK_BASE):
     def _wm_game_exe_path_filter(self) -> str:
         return self.wm_game_path_var.get().strip().strip('"')
 
+    def _wm_expected_window_size_filter(self) -> tuple[int, int] | None:
+        try:
+            width = int(str(self.wm_window_width_var.get()).strip())
+            height = int(str(self.wm_window_height_var.get()).strip())
+        except Exception:
+            return None
+        if width <= 0 or height <= 0:
+            return None
+        return (width, height)
+
+    def _wm_detection_log_path(self) -> Path:
+        return project_root() / WINDOW_DETECTION_LOG_PATH
+
+    def _wm_log_zero_detection_hint(self) -> None:
+        self._log(
+            "窗口管理：识别窗口失败：未识别到游戏窗口。"
+            f"如果桌面已有疑似斗罗大陆H5标题窗口，请查看详细日志：{self._wm_detection_log_path()}"
+        )
+
     def _wm_action_buttons(self) -> list[object]:
         buttons = []
         for name in (
@@ -1175,8 +1217,10 @@ class LauncherApp(_TK_BASE):
     def _wm_current_window_count(self) -> int:
         return len(
             list_game_windows(
+                title_template=_safe_wm_title_template(self),
                 exclude_hwnds=self._wm_excluded_hwnds(),
                 game_exe_path=self._wm_game_exe_path_filter(),
+                expected_window_size=_safe_wm_expected_window_size(self),
             )
         )
 
@@ -1334,7 +1378,14 @@ class LauncherApp(_TK_BASE):
 
         excluded_hwnds = self._wm_excluded_hwnds()
         try:
-            existing_count = len(list_game_windows(exclude_hwnds=excluded_hwnds, game_exe_path=game_path))
+            existing_count = len(
+                list_game_windows(
+                    title_template=_safe_wm_title_template(self),
+                    exclude_hwnds=excluded_hwnds,
+                    game_exe_path=game_path,
+                    expected_window_size=_safe_wm_expected_window_size(self),
+                )
+            )
         except Exception as exc:
             self._log(f"[窗口管理] 批量启动前识别窗口失败：{exc}")
             existing_count = 0
@@ -1410,7 +1461,12 @@ class LauncherApp(_TK_BASE):
         try:
             log(f"准备批量启动：路径={game_path}，数量={launch_count}，间隔={launch_interval}ms")
             try:
-                before_windows = list_game_windows(exclude_hwnds=excluded_hwnds, game_exe_path=game_path)
+                before_windows = list_game_windows(
+                    title_template=_safe_wm_title_template(self),
+                    exclude_hwnds=excluded_hwnds,
+                    game_exe_path=game_path,
+                    expected_window_size=_safe_wm_expected_window_size(self),
+                )
                 before_count = len(before_windows)
                 log(f"启动前识别到 {before_count} 个 H5 窗口")
             except Exception as exc:
@@ -1443,7 +1499,12 @@ class LauncherApp(_TK_BASE):
                     time.sleep(launch_interval / 1000)
 
                 try:
-                    current_windows = list_game_windows(exclude_hwnds=excluded_hwnds, game_exe_path=game_path)
+                    current_windows = list_game_windows(
+                        title_template=_safe_wm_title_template(self),
+                        exclude_hwnds=excluded_hwnds,
+                        game_exe_path=game_path,
+                        expected_window_size=_safe_wm_expected_window_size(self),
+                    )
                     current_count = len(current_windows)
                     expected_count = before_count + index
                     log(f"当前识别到 {current_count} 个 H5 窗口")
@@ -1455,7 +1516,14 @@ class LauncherApp(_TK_BASE):
                     log(f"启动后识别窗口失败：{exc}")
 
             try:
-                final_count = len(list_game_windows(exclude_hwnds=excluded_hwnds, game_exe_path=game_path))
+                final_count = len(
+                    list_game_windows(
+                        title_template=_safe_wm_title_template(self),
+                        exclude_hwnds=excluded_hwnds,
+                        game_exe_path=game_path,
+                        expected_window_size=_safe_wm_expected_window_size(self),
+                    )
+                )
             except Exception as exc:
                 final_count = -1
                 log(f"批量启动完成后识别窗口失败：{exc}")
@@ -1493,7 +1561,14 @@ class LauncherApp(_TK_BASE):
                     )
                 try:
                     if self._wm_has_saved_slots(layout_params) and not new_session:
-                        current_count = len(list_game_windows(exclude_hwnds=excluded_hwnds, game_exe_path=game_path))
+                        current_count = len(
+                            list_game_windows(
+                                title_template=_safe_wm_title_template(self),
+                                exclude_hwnds=excluded_hwnds,
+                                game_exe_path=game_path,
+                                expected_window_size=_safe_wm_expected_window_size(self),
+                            )
+                        )
                         if not self._wm_validate_slot_profile(
                             layout_params=layout_params,
                             current_window_count=current_count,
@@ -1531,6 +1606,15 @@ class LauncherApp(_TK_BASE):
                     )
                     log(f"自动排列完成，结果 {len(results)} 个")
                     self._wm_log_tile_results(results, log)
+                    failed_results = [result for result in results if not result.success]
+                    if failed_results:
+                        error = (
+                            f"排列窗口失败：{len(failed_results)} 个窗口移动失败，本次未写入槽位。"
+                            f"首个错误：{failed_results[0].error}"
+                        )
+                        log(error)
+                        self.after(0, lambda message=error: messagebox.showerror("排列窗口失败", message))
+                        return
                     if auto_rename:
                         self._wm_rename_windows_after_tile(
                             log=log,
@@ -1543,6 +1627,7 @@ class LauncherApp(_TK_BASE):
                         slots_path=self._wm_slots_path(layout_params),
                         exclude_hwnds=excluded_hwnds,
                         game_exe_path=game_path,
+                        title_template=layout_params.title_template,
                         layout_params=layout_params,
                         expected_count=target_count,
                     )
@@ -1567,7 +1652,14 @@ class LauncherApp(_TK_BASE):
 
         while time.monotonic() < deadline:
             try:
-                current_count = len(list_game_windows(exclude_hwnds=excluded_hwnds, game_exe_path=game_exe_path))
+                current_count = len(
+                    list_game_windows(
+                        title_template=_safe_wm_title_template(self),
+                        exclude_hwnds=excluded_hwnds,
+                        game_exe_path=game_exe_path,
+                        expected_window_size=_safe_wm_expected_window_size(self),
+                    )
+                )
             except Exception as exc:
                 stable_count = 0
                 log(f"等待窗口稳定时识别窗口失败：{exc}")
@@ -1605,7 +1697,12 @@ class LauncherApp(_TK_BASE):
         log=None,
     ):
         if tile_mode == WM_TILE_MODE_ROW_COUNT:
-            windows = list_game_windows(exclude_hwnds=exclude_hwnds, game_exe_path=game_exe_path)
+            windows = list_game_windows(
+                title_template=_safe_wm_title_template(self),
+                exclude_hwnds=exclude_hwnds,
+                game_exe_path=game_exe_path,
+                expected_window_size=_safe_wm_expected_window_size(self),
+            )
             plan = calculate_row_tile_plan(len(windows), tile_config)
             if log is not None:
                 work = plan.work_area
@@ -1639,9 +1736,15 @@ class LauncherApp(_TK_BASE):
                 tile_config,
                 exclude_hwnds=exclude_hwnds,
                 game_exe_path=game_exe_path,
+                title_template=_safe_wm_title_template(self),
                 windows=windows,
             )
-        return tile_game_windows(tile_config, exclude_hwnds=exclude_hwnds, game_exe_path=game_exe_path)
+        return tile_game_windows(
+            tile_config,
+            exclude_hwnds=exclude_hwnds,
+            game_exe_path=game_exe_path,
+            title_template=_safe_wm_title_template(self),
+        )
 
     def _wm_target_window_count(self) -> int | None:
         try:
@@ -1789,8 +1892,10 @@ class LauncherApp(_TK_BASE):
         try:
             current_count = len(
                 list_game_windows(
+                    title_template=_safe_wm_title_template(self),
                     exclude_hwnds=self._wm_excluded_hwnds(),
                     game_exe_path=self._wm_game_exe_path_filter(),
+                    expected_window_size=_safe_wm_expected_window_size(self),
                 )
             )
         except Exception as exc:
@@ -1816,6 +1921,7 @@ class LauncherApp(_TK_BASE):
                 slots_path=slots_path,
                 exclude_hwnds=self._wm_excluded_hwnds(),
                 game_exe_path=self._wm_game_exe_path_filter(),
+                title_template=layout_params.title_template,
                 layout_params=layout_params,
                 expected_count=target_count,
             )
@@ -1973,8 +2079,10 @@ class LauncherApp(_TK_BASE):
     def _wm_identify_windows(self) -> None:
         try:
             windows = list_game_windows(
+                title_template=_safe_wm_title_template(self),
                 exclude_hwnds=self._wm_excluded_hwnds(),
                 game_exe_path=self._wm_game_exe_path_filter(),
+                expected_window_size=_safe_wm_expected_window_size(self),
             )
         except Exception as exc:
             self._log(f"窗口管理：识别登录窗口失败：{exc}")
@@ -1982,6 +2090,8 @@ class LauncherApp(_TK_BASE):
             return
 
         self._log(f"窗口管理：识别到 {len(windows)} 个斗罗大陆H5登录窗口。")
+        if not windows:
+            self._wm_log_zero_detection_hint()
         for index, window in enumerate(windows, start=1):
             number = window.number if window.number is not None else "无编号"
             rect = window.rect
@@ -2004,8 +2114,10 @@ class LauncherApp(_TK_BASE):
         try:
             current_count = len(
                 list_game_windows(
+                    title_template=_safe_wm_title_template(self),
                     exclude_hwnds=self._wm_excluded_hwnds(),
                     game_exe_path=self._wm_game_exe_path_filter(),
+                    expected_window_size=_safe_wm_expected_window_size(self),
                 )
             )
         except Exception as exc:
@@ -2081,8 +2193,10 @@ class LauncherApp(_TK_BASE):
         try:
             current_count = len(
                 list_game_windows(
+                    title_template=_safe_wm_title_template(self),
                     exclude_hwnds=excluded_hwnds,
                     game_exe_path=self._wm_game_exe_path_filter(),
+                    expected_window_size=_safe_wm_expected_window_size(self),
                 )
             )
         except Exception as exc:
@@ -2137,6 +2251,15 @@ class LauncherApp(_TK_BASE):
             return
 
         self._wm_log_tile_results(results, lambda message: self._queue_log(f"窗口管理：{message}"))
+        failed_results = [result for result in results if not result.success]
+        if failed_results:
+            error = (
+                f"排列窗口失败：{len(failed_results)} 个窗口移动失败，本次未写入槽位。"
+                f"首个错误：{failed_results[0].error}"
+            )
+            self._queue_log(f"窗口管理：{error}")
+            self.after(0, lambda message=error: messagebox.showerror("重新生成槽位失败", message))
+            return
         if self.wm_auto_rename_after_tile_var.get():
             self._wm_rename_windows_after_tile(
                 log=lambda message: self._queue_log(f"[窗口管理] {message}"),
@@ -2149,6 +2272,7 @@ class LauncherApp(_TK_BASE):
                 slots_path=self._wm_slots_path(layout_params),
                 exclude_hwnds=excluded_hwnds,
                 game_exe_path=game_exe_path,
+                title_template=layout_params.title_template,
                 layout_params=layout_params,
                 expected_count=target_count,
             )
@@ -2306,6 +2430,7 @@ class LauncherApp(_TK_BASE):
             results = close_game_windows(
                 exclude_hwnds=self._wm_excluded_hwnds(),
                 game_exe_path=self._wm_game_exe_path_filter(),
+                title_template=_safe_wm_title_template(self),
             )
         except Exception as exc:
             self._log(f"窗口管理：关闭登录窗口失败：{exc}")
@@ -2880,7 +3005,7 @@ Write-Output $count
                 h5_candidates = [window for window in candidates if window.title.strip() == GAME_TITLE_KEYWORD]
                 numbered_candidates = [
                     window for window in h5_candidates
-                    if extract_window_number(window.title) is not None
+                    if extract_window_number(window.title, title_template=_safe_wm_title_template(self)) is not None
                 ]
                 if h5_candidates and not numbered_candidates:
                     message = (
@@ -2904,8 +3029,10 @@ Write-Output $count
 
     def _visible_h5_window_numbers(self) -> tuple[int, ...]:
         windows = list_game_windows(
+            title_template=_safe_wm_title_template(self),
             exclude_hwnds=self._wm_excluded_hwnds(),
             game_exe_path=self._wm_game_exe_path_filter(),
+            expected_window_size=_safe_wm_expected_window_size(self),
         )
         return tuple(
             sorted(

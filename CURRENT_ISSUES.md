@@ -26,7 +26,7 @@
 - 固定参数排列和行数列数排列均已支持。
 - 单层账号和四层账号已隔离。
 - 已新增 `D:\Ai\skills\launcher-regression-guard\SKILL.md` 防回归技能。
-- 2026-06-15 已修复辅助软件误识别为游戏窗口：窗口识别统一走 `is_game_window()` / `list_game_windows()`，配置了游戏程序路径时按 hwnd 进程 exe 路径过滤，编号窗口严格匹配 `斗罗大陆H5-数字号`，标题包含辅助/工具/上号器等关键字的窗口不进入游戏窗口集合。
+- 2026-06-16 已修复辅助软件误识别、标题格式二次回归、标题模板写死和 `SetWindowPos` 错误码 5 诊断不足：窗口识别统一走 `is_game_window()` / `list_game_windows()`，标题规则从当前 UI 标题模板动态生成；辅助/工具/上号器关键字优先排除；配置了游戏程序路径时按 hwnd 进程 exe 路径强确认，但进程路径不匹配不再一票否决；窗口移动失败会输出权限诊断，移动失败时禁止写槽位。
 
 ### 后续仍需扩大样本验证
 
@@ -119,7 +119,7 @@ OCR 兜底规则：
 - “修复窗口”不再要求当前 profile 槽位文件完整。slot 解析顺序为：当前 profile 文件、最近备份、legacy `window_slots.json`、当前桌面同编号窗口、固定参数推导。
 - 固定参数推导公式：`row=(slot_no-1)//per_row`，`col=(slot_no-1)%per_row`，`x=start_x+col*offset_x`，`y=start_y+row*offset_y`，宽高使用当前固定参数。
 - “重新生成槽位”“刷新槽位映射”“排列窗口”“修复窗口”“批量启动窗口”会禁用相关按钮；长耗时排列、重命名、扫描、保存放到 worker 线程，避免 UI 未响应。
-- 游戏窗口识别已收紧：禁止使用 `title.startswith("斗罗大陆")` 或 `"斗罗大陆H5" in title` 等模糊匹配；31 个真实 `X5Game.exe` 游戏窗口 + 1 个标题以 `斗罗大陆H5` 开头的辅助软件时，识别结果必须是 31，辅助软件不能被移动、重命名、写入 `window_slots.json` 或 profile 槽位。
+- 游戏窗口识别已改为多条件规则：禁止使用 `title.startswith("斗罗大陆")` 或 `"斗罗大陆H5" in title` 等模糊匹配；编号标题必须跟随当前 UI 标题模板，例如 `斗罗大陆H5-{index}号` 或 `DLH5-{index}`；31 个真实编号窗口 + 1 个标题包含辅助关键字的软件窗口时，识别结果必须是 31，辅助软件不能被移动、重命名、写入 `window_slots.json` 或 profile 槽位。数量异常时查看 `logs/window_detection_detail.log`。
 
 剩余风险：
 
@@ -449,3 +449,20 @@ OCR 兜底规则：
 4. 浏览器窗口同样自动枚举：`_find_game_browser_window()` 按标题关键词匹配
 
 窗口句柄不在代码中写死，运行时自动获取。但如果窗口标题格式变化（如不再包含 `H5-{number}-`），需调整 `window_title_matches_game_no` 中的匹配规则。
+
+---
+
+## 9. 通行证按钮安全点击（2026-06-18）
+
+当前源码已修复：
+
+- 点击右侧“通行证”按钮后必须轮询确认“通行证登录”弹窗、输入框或确认按钮出现。
+- 命中缓存按钮坐标也不能直接信任；缓存坐标点击后未弹窗，会清空当前 viewport 缓存并重新截图模板匹配。
+- 重新匹配后再点击一次，仍未弹窗则失败为“通行证弹窗未出现”。
+- 弹窗未出现时禁止继续输入通行证、禁止点击确认、禁止标记成功。
+- 失败现场保存到 `debug_ocr/_error/latest_error.png`、`latest_error_context.json`、`latest_error.log`。
+
+待现场验证：
+
+- 进入游戏页并关闭公告后，点击右侧“通行证”应弹出“通行证登录”输入框。
+- 如果没有弹出，应查看 `debug_ocr/_error/latest_error_context.json` 中的 `button_viewport`、`button_screen`、`template_score` 和 `attempts`。

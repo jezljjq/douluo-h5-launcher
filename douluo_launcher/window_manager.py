@@ -15,7 +15,7 @@ from typing import Callable, Iterable, List, Optional
 
 
 GAME_TITLE_KEYWORD = "斗罗大陆H5"
-NUMBERED_GAME_TITLE_PATTERN = re.compile(r"^斗罗大陆H5-(\d+)号$")
+DEFAULT_TITLE_TEMPLATE = f"{GAME_TITLE_KEYWORD}-{{index}}号"
 EXCLUDED_GAME_WINDOW_TITLE_KEYWORDS = (
     "全自动辅助",
     "辅助",
@@ -38,6 +38,7 @@ SPI_GETWORKAREA = 0x0030
 DWMWA_CLOAKED = 14
 DEFAULT_DPI = 96
 SLOT_FILE_VERSION = 1
+WINDOW_DETECTION_LOG_PATH = Path("logs") / "window_detection_detail.log"
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
@@ -53,6 +54,8 @@ user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
 user32.GetWindowTextLengthW.restype = ctypes.c_int
 user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
 user32.GetWindowTextW.restype = ctypes.c_int
+user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+user32.GetClassNameW.restype = ctypes.c_int
 user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
 user32.GetWindowThreadProcessId.restype = wintypes.DWORD
 user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
@@ -107,6 +110,9 @@ kernel32.QueryFullProcessImageNameW.argtypes = [
 kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
 kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 kernel32.CloseHandle.restype = wintypes.BOOL
+shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+shell32.IsUserAnAdmin.argtypes = []
+shell32.IsUserAnAdmin.restype = wintypes.BOOL
 
 
 @dataclass(frozen=True)
@@ -131,6 +137,23 @@ class GameWindow:
     title: str
     number: Optional[int]
     rect: WindowRect = WindowRect(0, 0, 0, 0)
+
+
+@dataclass(frozen=True)
+class WindowDetectResult:
+    hwnd: int
+    title: str
+    slot_no: Optional[int]
+    accepted: bool
+    reason: str
+    class_name: str = ""
+    pid: Optional[int] = None
+    process_path: str = ""
+    rect: WindowRect = WindowRect(0, 0, 0, 0)
+    title_numbered: bool = False
+    helper_keyword: str = ""
+    process_path_match: bool = False
+    size_match: bool = False
 
 
 @dataclass(frozen=True)
@@ -302,6 +325,14 @@ def _get_window_title(hwnd: int) -> str:
     return buffer.value
 
 
+def get_window_class_name(hwnd: int) -> str:
+    buffer = ctypes.create_unicode_buffer(256)
+    copied = user32.GetClassNameW(wintypes.HWND(hwnd), buffer, len(buffer))
+    if copied <= 0:
+        return ""
+    return buffer.value
+
+
 def get_window_rect(hwnd: int) -> WindowRect:
     rect = wintypes.RECT()
     if not user32.GetWindowRect(wintypes.HWND(hwnd), ctypes.byref(rect)):
@@ -346,6 +377,91 @@ def get_system_dpi() -> int:
     except Exception:
         pass
     return DEFAULT_DPI
+
+
+def is_current_process_admin() -> bool:
+    try:
+        return bool(shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def _format_windows_error(error_code: int) -> str:
+    try:
+        return ctypes.FormatError(int(error_code)).strip()
+    except Exception:
+        return ""
+
+
+def _format_set_window_pos_failure(
+    window: GameWindow,
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+    error_code: int,
+) -> str:
+    try:
+        pid = get_window_process_id(window.hwnd)
+    except Exception:
+        pid = None
+    try:
+        process_path = get_window_process_path(window.hwnd)
+    except Exception:
+        process_path = ""
+    rect = window.rect
+    error_text = _format_windows_error(error_code)
+    access_text = ""
+    if int(error_code) == 5:
+        access_text = (
+            "窗口移动失败：Windows 拒绝访问。"
+            "可能原因：目标窗口由其它辅助软件以更高权限启动，或上号器权限不足。"
+            "请用相同权限启动上号器和辅助软件，或改用上号器批量启动窗口。"
+        )
+    else:
+        access_text = "窗口移动失败。"
+    return (
+        f"{access_text} "
+        f"SetWindowPos 失败，错误码 {int(error_code)}"
+        f"{f'({error_text})' if error_text else ''}；"
+        f"hwnd={window.hwnd}；title={window.title}；pid={pid if pid is not None else '未知'}；"
+        f"process_path={process_path or '未知'}；上号器管理员={is_current_process_admin()}；"
+        "目标进程管理员=未知；"
+        f"当前rect=({rect.left},{rect.top},{rect.right},{rect.bottom})；"
+        f"目标x={x} y={y} w={width} h={height}"
+    )
+
+
+def _set_window_pos_with_retries(
+    window: GameWindow,
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+    flags: int,
+    retries: int,
+    retry_delay: float,
+) -> tuple[bool, str]:
+    error_code = 0
+    for attempt in range(retries + 1):
+        ctypes.set_last_error(0)
+        ok = bool(
+            user32.SetWindowPos(
+                wintypes.HWND(window.hwnd),
+                None,
+                x,
+                y,
+                width,
+                height,
+                flags,
+            )
+        )
+        if ok:
+            return True, ""
+        error_code = ctypes.get_last_error()
+        if attempt < retries:
+            time.sleep(retry_delay)
+    return False, _format_set_window_pos_failure(window, x, y, width, height, error_code)
 
 
 def make_slot_environment(screen_width: int, screen_height: int, dpi: int) -> SlotEnvironment:
@@ -521,16 +637,21 @@ def _normalize_exe_path_for_compare(path: str | Path | None) -> str:
     return os.path.normcase(os.path.normpath(normalized))
 
 
-def get_window_process_path(hwnd: int) -> str:
+def get_window_process_id(hwnd: int) -> int:
     process_id = wintypes.DWORD(0)
     user32.GetWindowThreadProcessId(wintypes.HWND(hwnd), ctypes.byref(process_id))
-    if not process_id.value:
+    return int(process_id.value or 0)
+
+
+def get_window_process_path(hwnd: int) -> str:
+    process_id = get_window_process_id(hwnd)
+    if not process_id:
         return ""
 
     process_handle = kernel32.OpenProcess(
         PROCESS_QUERY_LIMITED_INFORMATION,
         False,
-        process_id.value,
+        process_id,
     )
     if not process_handle:
         return ""
@@ -550,37 +671,219 @@ def get_window_process_path(hwnd: int) -> str:
         kernel32.CloseHandle(process_handle)
 
 
-def extract_window_number(title: str) -> Optional[int]:
-    match = NUMBERED_GAME_TITLE_PATTERN.fullmatch(str(title or "").strip())
+def build_title_template_pattern(title_template: str | None) -> re.Pattern[str]:
+    """Build a numbered-window pattern from a title template containing {index} or {number}."""
+    template = str(title_template or DEFAULT_TITLE_TEMPLATE).strip()
+    placeholder = "{index}"
+    position = template.find(placeholder)
+    if position < 0:
+        placeholder = "{number}"
+        position = template.find(placeholder)
+    if position < 0:
+        return re.compile(r"a^")
+
+    before = template[:position]
+    after = template[position + len(placeholder):]
+    pattern = f"^{re.escape(before)}(?P<index>\\d+){re.escape(after)}(?:-.+)?$"
+    return re.compile(pattern)
+
+
+def _title_template_literal_prefix(title_template: str | None) -> str:
+    template = str(title_template or DEFAULT_TITLE_TEMPLATE).strip()
+    positions = [pos for pos in (template.find("{index}"), template.find("{number}")) if pos >= 0]
+    if not positions:
+        return template
+    return template[: min(positions)]
+
+
+def _unnumbered_title_from_template(title_template: str | None) -> str:
+    prefix = _title_template_literal_prefix(title_template).rstrip("-_ #：:号")
+    return prefix or GAME_TITLE_KEYWORD
+
+
+def extract_window_number(title: str, title_template: str | None = None) -> Optional[int]:
+    match = build_title_template_pattern(title_template).fullmatch(str(title or "").strip())
     if match:
-        return int(match.group(1))
+        return int(match.group("index"))
 
     return None
+
+
+def _window_size_matches(
+    rect: WindowRect | None,
+    expected_window_size: tuple[int, int] | None,
+) -> bool:
+    if rect is None or expected_window_size is None:
+        return False
+    expected_width, expected_height = expected_window_size
+    if expected_width <= 0 or expected_height <= 0:
+        return False
+    width_tolerance = max(90, int(expected_width * 0.45))
+    height_tolerance = max(120, int(expected_height * 0.45))
+    return (
+        abs(rect.width - expected_width) <= width_tolerance
+        and abs(rect.height - expected_height) <= height_tolerance
+    )
+
+
+def _is_detection_candidate_title(title: str, title_template: str | None = None) -> bool:
+    clean_title = str(title or "").strip()
+    if not clean_title:
+        return False
+    if any(keyword in clean_title for keyword in EXCLUDED_GAME_WINDOW_TITLE_KEYWORDS):
+        return True
+    if extract_window_number(clean_title, title_template=title_template) is not None:
+        return True
+    prefix = _title_template_literal_prefix(title_template).strip()
+    return bool((prefix and prefix in clean_title) or "上号器" in clean_title or GAME_TITLE_KEYWORD in clean_title)
+
+
+def _result_payload(result: WindowDetectResult) -> dict[str, object]:
+    return {
+        "hwnd": result.hwnd,
+        "title": result.title,
+        "class_name": result.class_name,
+        "pid": result.pid,
+        "process_path": result.process_path,
+        "rect": [result.rect.left, result.rect.top, result.rect.right, result.rect.bottom],
+        "width": result.rect.width,
+        "height": result.rect.height,
+        "title_numbered": result.title_numbered,
+        "helper_keyword": result.helper_keyword,
+        "process_path_match": result.process_path_match,
+        "size_match": result.size_match,
+        "accepted": result.accepted,
+        "reason": result.reason,
+        "slot_no": result.slot_no,
+    }
+
+
+def _write_window_detection_diagnostics(
+    results: list[WindowDetectResult],
+    configured_game_exe_path: str | Path | None,
+    expected_window_size: tuple[int, int] | None,
+    log_path: str | Path | None = WINDOW_DETECTION_LOG_PATH,
+) -> None:
+    if not results or log_path is None:
+        return
+    path = Path(log_path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        accepted_count = sum(1 for result in results if result.accepted)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "event": "window_detection",
+                        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "configured_game_exe_path": str(configured_game_exe_path or ""),
+                        "expected_window_size": list(expected_window_size) if expected_window_size else None,
+                        "candidate_count": len(results),
+                        "accepted_count": accepted_count,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+            for result in results:
+                handle.write(json.dumps(_result_payload(result), ensure_ascii=False) + "\n")
+    except Exception:
+        return
+
+
+def detect_game_window(
+    hwnd: int,
+    title: str,
+    configured_game_exe_path: str | Path | None = None,
+    title_template: str | None = None,
+    allow_unnumbered: bool = False,
+    rect: WindowRect | None = None,
+    expected_window_size: tuple[int, int] | None = None,
+    class_name: str = "",
+    pid: Optional[int] = None,
+    process_path_getter: Callable[[int], str] = get_window_process_path,
+) -> WindowDetectResult:
+    clean_title = str(title or "").strip()
+    window_rect = rect or WindowRect(0, 0, 0, 0)
+    slot_no = extract_window_number(clean_title, title_template=title_template)
+    title_numbered = slot_no is not None
+    size_match = _window_size_matches(window_rect, expected_window_size)
+    process_path = ""
+    process_path_match = False
+
+    configured_path = _normalize_exe_path_for_compare(configured_game_exe_path)
+    if configured_path:
+        process_path = process_path_getter(int(hwnd))
+        actual_path = _normalize_exe_path_for_compare(process_path)
+        process_path_match = bool(actual_path and actual_path == configured_path)
+
+    def result(accepted: bool, reason: str, helper_keyword: str = "") -> WindowDetectResult:
+        return WindowDetectResult(
+            hwnd=int(hwnd),
+            title=clean_title,
+            slot_no=slot_no,
+            accepted=accepted,
+            reason=reason,
+            class_name=class_name,
+            pid=pid,
+            process_path=process_path,
+            rect=window_rect,
+            title_numbered=title_numbered,
+            helper_keyword=helper_keyword,
+            process_path_match=process_path_match,
+            size_match=size_match,
+        )
+
+    if not clean_title:
+        return result(False, "empty_title")
+
+    for keyword in EXCLUDED_GAME_WINDOW_TITLE_KEYWORDS:
+        if keyword in clean_title:
+            return result(False, "helper_keyword", helper_keyword=keyword)
+
+    if title_numbered:
+        if process_path_match:
+            return result(True, "process_match_numbered_title")
+        if configured_path and expected_window_size is not None:
+            if size_match:
+                return result(True, "process_mismatch_but_title_size_ok")
+            return result(False, "process_mismatch_size_mismatch")
+        if "-" in clean_title:
+            return result(True, "title_numbered_with_suffix")
+        return result(True, "title_numbered")
+
+    if allow_unnumbered and clean_title == _unnumbered_title_from_template(title_template):
+        if process_path_match:
+            return result(True, "process_match_unnumbered_exact")
+        if configured_path and expected_window_size is not None:
+            if size_match:
+                return result(True, "unnumbered_exact_size_ok")
+            return result(False, "unnumbered_exact_size_mismatch")
+        return result(True, "unnumbered_exact")
+
+    return result(False, "title_not_game_window")
 
 
 def is_game_window(
     hwnd: int,
     title: str,
     configured_game_exe_path: str | Path | None = None,
+    title_template: str | None = None,
     allow_unnumbered: bool = False,
+    rect: WindowRect | None = None,
+    expected_window_size: tuple[int, int] | None = None,
     process_path_getter: Callable[[int], str] = get_window_process_path,
 ) -> bool:
-    clean_title = str(title or "").strip()
-    if not clean_title:
-        return False
-    if any(keyword in clean_title for keyword in EXCLUDED_GAME_WINDOW_TITLE_KEYWORDS):
-        return False
-
-    configured_path = _normalize_exe_path_for_compare(configured_game_exe_path)
-    if configured_path:
-        actual_path = _normalize_exe_path_for_compare(process_path_getter(int(hwnd)))
-        if actual_path != configured_path:
-            return False
-
-    if extract_window_number(clean_title) is not None:
-        return True
-
-    return bool(allow_unnumbered and clean_title == GAME_TITLE_KEYWORD)
+    return detect_game_window(
+        hwnd,
+        title,
+        configured_game_exe_path=configured_game_exe_path,
+        title_template=title_template,
+        allow_unnumbered=allow_unnumbered,
+        rect=rect,
+        expected_window_size=expected_window_size,
+        process_path_getter=process_path_getter,
+    ).accepted
 
 
 def sort_game_windows(windows: List[GameWindow]) -> List[GameWindow]:
@@ -938,7 +1241,11 @@ def restore_windows_by_slots(
     if not slots:
         raise ValueError("未找到有效 window_slots.json 槽位映射")
 
-    windows = list_game_windows(exclude_hwnds=exclude_hwnds, game_exe_path=game_exe_path)
+    windows = list_game_windows(
+        title_template=title_template,
+        exclude_hwnds=exclude_hwnds,
+        game_exe_path=game_exe_path,
+    )
     windows_by_hwnd = {window.hwnd: window for window in windows}
     windows_by_title: dict[str, List[GameWindow]] = {}
     windows_by_number: dict[int, List[GameWindow]] = {}
@@ -946,6 +1253,34 @@ def restore_windows_by_slots(
         windows_by_title.setdefault(window.title, []).append(window)
         if window.number is not None:
             windows_by_number.setdefault(window.number, []).append(window)
+
+    if move_windows and windows:
+        probe = windows[0]
+        move_ok, move_error = _set_window_pos_with_retries(
+            probe,
+            probe.rect.left,
+            probe.rect.top,
+            probe.rect.width,
+            probe.rect.height,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+            retries=0,
+            retry_delay=0,
+        )
+        if not move_ok:
+            first_slot = slots[0]
+            return [
+                SlotRestoreResult(
+                    slot=first_slot,
+                    window=probe,
+                    success=False,
+                    x=first_slot.x,
+                    y=first_slot.y,
+                    width=first_slot.width,
+                    height=first_slot.height,
+                    new_title=_slot_title(title_template, first_slot),
+                    error=f"移动权限预检失败：{move_error}",
+                )
+            ]
 
     results: List[SlotRestoreResult] = []
     used_hwnds: set[int] = set()
@@ -978,27 +1313,18 @@ def restore_windows_by_slots(
         rename_ok = True
         errors: List[str] = []
         if move_windows:
-            move_ok = False
-            error_code = 0
-            for attempt in range(retries + 1):
-                move_ok = bool(
-                    user32.SetWindowPos(
-                        wintypes.HWND(window.hwnd),
-                        None,
-                        slot.x,
-                        slot.y,
-                        slot.width,
-                        slot.height,
-                        SWP_NOZORDER | SWP_NOACTIVATE,
-                    )
-                )
-                if move_ok:
-                    break
-                error_code = ctypes.get_last_error()
-                if attempt < retries:
-                    time.sleep(retry_delay)
+            move_ok, move_error = _set_window_pos_with_retries(
+                window,
+                slot.x,
+                slot.y,
+                slot.width,
+                slot.height,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+                retries,
+                retry_delay,
+            )
             if not move_ok:
-                errors.append(f"SetWindowPos 失败，错误码 {error_code}")
+                errors.append(move_error)
 
         new_title = _slot_title(title_template, slot)
         if rename_windows and new_title:
@@ -1030,11 +1356,16 @@ def save_current_windows_as_slots(
     slots_path: str | Path = "window_slots.json",
     exclude_hwnds: Optional[Iterable[int]] = None,
     game_exe_path: str | Path | None = None,
+    title_template: str | None = None,
     environment: Optional[SlotEnvironment] = None,
     layout_params: Optional[SlotLayoutParams] = None,
     expected_count: Optional[int] = None,
 ) -> List[WindowSlot]:
-    windows = list_game_windows(exclude_hwnds=exclude_hwnds, game_exe_path=game_exe_path)
+    windows = list_game_windows(
+        title_template=title_template,
+        exclude_hwnds=exclude_hwnds,
+        game_exe_path=game_exe_path,
+    )
     if expected_count is not None and len(windows) != int(expected_count):
         raise ValueError(
             f"当前窗口数量不完整：目标 {int(expected_count)}，当前 {len(windows)}。"
@@ -1079,12 +1410,17 @@ def refresh_window_slots_from_current_windows(
     slots_path: str | Path = "window_slots.json",
     exclude_hwnds: Optional[Iterable[int]] = None,
     game_exe_path: str | Path | None = None,
+    title_template: str | None = None,
     environment: Optional[SlotEnvironment] = None,
     layout_params: Optional[SlotLayoutParams] = None,
     expected_count: Optional[int] = None,
 ) -> List[WindowSlot]:
     """Save numbered visible game windows as slots without moving or renaming them."""
-    windows = list_game_windows(exclude_hwnds=exclude_hwnds, game_exe_path=game_exe_path)
+    windows = list_game_windows(
+        title_template=title_template,
+        exclude_hwnds=exclude_hwnds,
+        game_exe_path=game_exe_path,
+    )
     if expected_count is not None and len(windows) != int(expected_count):
         raise ValueError(
             f"当前窗口数量不完整：目标 {int(expected_count)}，当前 {len(windows)}。"
@@ -1198,7 +1534,11 @@ def resolve_window_slot_for_repair(
         if slot is not None:
             return slot, "legacy_slot_file", ""
 
-    for window in list_game_windows(exclude_hwnds=exclude_hwnds, game_exe_path=game_exe_path):
+    for window in list_game_windows(
+        title_template=title_template,
+        exclude_hwnds=exclude_hwnds,
+        game_exe_path=game_exe_path,
+    ):
         if window.number != slot_no:
             continue
         slot = WindowSlot(
@@ -1283,7 +1623,11 @@ def repair_window_slot(
 
     excluded = {int(hwnd) for hwnd in exclude_hwnds or []}
     filter_game_path = game_exe_path or game_path
-    before_windows = list_game_windows(exclude_hwnds=excluded, game_exe_path=filter_game_path)
+    before_windows = list_game_windows(
+        title_template=title_template,
+        exclude_hwnds=excluded,
+        game_exe_path=filter_game_path,
+    )
     for window in before_windows:
         if window.number != int(slot_no):
             continue
@@ -1329,7 +1673,11 @@ def repair_window_slot(
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         time.sleep(poll_interval)
-        windows = list_game_windows(exclude_hwnds=excluded, game_exe_path=filter_game_path)
+        windows = list_game_windows(
+            title_template=title_template,
+            exclude_hwnds=excluded,
+            game_exe_path=filter_game_path,
+        )
         candidates = [window for window in windows if window.hwnd not in before_hwnds]
         if candidates:
             candidates.sort(key=lambda item: (item.number is not None, item.title, item.hwnd))
@@ -1345,25 +1693,23 @@ def repair_window_slot(
             slot_source=slot_source,
         )
 
-    move_ok = bool(
-        user32.SetWindowPos(
-            wintypes.HWND(new_window.hwnd),
-            None,
-            slot.x,
-            slot.y,
-            slot.width,
-            slot.height,
-            SWP_NOZORDER | SWP_NOACTIVATE,
-        )
+    move_ok, move_error = _set_window_pos_with_retries(
+        new_window,
+        slot.x,
+        slot.y,
+        slot.width,
+        slot.height,
+        SWP_NOZORDER | SWP_NOACTIVATE,
+        retries=3,
+        retry_delay=0.5,
     )
     if not move_ok:
-        error_code = ctypes.get_last_error()
         return RepairSlotResult(
             slot=slot,
             success=False,
             old_hwnd=old_hwnd,
             new_hwnd=new_window.hwnd,
-            error=f"移动新窗口失败，错误码 {error_code}",
+            error=f"移动新窗口失败：{move_error}",
             slot_source=slot_source,
         )
 
@@ -1449,12 +1795,16 @@ def launch_game_process(game_path: str) -> LaunchResult:
 
 
 def list_game_windows(
-    title_keyword: str = GAME_TITLE_KEYWORD,
+    title_keyword: str = "",
+    title_template: str | None = None,
     exclude_hwnds: Optional[Iterable[int]] = None,
     game_exe_path: str | Path | None = None,
     allow_unnumbered: bool = True,
+    expected_window_size: tuple[int, int] | None = None,
+    diagnostic_log_path: str | Path | None = WINDOW_DETECTION_LOG_PATH,
 ) -> List[GameWindow]:
     windows: List[GameWindow] = []
+    detection_results: list[WindowDetectResult] = []
     excluded = {int(hwnd) for hwnd in exclude_hwnds or []}
 
     @EnumWindowsProc
@@ -1467,21 +1817,38 @@ def list_game_windows(
             return True
 
         title = _get_window_title(hwnd)
-        if is_game_window(
+        if not (_is_detection_candidate_title(title, title_template=title_template) or (title_keyword and title_keyword in title)):
+            return True
+        try:
+            rect = get_window_rect(int(hwnd))
+        except OSError:
+            rect = WindowRect(0, 0, 0, 0)
+        try:
+            class_name = get_window_class_name(int(hwnd))
+        except Exception:
+            class_name = ""
+        try:
+            pid = get_window_process_id(int(hwnd))
+        except Exception:
+            pid = None
+        detect_result = detect_game_window(
             int(hwnd),
             title,
             configured_game_exe_path=game_exe_path,
+            title_template=title_template,
             allow_unnumbered=allow_unnumbered,
-        ):
-            try:
-                rect = get_window_rect(int(hwnd))
-            except OSError:
-                rect = WindowRect(0, 0, 0, 0)
+            rect=rect,
+            expected_window_size=expected_window_size,
+            class_name=class_name,
+            pid=pid,
+        )
+        detection_results.append(detect_result)
+        if detect_result.accepted:
             windows.append(
                 GameWindow(
                     hwnd=int(hwnd),
                     title=title,
-                    number=extract_window_number(title),
+                    number=detect_result.slot_no,
                     rect=rect,
                 )
             )
@@ -1491,6 +1858,12 @@ def list_game_windows(
         error_code = ctypes.get_last_error()
         raise ctypes.WinError(error_code)
 
+    _write_window_detection_diagnostics(
+        detection_results,
+        configured_game_exe_path=game_exe_path,
+        expected_window_size=expected_window_size,
+        log_path=diagnostic_log_path,
+    )
     return sort_game_windows(windows)
 
 
@@ -1498,6 +1871,7 @@ def tile_game_windows(
     config: TileConfig,
     exclude_hwnds: Optional[Iterable[int]] = None,
     game_exe_path: str | Path | None = None,
+    title_template: str | None = None,
     retries: int = 3,
     retry_delay: float = 0.5,
 ) -> List[TileResult]:
@@ -1506,29 +1880,51 @@ def tile_game_windows(
     if config.width <= 0 or config.height <= 0:
         raise ValueError("窗口宽度和高度必须大于 0")
 
+    windows = list_game_windows(
+        title_template=title_template,
+        exclude_hwnds=exclude_hwnds,
+        game_exe_path=game_exe_path,
+        expected_window_size=(config.width, config.height),
+    )
     results: List[TileResult] = []
-    for index, window in enumerate(list_game_windows(exclude_hwnds=exclude_hwnds, game_exe_path=game_exe_path)):
+    if windows:
+        probe = windows[0]
+        ok, error = _set_window_pos_with_retries(
+            probe,
+            probe.rect.left,
+            probe.rect.top,
+            probe.rect.width,
+            probe.rect.height,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+            retries=0,
+            retry_delay=0,
+        )
+        if not ok:
+            return [
+                TileResult(
+                    window=probe,
+                    x=probe.rect.left,
+                    y=probe.rect.top,
+                    success=False,
+                    error=f"移动权限预检失败：{error}",
+                    width=probe.rect.width,
+                    height=probe.rect.height,
+                )
+            ]
+
+    for index, window in enumerate(windows):
         x, y = calculate_tile_position(index, config)
 
-        ok = False
-        error_code = 0
-        for attempt in range(retries + 1):
-            ok = bool(
-                user32.SetWindowPos(
-                    wintypes.HWND(window.hwnd),
-                    None,
-                    x,
-                    y,
-                    config.width,
-                    config.height,
-                    SWP_NOZORDER | SWP_NOACTIVATE,
-                )
-            )
-            if ok:
-                break
-            error_code = ctypes.get_last_error()
-            if attempt < retries:
-                time.sleep(retry_delay)
+        ok, error = _set_window_pos_with_retries(
+            window,
+            x,
+            y,
+            config.width,
+            config.height,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+            retries,
+            retry_delay,
+        )
 
         if ok:
             results.append(
@@ -1548,7 +1944,7 @@ def tile_game_windows(
                     x=x,
                     y=y,
                     success=False,
-                    error=f"SetWindowPos 失败，错误码 {error_code}",
+                    error=error,
                     width=config.width,
                     height=config.height,
                 )
@@ -1561,6 +1957,7 @@ def tile_game_windows_by_row_count(
     config: RowTileConfig,
     exclude_hwnds: Optional[Iterable[int]] = None,
     game_exe_path: str | Path | None = None,
+    title_template: str | None = None,
     windows: Optional[List[GameWindow]] = None,
     retries: int = 3,
     retry_delay: float = 0.5,
@@ -1573,10 +1970,41 @@ def tile_game_windows_by_row_count(
     arranged_windows = (
         list(windows)
         if windows is not None
-        else list_game_windows(exclude_hwnds=exclude_hwnds, game_exe_path=game_exe_path)
+        else list_game_windows(
+            title_template=title_template,
+            exclude_hwnds=exclude_hwnds,
+            game_exe_path=game_exe_path,
+            expected_window_size=(config.width, config.height)
+            if config.width is not None and config.height is not None
+            else None,
+        )
     )
     plan = calculate_row_tile_plan(len(arranged_windows), config)
     results: List[TileResult] = []
+    if arranged_windows:
+        probe = arranged_windows[0]
+        ok, error = _set_window_pos_with_retries(
+            probe,
+            probe.rect.left,
+            probe.rect.top,
+            probe.rect.width,
+            probe.rect.height,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+            retries=0,
+            retry_delay=0,
+        )
+        if not ok:
+            return [
+                TileResult(
+                    window=probe,
+                    x=probe.rect.left,
+                    y=probe.rect.top,
+                    success=False,
+                    error=f"移动权限预检失败：{error}",
+                    width=probe.rect.width,
+                    height=probe.rect.height,
+                )
+            ]
 
     for index, window in enumerate(arranged_windows):
         row = index // plan.cols
@@ -1586,32 +2014,23 @@ def tile_game_windows_by_row_count(
         wrapped_by_screen = col == 0 and row > 0
         flags = SWP_NOZORDER | SWP_NOACTIVATE
 
-        ok = False
-        error_code = 0
-        for attempt in range(retries + 1):
-            ok = bool(
-                user32.SetWindowPos(
-                    wintypes.HWND(window.hwnd),
-                    None,
-                    x,
-                    y,
-                    plan.target_width,
-                    plan.target_height,
-                    flags,
-                )
-            )
-            if ok:
-                break
-            error_code = ctypes.get_last_error()
-            if attempt < retries:
-                time.sleep(retry_delay)
+        ok, error = _set_window_pos_with_retries(
+            window,
+            x,
+            y,
+            plan.target_width,
+            plan.target_height,
+            flags,
+            retries,
+            retry_delay,
+        )
 
         result = TileResult(
             window=window,
             x=x,
             y=y,
             success=ok,
-            error="" if ok else f"SetWindowPos 失败，错误码 {error_code}",
+            error="" if ok else error,
             width=plan.target_width,
             height=plan.target_height,
             wrapped_by_screen=wrapped_by_screen,
@@ -1670,7 +2089,11 @@ def rename_game_windows(
 
     results: List[RenameResult] = []
     for index, window in enumerate(
-        list_game_windows(exclude_hwnds=exclude_hwnds, game_exe_path=game_exe_path),
+        list_game_windows(
+            title_template=title_template,
+            exclude_hwnds=exclude_hwnds,
+            game_exe_path=game_exe_path,
+        ),
         start=1,
     ):
         new_title = title_template.format(
@@ -1700,9 +2123,14 @@ def close_game_windows(
     timeout_ms: int = 1500,
     exclude_hwnds: Optional[Iterable[int]] = None,
     game_exe_path: str | Path | None = None,
+    title_template: str | None = None,
 ) -> List[CloseResult]:
     results: List[CloseResult] = []
-    for window in list_game_windows(exclude_hwnds=exclude_hwnds, game_exe_path=game_exe_path):
+    for window in list_game_windows(
+        title_template=title_template,
+        exclude_hwnds=exclude_hwnds,
+        game_exe_path=game_exe_path,
+    ):
         result = wintypes.DWORD()
         send_result = user32.SendMessageTimeoutW(
             wintypes.HWND(window.hwnd),

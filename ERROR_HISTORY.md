@@ -249,17 +249,56 @@
 
 桌面同时存在 31 个真实 `X5Game.exe` 游戏窗口和 1 个辅助软件窗口。辅助软件标题以 `斗罗大陆H5` 开头，例如 `斗罗大陆H5 电脑版全自动辅助...`。旧逻辑用 `title.startswith("斗罗大陆")`、`"斗罗大陆H5" in title` 等模糊标题规则识别窗口，导致辅助软件被算成第 32 个窗口，排列窗口时报 `目标 31，当前 32`。
 
+二次回归：真实窗口可能由辅助软件启动，标题后缀不固定，hwnd 进程路径也不一定等于配置的 `X5Game.exe`。如果把进程路径不匹配做成一票否决，或把标题规则写死为 `斗罗大陆H5-数字号`，真实 31 个窗口会被识别成 0。
+
+三次回归：窗口识别规则仍然写死 `斗罗大陆H5`，没有跟随 UI 标题模板；同时 `SetWindowPos` 错误码 5 只输出裸错误码，用户无法判断是权限不一致，且移动失败后仍可能继续写槽位。
+
 防回归规则：
 
 - 窗口管理、槽位保存、槽位刷新、重排、补位、关闭、批量启动前检测、串行运行前预检必须统一使用 `douluo_launcher.window_manager.is_game_window()` / `list_game_windows()`。
-- 配置了游戏程序路径时，必须读取 hwnd 所属进程 exe 路径，只有进程路径等于配置的 `X5Game.exe` 才能进入游戏窗口候选。
-- 编号窗口标题只允许严格匹配 `^斗罗大陆H5-(\d+)号$`。
-- 未编号窗口只允许在显式 `allow_unnumbered=True` 时识别精确标题 `斗罗大陆H5`。
-- 标题包含 `辅助`、`全自动辅助`、`任务开关`、`公共设置`、`日常设置`、`代理设置`、`上号器`、`工具` 时必须排除。
+- 标题包含辅助/工具/上号器等排除关键字时必须直接排除。
+- 配置了游戏程序路径时，必须读取 hwnd 所属进程 exe 路径；进程路径匹配配置的 `X5Game.exe` 是强确认条件，但进程路径不匹配不能一票否决。
+- 编号窗口标题必须从当前 UI 标题模板动态生成正则，模板中的 `{index}` / `{number}` 才是窗口编号位置，模板其它字符必须按普通文本转义，并允许 `-运行状态` 后缀。
+- 进程路径不匹配但标题符合编号规则、窗口尺寸接近当前配置时，仍应识别为游戏窗口候选。
+- 未编号窗口只允许在显式 `allow_unnumbered=True` 时识别由当前标题模板推导出的精确未编号标题。
 - 禁止回退到包含匹配、前缀匹配或从标题中任意提取数字。
+- 识别过程必须写入 `logs/window_detection_detail.log`，记录候选窗口的 hwnd/title/class_name/pid/process_path/rect/匹配项/最终原因。
+- `SetWindowPos` 错误码 5 必须明确提示 Windows 拒绝访问和权限不一致原因，并记录 hwnd/title/pid/process_path/管理员状态/当前 rect/目标位置/错误码文字。
+- 排列窗口或重新生成槽位时，如果任意窗口移动失败，必须停止后续保存，禁止写入槽位文件或覆盖 profile。
 
 测试：
 
 - `tests/test_window_manager.py::WindowManagerTests::test_is_game_window_uses_strict_title_and_excludes_helpers`
 - `tests/test_window_manager.py::WindowManagerTests::test_is_game_window_filters_by_configured_game_exe_path`
 - `tests/test_window_manager.py::WindowManagerTests::test_31_game_windows_plus_helper_counts_as_31`
+- `tests/test_window_manager.py::WindowManagerTests::test_31_scan_login_windows_plus_helper_counts_as_31_with_process_mismatch`
+- `tests/test_window_manager.py::WindowManagerTests::test_process_mismatch_does_not_reject_numbered_title_with_matching_size`
+- `tests/test_window_manager.py::WindowManagerTests::test_window_detection_diagnostics_include_reject_reason`
+- `tests/test_window_manager.py::WindowManagerTests::test_dynamic_title_template_controls_detection`
+- `tests/test_window_manager.py::WindowManagerTests::test_build_title_template_pattern_escapes_literal_text`
+- `tests/test_window_manager.py::WindowManagerTests::test_tile_game_windows_reports_access_denied_diagnostics`
+- `tests/test_window_slot_regression.py::WindowSlotRegressionTests::test_regenerate_slots_does_not_save_when_move_fails`
+
+## 13. 通行证按钮点击后弹窗未出现却继续输入
+
+历史问题：
+
+进入游戏页并关闭公告后，程序点击右侧“通行证”按钮，但“通行证登录”输入框没有弹出。旧的合并 Dm chain 快路径只按缓存坐标点击按钮、固定等待，然后直接点击输入框、输入通行证、点击确认，导致日志可能显示已输入/流程完成，而真实页面并没有打开通行证弹窗。
+
+防回归规则：
+
+- 点击通行证按钮后必须短轮询检测弹窗出现，不能靠固定 sleep 后继续输入。
+- 弹窗检测必须至少确认“通行证登录”弹窗、输入框或确认按钮出现。
+- 命中缓存按钮坐标时也不能直接信任；点击后若弹窗未出现，必须清空失效缓存、重新截图、重新模板匹配并重试一次。
+- 两次点击后弹窗仍未出现时，必须失败为“通行证弹窗未出现”，不能继续输入通行证，不能标记成功。
+- 点击坐标必须落在当前浏览器 viewport 内，超出范围时直接失败并保存现场。
+- 失败现场必须保存到 `debug_ocr/_error/latest_error.png`、`latest_error_context.json`、`latest_error.log`。
+- 已禁用旧的“点击按钮 + 固定等待 + 输入 + 确认”合并快路径；以后不得绕过弹窗校验重新启用。
+
+测试：
+
+- `tests/test_automation_helpers.py::AutomationHelperTests::test_passport_button_cache_success_waits_for_dialog_before_input`
+- `tests/test_automation_helpers.py::AutomationHelperTests::test_passport_button_cache_failure_clears_cache_and_retemplates`
+- `tests/test_automation_helpers.py::AutomationHelperTests::test_passport_button_two_failed_clicks_raise_without_input`
+- `tests/test_automation_helpers.py::AutomationHelperTests::test_fast_dm_chain_path_is_disabled_until_dialog_is_verified`
+- `tests/test_automation_helpers.py::AutomationHelperTests::test_passport_button_click_must_be_inside_viewport`

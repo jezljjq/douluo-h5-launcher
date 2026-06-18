@@ -49,11 +49,11 @@
 | 截图/日志清理 | ✅ 已实现 | _error/ 保留10张，logs/ 保留2份 | — |
 | 窗口管理区 | ✅ 已接入 | 批量启动、识别、按槽位恢复排列、关闭、重命名、单窗口补位、槽位完整性保护、参数记忆 | [docs/WINDOW_MANAGER_AND_PASSPORT_MILESTONE.md](docs/WINDOW_MANAGER_AND_PASSPORT_MILESTONE.md) |
 | 停止任务/关闭清理 | ✅ 已验证 | 停止时终止账号子进程、清理 dm_click_helper.py 和 Chromium | [CLICK_SOLUTION.md](CLICK_SOLUTION.md) |
-| 通行证弹窗坐标缓存 | ✅ 已验证 | `debug_ocr/passport_dialog_pos_cache.json` 按 viewport 缓存 button/input/confirm，跨账号/子进程复用 | [CLICK_SOLUTION.md](CLICK_SOLUTION.md) |
+| 通行证弹窗坐标缓存 | ✅ 已验证 | `debug_ocr/passport_dialog_pos_cache.json` 按 viewport 缓存 button/input/confirm；按钮点击后必须先校验弹窗出现，缓存失效会清空并重匹配 | [CLICK_SOLUTION.md](CLICK_SOLUTION.md) |
 | 批量快速登录 + 统一校验 | ✅ 已验证 | 当前层/全部串行先快速提交，统一校验后只重登失败账号；9 个单层账号最终 9/9 成功 | [docs/LAUNCHER_FINAL_MILESTONE.md](docs/LAUNCHER_FINAL_MILESTONE.md) |
 | 串行按钮范围与预检 | ✅ 源码验证 | 单账号/当前层/全部串行范围隔离；全部串行先生成 run_plan 并一次性校验窗口缺口 | [CURRENT_ISSUES.md](CURRENT_ISSUES.md) |
 | 配置区易用性 | ✅ 已实现 | 客户模式只暴露选择游戏图标/程序、自动查收藏夹、账号目录下拉；技术路径放入高级配置 | [REGRESSION_TESTS.md](REGRESSION_TESTS.md) |
-| 游戏窗口识别过滤 | ✅ 已修复 | 统一使用进程 exe 路径 + 严格标题模板过滤，辅助软件标题包含斗罗大陆H5 也不会计入游戏窗口 | [ERROR_HISTORY.md](ERROR_HISTORY.md), [REGRESSION_TESTS.md](REGRESSION_TESTS.md) |
+| 游戏窗口识别过滤 | ✅ 已修复 | 统一使用辅助关键字排除 + 编号标题后缀识别 + 进程路径强确认，辅助软件不会计入游戏窗口 | [ERROR_HISTORY.md](ERROR_HISTORY.md), [REGRESSION_TESTS.md](REGRESSION_TESTS.md) |
 | 源码 / exe 一致性 | ✅ 已验证 | exe 使用 `dist/Launcher/上号器.exe`，发布包内置 `ms-playwright` Chromium，不依赖目标电脑用户缓存 | [BUILD.md](BUILD.md) |
 | 防回归体系 | ✅ 已加固 | 历史事故台账 + 自动化测试映射 + 打包前硬检查；没有回归测试的修复不算完成 | [ERROR_HISTORY.md](ERROR_HISTORY.md), [REGRESSION_TESTS.md](REGRESSION_TESTS.md) |
 
@@ -163,14 +163,18 @@
 
 所有窗口管理入口必须统一使用 `douluo_launcher.window_manager.is_game_window()` / `list_game_windows()` 过滤窗口，禁止各处自行用标题包含判断。
 
-- 配置了游戏程序路径时，优先读取 hwnd 对应进程 exe 路径，并与配置中的真实 `X5Game.exe` 路径比对；进程路径不一致的窗口不能作为游戏窗口。
-- 已编号游戏窗口标题必须严格匹配 `^斗罗大陆H5-(\d+)号$`，例如 `斗罗大陆H5-1号`、`斗罗大陆H5-31号`。
-- 未编号窗口只允许在明确允许未编号场景下识别精确标题 `斗罗大陆H5`。
-- 辅助软件、上号器自身、工具窗口、任务开关等窗口即使标题包含 `斗罗大陆H5`，也必须排除。
+- 标题包含 `辅助`、`全自动辅助`、`任务开关`、`公共设置`、`日常设置`、`代理设置`、`上号器`、`工具` 时必须直接排除。
+- 配置了游戏程序路径时，优先读取 hwnd 对应进程 exe 路径，并与配置中的真实 `X5Game.exe` 路径比对；进程路径匹配是强确认条件，但进程路径不匹配不能一票否决。
+- 已编号游戏窗口标题必须从当前 UI 的“标题模板”动态生成识别正则；例如模板 `斗罗大陆H5-{index}号` 识别 `斗罗大陆H5-1号`、`斗罗大陆H5-1号-扫码登录`，模板 `DLH5-{index}` 识别 `DLH5-1`、`DLH5-1-扫码登录`。
+- 进程路径不匹配但标题符合编号规则、窗口尺寸接近当前窗口管理配置时，仍可作为真实游戏窗口候选。
+- 未编号窗口只允许在明确允许未编号场景下识别由当前标题模板推导出的精确未编号标题。
 - 禁止回退到 `title.startswith("斗罗大陆")`、`"斗罗大陆H5" in title` 或从标题任意位置提取数字。
+- 每次窗口识别会把候选窗口诊断写入 `logs/window_detection_detail.log`，包含 hwnd、title、class_name、pid、process_path、rect、标题命中、辅助关键字、进程路径匹配、accept/reject 和原因。
+- `SetWindowPos` 失败必须记录 hwnd/title/pid/process_path/管理员状态/当前 rect/目标位置/错误码文字；错误码 5 必须提示 Windows 拒绝访问和权限不一致原因。排列或重新生成槽位时只要任意移动失败，禁止写入槽位文件。
 - 修改窗口识别逻辑后必须运行 `tests/test_window_manager.py` 中的辅助软件误识别防回归测试，以及完整 `python -m unittest discover -s tests -v`。
 
 历史事故：桌面有 31 个真实游戏窗口和 1 个标题以 `斗罗大陆H5` 开头的辅助软件时，旧逻辑把辅助软件计入第 32 个窗口，导致排列窗口提示 `目标 31，当前 32`。当前防回归要求：同场景识别结果必须是 31，辅助软件不能被移动、重命名或写入槽位文件。
+二次回归：真实窗口标题格式必须跟随 UI 标题模板，不能在代码里写死 `斗罗大陆H5`；由辅助软件启动导致 hwnd 进程路径不等于配置的 `X5Game.exe` 时，也不能被过滤成 0。
 
 ### 2.1.1 窗口槽位机制
 
@@ -248,8 +252,8 @@
 - 通行证弹窗坐标文件缓存：`debug_ocr/passport_dialog_pos_cache.json`。
 - 缓存 key 使用浏览器真实 viewport，例如 `960x720`。
 - 缓存内容包含通行证按钮、输入框、确认按钮坐标和更新时间。
-- 命中缓存后使用合并 Dm chain：
-  `click 通行证按钮 → wait → click 输入框 → type 通行证 → click 确认`。
+- 命中缓存后只复用按钮/输入框/确认按钮坐标；必须先点击通行证按钮并轮询确认弹窗出现，确认输入框和确认按钮可定位后，才允许执行输入+确认。
+- 如果缓存按钮点击后弹窗未出现，程序会清空该 viewport 缓存、重新截图模板匹配并重试；仍失败则记录“通行证弹窗未出现”，不会继续输入。
 - 当前层串行 / 全部串行使用“快速提交 + 统一校验 + 失败重登”。
 - 单账号运行仍保留完整校验逻辑。
 - `重新次数` 用于限制统一校验和失败重登轮数；全部成功会提前结束。
@@ -266,7 +270,7 @@
 已验证结果：
 
 - 已读取通行证弹窗坐标缓存。
-- 已使用合并 Dm chain，合并 chain 耗时约 `2.4s`。
+- 已禁用旧的“点击按钮 + 固定等待 + 输入 + 确认”快路径；当前必须先验证通行证登录弹窗出现，再执行输入+确认。
 - 9 个单层账号批量快速登录 + 统一校验最终全部成功。
 - 最终结果：总 9，成功 9，失败 0。
 
@@ -292,8 +296,8 @@
 - 二维码页不能判成功。
 - `unknown` 不能判成功。
 - 批量快速登录 + 统一校验 + 失败重登已验证。
-- 文件级通行证弹窗坐标缓存已生效。
-- 合并 Dm chain 已生效。
+- 文件级通行证弹窗坐标缓存已生效，但缓存只作为定位辅助，不能绕过弹窗出现校验。
+- 旧合并 Dm chain 快路径已禁用，防止按钮未点开弹窗时继续输入。
 - 固定参数排列和行数列数排列已支持。
 - 单层账号和四层账号已隔离。
 - 停止任务和关闭程序清理子进程已修复。

@@ -500,25 +500,42 @@ class AccountRunner:
                 # 按钮坐标
                 cache_key = (self.settings.window_width, self.settings.window_height)
                 dialog_coord_cache = self._load_passport_dialog_coord_cache(viewport_key)
+                button_used_cache = False
+                button_source = "unknown"
+                button_match_score: float | None = None
                 if dialog_coord_cache:
                     btn_pos = dialog_coord_cache[0]
+                    button_used_cache = True
+                    button_source = "dialog_cache"
                     self.log(
                         f"[窗口{self.account.game_window_no}] 使用缓存通行证按钮坐标: "
                         f"viewport={viewport_label} button={btn_pos}"
                     )
                 elif AccountRunner._cached_window_size == cache_key and AccountRunner._cached_btn:
                     btn_pos = AccountRunner._cached_btn
+                    button_used_cache = True
+                    button_source = "memory_cache"
                     self.log(f"[窗口{self.account.game_window_no}] 使用缓存按钮坐标: {btn_pos}")
                 else:
                     _client = self._capture_browser_client(browser_hwnd, None)
-                    btn_pos = self._locate_passport_button(_client)
+                    btn_pos, button_match_score, button_source = self._locate_passport_button_with_details(_client)
                     if btn_pos:
-                        AccountRunner._cached_btn = btn_pos
-                        AccountRunner._cached_window_size = cache_key
-                        self.log(f"[窗口{self.account.game_window_no}] 模板匹配定位按钮: {btn_pos}（已缓存）")
+                        if button_source == "template":
+                            AccountRunner._cached_btn = btn_pos
+                            AccountRunner._cached_window_size = cache_key
+                            self.log(
+                                f"[窗口{self.account.game_window_no}] 模板匹配定位按钮: "
+                                f"{btn_pos} score={button_match_score:.3f}（已缓存）"
+                            )
+                        else:
+                            self.log(
+                                f"[窗口{self.account.game_window_no}] 使用通行证按钮回退坐标: "
+                                f"{btn_pos} source={button_source} score={button_match_score}"
+                            )
                     else:
                         self.log(f"[窗口{self.account.game_window_no}] 模板匹配失败，使用回退坐标")
                         btn_pos = self.settings.passport_btn_viewport
+                        button_source = "settings_fallback"
                 btn_vx, btn_vy = btn_pos
                 _t_locate_done = _time.perf_counter()
                 self.log(
@@ -530,50 +547,40 @@ class AccountRunner:
                     f"{_time.perf_counter() - _t_locate_done:.2f}s"
                 )
 
-                _t_input_done = None
-                if self._click_passport_button_input_confirm_fast(
-                    viewport_key,
-                    btn_vx,
-                    btn_vy,
-                    passport,
+                input_x, input_y, confirm_x, confirm_y = self._click_passport_button_with_retry(
+                    browser_hwnd,
+                    (btn_vx, btn_vy),
                     "方式一",
+                    viewport_key,
+                    button_used_cache,
+                    button_source,
+                    button_match_score,
+                )
+                _t_dialog_ready = _time.perf_counter()
+
+                self.update_status(self.account, "输入中")
+                self.log(f"[窗口{self.account.game_window_no}] 输入通行证并点击确认: {passport}")
+                self.log(
+                    f"[窗口{self.account.game_window_no}] [耗时] 检测到弹窗→发起输入="
+                    f"{_time.perf_counter() - _t_dialog_ready:.2f}s"
+                )
+
+                # 弹窗已确认出现后，再执行输入+确认。
+                _t_input_chain = _time.perf_counter()
+                if not self._dm_chain(
+                    [f"click,{input_x},{input_y},80",
+                     f"type,{passport}",
+                     f"click,{confirm_x},{confirm_y},100"],
+                    "输入+确认"
                 ):
-                    _t_input_done = _time.perf_counter()
-                    self.update_status(self.account, "已输入通行证")
-                    self.log(f"[窗口{self.account.game_window_no}] 输入+确认完成（合并DM chain 快路径）")
-                else:
-                    input_x, input_y, confirm_x, confirm_y = self._click_passport_button_and_wait_dialog(
-                        browser_hwnd,
-                        btn_vx,
-                        btn_vy,
-                        "方式一",
-                        viewport_key,
-                    )
-                    _t_dialog_ready = _time.perf_counter()
-
-                    self.update_status(self.account, "输入中")
-                    self.log(f"[窗口{self.account.game_window_no}] 输入通行证并点击确认: {passport}")
-                    self.log(
-                        f"[窗口{self.account.game_window_no}] [耗时] 检测到弹窗→发起输入="
-                        f"{_time.perf_counter() - _t_dialog_ready:.2f}s"
-                    )
-
-                    # 弹窗已确认出现后，再执行输入+确认。
-                    _t_input_chain = _time.perf_counter()
-                    if not self._dm_chain(
-                        [f"click,{input_x},{input_y},80",
-                         f"type,{passport}",
-                         f"click,{confirm_x},{confirm_y},100"],
-                        "输入+确认"
-                    ):
-                        raise RuntimeError("Dm 输入+确认失败")
-                    _t_input_done = _time.perf_counter()
-                    self.log(
-                        f"[窗口{self.account.game_window_no}] [耗时] 点击输入框+输入通行证+点击确认="
-                        f"{_t_input_done - _t_input_chain:.2f}s"
-                    )
-                    self.update_status(self.account, "已输入通行证")
-                    self.log(f"[窗口{self.account.game_window_no}] 输入+确认完成（Dm 合并调用）")
+                    raise RuntimeError("Dm 输入+确认失败")
+                _t_input_done = _time.perf_counter()
+                self.log(
+                    f"[窗口{self.account.game_window_no}] [耗时] 点击输入框+输入通行证+点击确认="
+                    f"{_t_input_done - _t_input_chain:.2f}s"
+                )
+                self.update_status(self.account, "已输入通行证")
+                self.log(f"[窗口{self.account.game_window_no}] 输入+确认完成（Dm 合并调用）")
                 self._ensure_not_stopped()
                 _timings["点击按钮"] = _time.perf_counter() - _t_btn
                 _timings["输入"] = 0
@@ -865,11 +872,17 @@ class AccountRunner:
                 if browser_hwnd is None:
                     raise RuntimeError("未找到浏览器窗口")
                 self._write_browser_pos(browser_hwnd)
+                viewport_key = self._get_browser_viewport_size(browser_hwnd)
 
                 cache_key = (self.settings.window_width, self.settings.window_height)
                 # 方式二通行证按钮位置不同，必须独立模板匹配
+                button_used_cache = False
+                button_source = "unknown"
+                button_match_score: float | None = None
                 if AccountRunner._cached_window_size == cache_key and AccountRunner._cached_btn_m2:
                     btn_pos = AccountRunner._cached_btn_m2
+                    button_used_cache = True
+                    button_source = "memory_cache_m2"
                     self.log(f"[方式二] 使用方式二缓存按钮坐标: {btn_pos}")
                 else:
                     _client = self._capture_browser_client(browser_hwnd, "m2_button_match.png")
@@ -882,20 +895,29 @@ class AccountRunner:
                         pass
                     if self._m2_notice_overlay_visible(_client):
                         raise RuntimeError("方式二公告仍未关闭，停止定位通行证按钮")
-                    btn_pos = self._locate_passport_button(_client, use_fallback=False)
+                    btn_pos, button_match_score, button_source = self._locate_passport_button_with_details(
+                        _client,
+                        use_fallback=False,
+                    )
                     if btn_pos:
                         AccountRunner._cached_btn_m2 = btn_pos
                         AccountRunner._cached_window_size = cache_key
-                        self.log(f"[方式二] 模板匹配定位按钮: {btn_pos}（已缓存到方式二）")
+                        self.log(
+                            f"[方式二] 模板匹配定位按钮: {btn_pos} "
+                            f"score={button_match_score:.3f}（已缓存到方式二）"
+                        )
                     else:
                         raise RuntimeError("方式二通行证按钮模板匹配失败，请检查模板文件")
                 btn_vx, btn_vy = btn_pos
 
-                input_x, input_y, confirm_x, confirm_y = self._click_passport_button_and_wait_dialog(
+                input_x, input_y, confirm_x, confirm_y = self._click_passport_button_with_retry(
                     browser_hwnd,
-                    btn_vx,
-                    btn_vy,
+                    (btn_vx, btn_vy),
                     "方式二",
+                    viewport_key,
+                    button_used_cache,
+                    button_source,
+                    button_match_score,
                 )
 
                 self.update_status(self.account, "输入中")
@@ -3261,6 +3283,94 @@ class AccountRunner:
             f"viewport={cache_label}"
         )
 
+    def _remove_passport_dialog_coord_cache(self, viewport_key: tuple[int, int]) -> None:
+        cache_label = self._viewport_cache_key(viewport_key)
+        AccountRunner._dialog_coord_cache.pop(viewport_key, None)
+        path = self._passport_dialog_cache_path()
+        if not path.exists():
+            return
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict) or cache_label not in raw:
+                return
+            raw.pop(cache_label, None)
+            path.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
+            self.log(
+                f"[窗口{self.account.game_window_no}] 已清理失效通行证弹窗坐标缓存："
+                f"viewport={cache_label}"
+            )
+        except Exception as exc:
+            self.log(
+                f"[窗口{self.account.game_window_no}] 清理通行证弹窗坐标缓存失败：{exc}"
+            )
+
+    def _clear_passport_button_cache(
+        self,
+        viewport_key: tuple[int, int] | None,
+        label: str,
+    ) -> None:
+        if label == "方式二":
+            AccountRunner._cached_btn_m2 = None
+        else:
+            AccountRunner._cached_btn = None
+            if viewport_key is not None:
+                self._remove_passport_dialog_coord_cache(viewport_key)
+        AccountRunner._cached_input = None
+        AccountRunner._cached_confirm = None
+        AccountRunner._cached_dialog_window_size = None
+
+    def _read_browser_render_origin(self) -> tuple[int, int] | None:
+        pos_file = app_root() / "debug_ocr/browser_pos.json"
+        if not pos_file.exists():
+            return None
+        try:
+            raw = json.loads(pos_file.read_text(encoding="utf-8"))
+            return int(raw["cx"]), int(raw["cy"])
+        except Exception:
+            return None
+
+    @staticmethod
+    def _viewport_point_in_bounds(point: tuple[int, int], viewport_key: tuple[int, int]) -> bool:
+        x, y = point
+        width, height = viewport_key
+        return 0 <= int(x) < int(width) and 0 <= int(y) < int(height)
+
+    def _screen_point_from_viewport(self, point: tuple[int, int]) -> tuple[int, int] | None:
+        origin = self._read_browser_render_origin()
+        if origin is None:
+            return None
+        return origin[0] + int(point[0]), origin[1] + int(point[1])
+
+    def _save_passport_click_failure_context(
+        self,
+        browser_hwnd: int,
+        context: dict,
+        image=None,
+    ) -> None:
+        error_dir = self._debug_dir / "_error"
+        error_dir.mkdir(parents=True, exist_ok=True)
+        context = dict(context)
+        context.setdefault("timestamp", datetime.now().isoformat(timespec="seconds"))
+        context.setdefault("window_no", self.account.game_window_no)
+        context.setdefault("hwnd", browser_hwnd)
+        try:
+            if image is not None:
+                image.save(error_dir / "latest_error.png")
+            else:
+                captured = self._capture_browser_client(browser_hwnd, None)
+                captured.save(error_dir / "latest_error.png")
+        except Exception as exc:
+            context["screenshot_error"] = str(exc)
+
+        context_path = error_dir / "latest_error_context.json"
+        context_path.write_text(json.dumps(context, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+        log_lines = [f"{key}: {value}" for key, value in context.items()]
+        (error_dir / "latest_error.log").write_text("\n".join(log_lines), encoding="utf-8")
+        self.log(
+            f"[窗口{self.account.game_window_no}] 通行证点击失败现场已保存: "
+            f"{error_dir / 'latest_error.png'}"
+        )
+
     def _click_passport_button_and_wait_dialog(
         self,
         browser_hwnd: int,
@@ -3268,16 +3378,35 @@ class AccountRunner:
         btn_vy: int,
         label: str,
         viewport_key: tuple[int, int] | None = None,
+        wait_timeout_s: float = 5.0,
+        save_failure: bool = True,
+        click_context: dict | None = None,
     ) -> tuple[int, int, int, int]:
         if viewport_key is None:
             viewport_key = self._get_browser_viewport_size(browser_hwnd)
         viewport_label = f"{viewport_key[0]}x{viewport_key[1]}"
         t_start = time.perf_counter()
+        button_point = (int(btn_vx), int(btn_vy))
+        if click_context is not None:
+            click_context.setdefault("attempts", [])
+            click_context["viewport_size"] = viewport_key
+            click_context["render_origin"] = self._read_browser_render_origin()
+            click_context["button_viewport"] = button_point
+            click_context["button_screen"] = self._screen_point_from_viewport(button_point)
+        if not self._viewport_point_in_bounds(button_point, viewport_key):
+            if click_context is not None:
+                click_context["dialog_detected"] = False
+                click_context["reject_reason"] = "button_outside_viewport"
+                self._save_passport_click_failure_context(browser_hwnd, click_context)
+            raise RuntimeError("通行证按钮坐标超出当前窗口客户区")
         self.log(
             f"[窗口{self.account.game_window_no}] 点击通行证按钮并等待弹窗: "
             f"{label} button=({btn_vx},{btn_vy})"
         )
         if not self._dm_click_viewport(btn_vx, btn_vy, "通行证按钮", 120):
+            if click_context is not None:
+                click_context["dialog_detected"] = False
+                click_context["reject_reason"] = "dm_click_failed"
             raise RuntimeError("Dm 点击通行证按钮失败")
         t_click_done = time.perf_counter()
         self.log(
@@ -3285,15 +3414,17 @@ class AccountRunner:
             f"{t_click_done - t_start:.2f}s"
         )
 
-        deadline = time.perf_counter() + 5.0
+        deadline = time.perf_counter() + wait_timeout_s
         last_input = None
         last_confirm = None
+        last_image = None
         attempt = 0
         while time.perf_counter() < deadline:
             self._ensure_not_stopped()
             time.sleep(0.05)
             attempt += 1
             image = self._capture_browser_client(browser_hwnd, None)
+            last_image = image
             dialog_visible = self._is_passport_dialog_visible_by_ocr(image)
             if not dialog_visible:
                 self.log(
@@ -3351,16 +3482,146 @@ class AccountRunner:
                 f"[窗口{self.account.game_window_no}] [耗时] 弹窗出现→控件定位完成="
                 f"{t_controls_done - t_dialog_seen:.2f}s"
             )
+            if click_context is not None:
+                click_context["dialog_detected"] = True
+                click_context["input_center"] = input_center
+                click_context["confirm_center"] = confirm_center
             return input_center[0], input_center[1], confirm_center[0], confirm_center[1]
 
-        try:
-            self._capture_browser_client(browser_hwnd, f"passport_dialog_wait_failed_{label}.png")
-        except Exception:
-            pass
+        if click_context is not None:
+            click_context["dialog_detected"] = False
+            click_context["last_input"] = last_input
+            click_context["last_confirm"] = last_confirm
+        if save_failure:
+            try:
+                last_image = self._capture_browser_client(browser_hwnd, f"passport_dialog_wait_failed_{label}.png")
+            except Exception:
+                pass
+            if click_context is not None:
+                self._save_passport_click_failure_context(browser_hwnd, click_context, last_image)
         raise RuntimeError(
-            "点击通行证按钮后弹窗未出现或定位失败，"
+            "通行证弹窗未出现，"
             f"input={last_input} confirm={last_confirm}"
         )
+
+    def _click_passport_button_with_retry(
+        self,
+        browser_hwnd: int,
+        btn_pos: tuple[int, int],
+        label: str,
+        viewport_key: tuple[int, int] | None = None,
+        used_cache: bool = False,
+        cache_source: str = "unknown",
+        template_score: float | None = None,
+        first_wait_timeout_s: float = 1.2,
+        retry_wait_timeout_s: float = 1.5,
+    ) -> tuple[int, int, int, int]:
+        if viewport_key is None:
+            viewport_key = self._get_browser_viewport_size(browser_hwnd)
+        context: dict = {
+            "window_no": self.account.game_window_no,
+            "hwnd": browser_hwnd,
+            "viewport_size": viewport_key,
+            "render_origin": self._read_browser_render_origin(),
+            "used_cache": used_cache,
+            "cache_source": cache_source,
+            "cache_button_viewport": btn_pos if used_cache else None,
+            "template_score": template_score,
+            "attempts": [],
+            "dialog_detected": False,
+        }
+
+        if not self._viewport_point_in_bounds(btn_pos, viewport_key):
+            context["reject_reason"] = "button_outside_viewport"
+            self._save_passport_click_failure_context(browser_hwnd, context)
+            raise RuntimeError("通行证按钮坐标超出当前窗口客户区")
+
+        attempts: list[tuple[tuple[int, int], str, float | None, float]] = [
+            (btn_pos, cache_source, template_score, first_wait_timeout_s)
+        ]
+        last_error: Exception | None = None
+        last_image = None
+
+        for index, (point, source, score, timeout_s) in enumerate(attempts):
+            attempt_context = {
+                "index": index + 1,
+                "source": source,
+                "button_viewport": point,
+                "button_screen": self._screen_point_from_viewport(point),
+                "template_score": score,
+            }
+            context["attempts"].append(attempt_context)
+            self.log(
+                f"[窗口{self.account.game_window_no}] 尝试点击通行证按钮（第{index + 1}次）: "
+                f"source={source} viewport={point} screen={attempt_context['button_screen']} score={score}"
+            )
+            try:
+                controls = self._click_passport_button_and_wait_dialog(
+                    browser_hwnd,
+                    int(point[0]),
+                    int(point[1]),
+                    label,
+                    viewport_key,
+                    wait_timeout_s=timeout_s,
+                    save_failure=False,
+                    click_context=context,
+                )
+                context["dialog_detected"] = True
+                context["success_attempt"] = index + 1
+                self.log(
+                    f"[窗口{self.account.game_window_no}] 通行证弹窗已出现（第{index + 1}次点击成功）"
+                )
+                return controls
+            except RuntimeError as exc:
+                last_error = exc
+                attempt_context["error"] = str(exc)
+                if index == 0:
+                    self.log(
+                        f"[窗口{self.account.game_window_no}] 通行证弹窗未出现，"
+                        "判定当前按钮坐标失效，准备重新截图模板匹配"
+                    )
+                    if used_cache:
+                        self._clear_passport_button_cache(viewport_key, label)
+                    try:
+                        last_image = self._capture_browser_client(
+                            browser_hwnd,
+                            f"passport_button_retry_match_{label}.png",
+                        )
+                        match_pos, match_score, match_source = self._locate_passport_button_with_details(
+                            last_image,
+                            use_fallback=False,
+                        )
+                    except Exception as match_exc:
+                        context["retry_match_error"] = str(match_exc)
+                        match_pos = None
+                        match_score = None
+                        match_source = "match_error"
+                    if match_pos is None:
+                        context["retry_match_pos"] = None
+                        context["retry_match_score"] = match_score
+                        context["retry_match_source"] = match_source
+                        context["reject_reason"] = "passport_button_rematch_failed"
+                        break
+                    context["retry_match_pos"] = match_pos
+                    context["retry_match_score"] = match_score
+                    context["retry_match_source"] = match_source
+                    if label == "方式二":
+                        AccountRunner._cached_btn_m2 = match_pos
+                    else:
+                        AccountRunner._cached_btn = match_pos
+                    AccountRunner._cached_window_size = (
+                        self.settings.window_width,
+                        self.settings.window_height,
+                    )
+                    attempts.append((match_pos, match_source, match_score, retry_wait_timeout_s))
+                continue
+
+        context["dialog_detected"] = False
+        context.setdefault("reject_reason", "passport_dialog_not_shown")
+        if last_error is not None:
+            context["last_error"] = str(last_error)
+        self._save_passport_click_failure_context(browser_hwnd, context, last_image)
+        raise RuntimeError("通行证弹窗未出现")
 
     def _click_passport_button_input_confirm_fast(
         self,
@@ -3371,61 +3632,13 @@ class AccountRunner:
         label: str,
         wait_ms: int = 450,
     ) -> bool:
-        """Use one Dm helper process when dialog control coordinates are known."""
         viewport_label = f"{viewport_key[0]}x{viewport_key[1]}"
-        cached_coords = self._load_passport_dialog_coord_cache(viewport_key)
-        if cached_coords is None:
-            self.log(
-                f"[窗口{self.account.game_window_no}] 未使用合并DM chain："
-                f"viewport={viewport_label} 暂无同尺寸弹窗坐标缓存，走视觉检测安全路径"
-            )
-            return False
-
-        cached_button, cached_input, cached_confirm = cached_coords
-        btn_vx, btn_vy = cached_button
-        input_x, input_y = cached_input
-        confirm_x, confirm_y = cached_confirm
+        _ = (btn_vx, btn_vy, passport, label, wait_ms)
         self.log(
-            f"[窗口{self.account.game_window_no}] 使用合并DM chain："
-            f"viewport={viewport_label} button=({btn_vx},{btn_vy}) "
-            f"input=({input_x},{input_y}) confirm=({confirm_x},{confirm_y}) "
-            f"wait={wait_ms}ms label={label}"
+            f"[窗口{self.account.game_window_no}] 已禁用合并DM chain快路径："
+            f"viewport={viewport_label} 必须先检测通行证弹窗出现后再输入"
         )
-        self.log(f"[窗口{self.account.game_window_no}] 输入通行证并点击确认: {passport}")
-        chain_start = time.perf_counter()
-        if not self._dm_chain(
-            [
-                f"click,{btn_vx},{btn_vy},120",
-                f"wait,{wait_ms}",
-                f"click,{input_x},{input_y},80",
-                f"type,{passport}",
-                f"click,{confirm_x},{confirm_y},100",
-            ],
-            "合并点击按钮+输入+确认",
-        ):
-            raise RuntimeError("Dm 合并点击按钮+输入+确认失败")
-        chain_done = time.perf_counter()
-        self.log(
-            f"[窗口{self.account.game_window_no}] [耗时] 合并DM chain总耗时="
-            f"{chain_done - chain_start:.2f}s"
-        )
-        self.log(
-            f"[窗口{self.account.game_window_no}] [耗时] 发起点击→点击通行证按钮完成="
-            "合并chain内执行"
-        )
-        self.log(
-            f"[窗口{self.account.game_window_no}] [耗时] 点击按钮到弹窗出现="
-            f"{wait_ms / 1000:.2f}s（合并chain固定等待）"
-        )
-        self.log(
-            f"[窗口{self.account.game_window_no}] [耗时] 检测到弹窗→发起输入="
-            "合并chain内执行"
-        )
-        self.log(
-            f"[窗口{self.account.game_window_no}] [耗时] 点击输入框+输入通行证+点击确认="
-            f"{chain_done - chain_start:.2f}s（包含按钮点击与等待）"
-        )
-        return True
+        return False
 
     def _dm_click_viewport(self, vx: int, vy: int, label: str, hold_ms: int = 120) -> bool:
         import subprocess
@@ -3864,19 +4077,23 @@ class AccountRunner:
         dark_ratio = float(dark_page.mean())
         return bright_ratio > 0.16 and orange_ratio > 0.006 and dark_ratio > 0.30
 
-    def _locate_passport_button(self, screenshot, use_fallback: bool = True) -> tuple[int, int] | None:
-        """模板匹配定位通行证按钮，返回 viewport 中心坐标 (vx, vy) 或 None"""
+    def _locate_passport_button_with_details(
+        self,
+        screenshot,
+        use_fallback: bool = True,
+    ) -> tuple[tuple[int, int] | None, float | None, str]:
+        """模板匹配定位通行证按钮，返回 (坐标, 得分, 来源)。"""
         template_path = app_root() / self.settings.passport_btn_template
         if not template_path.exists():
             self.log(f"[窗口{self.account.game_window_no}] 通行证按钮模板不存在: {template_path}")
-            return None
+            return None, None, "template_missing"
         import cv2
         import numpy as np
         screen_arr = cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR)
         template = cv2.imdecode(np.fromfile(str(template_path), dtype=np.uint8), cv2.IMREAD_COLOR)
         if template is None:
             self.log(f"[窗口{self.account.game_window_no}] 无法读取模板: {template_path}")
-            return None
+            return None, None, "template_unreadable"
         result = cv2.matchTemplate(screen_arr, template, cv2.TM_CCOEFF_NORMED)
         _, max_val, _, max_loc = cv2.minMaxLoc(result)
         th, tw = template.shape[:2]
@@ -3890,15 +4107,23 @@ class AccountRunner:
                 self.log(f"[窗口{self.account.game_window_no}] 回退已知坐标")
                 known = self.settings.passport_btn_viewport
                 if known and known[0] > 0:
-                    return (known[0], known[1])
-                return None
+                    return (known[0], known[1]), float(max_val), "fallback"
+                return None, float(max_val), "low_score"
             self.log(f"[窗口{self.account.game_window_no}] 不使用低分匹配结果，避免缓存错误坐标")
-            return None
+            return None, float(max_val), "low_score"
         self.log(
             f"[窗口{self.account.game_window_no}] 模板匹配成功: "
             f"({center_x},{center_y}) score={max_val:.3f}"
         )
-        return (center_x, center_y)
+        return (center_x, center_y), float(max_val), "template"
+
+    def _locate_passport_button(self, screenshot, use_fallback: bool = True) -> tuple[int, int] | None:
+        """模板匹配定位通行证按钮，返回 viewport 中心坐标 (vx, vy) 或 None"""
+        point, _score, _source = self._locate_passport_button_with_details(
+            screenshot,
+            use_fallback=use_fallback,
+        )
+        return point
 
     def _click_passport_button_dm(self, vx: int, vy: int) -> bool:
         """通过 Dm 子进程在 viewport (vx, vy) 处后台点击"""

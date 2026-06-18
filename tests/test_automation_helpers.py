@@ -19,6 +19,16 @@ from douluo_launcher.config import AccountConfig, AutomationSettings
 
 
 class AutomationHelperTests(unittest.TestCase):
+    def _make_runner(self) -> AccountRunner:
+        account = AccountConfig(level="单层账号", bookmark_no=1, game_window_no=1, url="https://example.com")
+        return AccountRunner(
+            account,
+            AutomationSettings(),
+            threading.Event(),
+            log=lambda _msg: None,
+            update_status=lambda _account, _status: None,
+        )
+
     def test_extracts_passport_from_visible_text(self) -> None:
         text = "扫码登录\n本次通行证：8598a293\n请使用手机扫码"
 
@@ -167,6 +177,122 @@ class AutomationHelperTests(unittest.TestCase):
         self.assertEqual(state, "logged_in")
         self.assertTrue(metrics["game_ui_detected"])
         self.assertEqual(metrics["final_reason"], "检测到游戏界面特征且无 strong_qr")
+
+    def test_passport_button_cache_success_waits_for_dialog_before_input(self) -> None:
+        runner = self._make_runner()
+        clicked: list[tuple[int, int]] = []
+        runner._get_browser_viewport_size = lambda _hwnd: (960, 720)  # type: ignore[method-assign]
+        runner._capture_browser_client = lambda _hwnd, _name=None: Image.new("RGB", (960, 720))  # type: ignore[method-assign]
+        runner._is_passport_dialog_visible_by_ocr = lambda _image: True  # type: ignore[method-assign]
+        runner._locate_passport_input_center = lambda _image, log_result=False: (300, 330)  # type: ignore[method-assign]
+        runner._locate_confirm_button_center = lambda _image, log_result=False: (520, 520)  # type: ignore[method-assign]
+        runner._dm_click_viewport = lambda x, y, _label, _hold=120: clicked.append((x, y)) or True  # type: ignore[method-assign]
+        runner._dm_chain = lambda _steps, _label="": self.fail("弹窗出现前不应调用输入+确认")  # type: ignore[method-assign]
+        runner._save_passport_dialog_coord_cache = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+
+        controls = runner._click_passport_button_with_retry(
+            browser_hwnd=100,
+            btn_pos=(680, 300),
+            label="方式一",
+            viewport_key=(960, 720),
+            used_cache=True,
+            cache_source="dialog_cache",
+            first_wait_timeout_s=0.05,
+            retry_wait_timeout_s=0.05,
+        )
+
+        self.assertEqual(controls, (300, 330, 520, 520))
+        self.assertEqual(clicked, [(680, 300)])
+
+    def test_passport_button_cache_failure_clears_cache_and_retemplates(self) -> None:
+        runner = self._make_runner()
+        AccountRunner._cached_btn = (680, 300)
+        AccountRunner._cached_window_size = (runner.settings.window_width, runner.settings.window_height)
+        AccountRunner._dialog_coord_cache[(960, 720)] = ((680, 300), (301, 331), (521, 521))
+        clicked: list[tuple[int, int]] = []
+        visible = iter([False, True])
+        runner._get_browser_viewport_size = lambda _hwnd: (960, 720)  # type: ignore[method-assign]
+        runner._capture_browser_client = lambda _hwnd, _name=None: Image.new("RGB", (960, 720))  # type: ignore[method-assign]
+        runner._is_passport_dialog_visible_by_ocr = lambda _image: next(visible)  # type: ignore[method-assign]
+        runner._locate_passport_input_center = lambda _image, log_result=False: (310, 340)  # type: ignore[method-assign]
+        runner._locate_confirm_button_center = lambda _image, log_result=False: (530, 540)  # type: ignore[method-assign]
+        runner._dm_click_viewport = lambda x, y, _label, _hold=120: clicked.append((x, y)) or True  # type: ignore[method-assign]
+        runner._locate_passport_button_with_details = lambda _image, use_fallback=False: ((700, 360), 0.91, "template")  # type: ignore[method-assign]
+        runner._save_passport_dialog_coord_cache = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+
+        controls = runner._click_passport_button_with_retry(
+            browser_hwnd=100,
+            btn_pos=(680, 300),
+            label="方式一",
+            viewport_key=(960, 720),
+            used_cache=True,
+            cache_source="dialog_cache",
+            first_wait_timeout_s=0.05,
+            retry_wait_timeout_s=0.05,
+        )
+
+        self.assertEqual(controls, (310, 340, 530, 540))
+        self.assertEqual(clicked, [(680, 300), (700, 360)])
+        self.assertEqual(AccountRunner._dialog_coord_cache[(960, 720)][0], (700, 360))
+        self.assertEqual(AccountRunner._cached_btn, (700, 360))
+
+    def test_passport_button_two_failed_clicks_raise_without_input(self) -> None:
+        runner = self._make_runner()
+        saved_contexts: list[dict] = []
+        runner._get_browser_viewport_size = lambda _hwnd: (960, 720)  # type: ignore[method-assign]
+        runner._capture_browser_client = lambda _hwnd, _name=None: Image.new("RGB", (960, 720))  # type: ignore[method-assign]
+        runner._is_passport_dialog_visible_by_ocr = lambda _image: False  # type: ignore[method-assign]
+        runner._dm_click_viewport = lambda _x, _y, _label, _hold=120: True  # type: ignore[method-assign]
+        runner._locate_passport_button_with_details = lambda _image, use_fallback=False: ((700, 360), 0.88, "template")  # type: ignore[method-assign]
+        runner._save_passport_click_failure_context = lambda _hwnd, context, _image=None: saved_contexts.append(context)  # type: ignore[method-assign]
+        runner._dm_chain = lambda _steps, _label="": self.fail("弹窗未出现时不能调用输入+确认")  # type: ignore[method-assign]
+
+        with self.assertRaisesRegex(RuntimeError, "通行证弹窗未出现"):
+            runner._click_passport_button_with_retry(
+                browser_hwnd=100,
+                btn_pos=(680, 300),
+                label="方式一",
+                viewport_key=(960, 720),
+                used_cache=True,
+                cache_source="dialog_cache",
+                first_wait_timeout_s=0.05,
+                retry_wait_timeout_s=0.05,
+            )
+
+        self.assertTrue(saved_contexts)
+        self.assertFalse(saved_contexts[-1]["dialog_detected"])
+
+    def test_fast_dm_chain_path_is_disabled_until_dialog_is_verified(self) -> None:
+        runner = self._make_runner()
+        runner._dm_chain = lambda _steps, _label="": self.fail("禁用快路径不能调用输入+确认 chain")  # type: ignore[method-assign]
+
+        result = runner._click_passport_button_input_confirm_fast(
+            (960, 720),
+            680,
+            300,
+            "8598a293",
+            "方式一",
+        )
+
+        self.assertFalse(result)
+
+    def test_passport_button_click_must_be_inside_viewport(self) -> None:
+        runner = self._make_runner()
+        saved_contexts: list[dict] = []
+        runner._get_browser_viewport_size = lambda _hwnd: (960, 720)  # type: ignore[method-assign]
+        runner._save_passport_click_failure_context = lambda _hwnd, context, _image=None: saved_contexts.append(context)  # type: ignore[method-assign]
+
+        with self.assertRaisesRegex(RuntimeError, "通行证按钮坐标超出当前窗口客户区"):
+            runner._click_passport_button_with_retry(
+                browser_hwnd=100,
+                btn_pos=(1200, 300),
+                label="方式一",
+                viewport_key=(960, 720),
+                used_cache=False,
+                cache_source="template",
+            )
+
+        self.assertEqual(saved_contexts[-1]["reject_reason"], "button_outside_viewport")
 
 
 if __name__ == "__main__":

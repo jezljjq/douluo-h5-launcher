@@ -17,6 +17,8 @@ from douluo_launcher.window_manager import (  # noqa: E402
     calculate_slot_from_tile_config,
     calculate_tile_position,
     check_window_slots_compatibility,
+    build_title_template_pattern,
+    detect_game_window,
     extract_window_number,
     layout_params_from_tile_config,
     load_window_slot_metadata,
@@ -26,6 +28,8 @@ from douluo_launcher.window_manager import (  # noqa: E402
     save_current_windows_as_slots,
     is_game_window,
     sort_game_windows,
+    tile_game_windows,
+    _write_window_detection_diagnostics,
     window_slots_profile_path,
 )
 
@@ -33,19 +37,48 @@ from douluo_launcher.window_manager import (  # noqa: E402
 class WindowManagerTests(unittest.TestCase):
     def test_extract_window_number(self) -> None:
         self.assertEqual(extract_window_number("斗罗大陆H5-1号"), 1)
+        self.assertEqual(extract_window_number("斗罗大陆H5-1号-扫码登录"), 1)
+        self.assertEqual(extract_window_number("斗罗大陆H5-1-伊号科技", "斗罗大陆H5-{index}"), 1)
         self.assertEqual(extract_window_number("斗罗大陆H5-31号"), 31)
+        self.assertEqual(extract_window_number("斗罗大陆H5-31号-扫码登录"), 31)
+        self.assertEqual(extract_window_number("斗罗大陆H5-31-伊号科技", "斗罗大陆H5-{index}"), 31)
         self.assertIsNone(extract_window_number("斗罗大陆H5-1号甲战区"))
         self.assertIsNone(extract_window_number("斗罗大陆H5_8号"))
         self.assertIsNone(extract_window_number("斗罗大陆H5"))
 
+    def test_build_title_template_pattern_escapes_literal_text(self) -> None:
+        pattern = build_title_template_pattern("DLH5.{index}")
+
+        self.assertEqual(pattern.fullmatch("DLH5.1").group("index"), "1")
+        self.assertEqual(pattern.fullmatch("DLH5.1-扫码登录").group("index"), "1")
+        self.assertIsNone(pattern.fullmatch("DLH5x1"))
+
+    def test_dynamic_title_template_controls_detection(self) -> None:
+        self.assertTrue(is_game_window(1, "DLH5-1", title_template="DLH5-{index}"))
+        self.assertTrue(is_game_window(2, "DLH5-1-扫码登录", title_template="DLH5-{index}"))
+        self.assertFalse(is_game_window(3, "斗罗大陆H5-1号", title_template="DLH5-{index}"))
+        self.assertTrue(is_game_window(4, "游戏窗口1", title_template="游戏窗口{index}"))
+        self.assertTrue(is_game_window(5, "游戏窗口1-扫码登录", title_template="游戏窗口{index}"))
+        self.assertFalse(is_game_window(6, "斗罗大陆H5 电脑版全自动辅助", title_template="斗罗大陆H5-{index}号"))
+
     def test_is_game_window_uses_strict_title_and_excludes_helpers(self) -> None:
-        self.assertTrue(is_game_window(1, "斗罗大陆H5-1号"))
-        self.assertTrue(is_game_window(2, "斗罗大陆H5-31号"))
-        self.assertFalse(is_game_window(3, "斗罗大陆H5 电脑版全自动辅助"))
-        self.assertFalse(is_game_window(4, "斗罗大陆H5 辅助工具"))
-        self.assertFalse(is_game_window(5, "上号器 —— 前台串行模式"))
-        self.assertFalse(is_game_window(6, "斗罗大陆H5"))
-        self.assertTrue(is_game_window(7, "斗罗大陆H5", allow_unnumbered=True))
+        template = "斗罗大陆H5-{index}号"
+        self.assertTrue(is_game_window(1, "斗罗大陆H5-1号", title_template=template))
+        self.assertTrue(is_game_window(8, "斗罗大陆H5-1号-扫码登录", title_template=template))
+        self.assertTrue(is_game_window(9, "斗罗大陆H5-31号-扫码登录", title_template=template))
+        self.assertTrue(is_game_window(2, "斗罗大陆H5-31号", title_template=template))
+        self.assertFalse(is_game_window(3, "斗罗大陆H5 电脑版全自动辅助", title_template=template))
+        self.assertFalse(is_game_window(4, "斗罗大陆H5 辅助工具", title_template=template))
+        self.assertFalse(is_game_window(5, "上号器 —— 前台串行模式", title_template=template))
+        self.assertFalse(is_game_window(6, "斗罗大陆H5", title_template=template))
+        self.assertTrue(
+            is_game_window(
+                7,
+                "斗罗大陆H5",
+                allow_unnumbered=True,
+                title_template=template,
+            )
+        )
 
     def test_is_game_window_filters_by_configured_game_exe_path(self) -> None:
         configured = r"E:\Program Files\DLH5\X5Game.exe"
@@ -83,6 +116,34 @@ class WindowManagerTests(unittest.TestCase):
 
         self.assertEqual(accepted, [1, 2, 31])
 
+    def test_process_mismatch_does_not_reject_numbered_title_with_matching_size(self) -> None:
+        configured = r"E:\Program Files\DLH5\X5Game.exe"
+
+        self.assertTrue(
+            is_game_window(
+                1,
+                "斗罗大陆H5-1-伊号科技",
+                title_template="斗罗大陆H5-{index}",
+                configured_game_exe_path=configured,
+                rect=WindowRect(250, 0, 570, 540),
+                expected_window_size=(320, 540),
+                process_path_getter=lambda _hwnd: r"E:\Tools\launcher-opened-window.exe",
+            )
+        )
+
+    def test_process_match_strongly_confirms_numbered_title_with_suffix(self) -> None:
+        configured = r"E:\Program Files\DLH5\X5Game.exe"
+
+        self.assertTrue(
+            is_game_window(
+                1,
+                "斗罗大陆H5-1-伊号科技",
+                title_template="斗罗大陆H5-{index}",
+                configured_game_exe_path=configured,
+                process_path_getter=lambda _hwnd: configured,
+            )
+        )
+
     def test_31_game_windows_plus_helper_counts_as_31(self) -> None:
         configured = r"E:\Program Files\DLH5\X5Game.exe"
         process_paths = {index: configured for index in range(1, 32)}
@@ -98,6 +159,88 @@ class WindowManagerTests(unittest.TestCase):
                 hwnd,
                 title,
                 configured_game_exe_path=configured,
+                process_path_getter=lambda value: process_paths[value],
+            )
+        )
+
+        self.assertEqual(count, 31)
+
+    def test_window_detection_diagnostics_include_reject_reason(self) -> None:
+        result = detect_game_window(
+            99,
+            "斗罗大陆H5 电脑版全自动辅助",
+            class_name="HelperWindow",
+            pid=1234,
+            rect=WindowRect(0, 0, 800, 600),
+            process_path_getter=lambda _hwnd: r"E:\Tools\helper.exe",
+        )
+
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.reason, "helper_keyword")
+        self.assertEqual(result.helper_keyword, "全自动辅助")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "window_detection_detail.log"
+            _write_window_detection_diagnostics(
+                [result],
+                configured_game_exe_path=r"E:\Program Files\DLH5\X5Game.exe",
+                expected_window_size=(320, 540),
+                log_path=log_path,
+            )
+
+            content = log_path.read_text(encoding="utf-8")
+
+        self.assertIn('"event": "window_detection"', content)
+        self.assertIn('"title": "斗罗大陆H5 电脑版全自动辅助"', content)
+        self.assertIn('"accepted": false', content)
+        self.assertIn('"reason": "helper_keyword"', content)
+
+    def test_tile_game_windows_reports_access_denied_diagnostics(self) -> None:
+        windows = [
+            GameWindow(
+                hwnd=200,
+                title="斗罗大陆H5-1号-扫码登录",
+                number=1,
+                rect=WindowRect(10, 20, 330, 560),
+            )
+        ]
+
+        with (
+            mock.patch("douluo_launcher.window_manager.list_game_windows", return_value=windows),
+            mock.patch("douluo_launcher.window_manager.user32.SetWindowPos", return_value=False),
+            mock.patch("douluo_launcher.window_manager.ctypes.get_last_error", return_value=5),
+            mock.patch("douluo_launcher.window_manager.get_window_process_id", return_value=1234),
+            mock.patch("douluo_launcher.window_manager.get_window_process_path", return_value=r"E:\Tools\helper-opened.exe"),
+            mock.patch("douluo_launcher.window_manager.is_current_process_admin", return_value=False),
+        ):
+            results = tile_game_windows(TileConfig(width=320, height=540, start_x=250, start_y=0, offset_x=320, offset_y=525))
+
+        self.assertEqual(len(results), 1)
+        self.assertFalse(results[0].success)
+        self.assertIn("Windows 拒绝访问", results[0].error)
+        self.assertIn("hwnd=200", results[0].error)
+        self.assertIn("pid=1234", results[0].error)
+        self.assertIn("上号器管理员=False", results[0].error)
+        self.assertIn("目标x=10", results[0].error)
+
+    def test_31_scan_login_windows_plus_helper_counts_as_31_with_process_mismatch(self) -> None:
+        configured = r"E:\Program Files\DLH5\X5Game.exe"
+        process_paths = {index: r"E:\Tools\launcher-opened-window.exe" for index in range(1, 32)}
+        process_paths[99] = r"E:\Tools\斗罗大陆H5辅助.exe"
+
+        titles = [(index, f"斗罗大陆H5-{index}-伊号科技") for index in range(1, 32)]
+        titles.append((99, "斗罗大陆H5 电脑版全自动辅助"))
+
+        count = sum(
+            1
+            for hwnd, title in titles
+            if is_game_window(
+                hwnd,
+                title,
+                title_template="斗罗大陆H5-{index}",
+                configured_game_exe_path=configured,
+                rect=WindowRect(250, 0, 570, 540),
+                expected_window_size=(320, 540),
                 process_path_getter=lambda value: process_paths[value],
             )
         )
