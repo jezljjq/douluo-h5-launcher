@@ -695,7 +695,7 @@ def _normalize_account_group_settings(value: object) -> dict[str, dict[str, bool
 
 def filter_accounts(accounts: Iterable[AccountConfig], level: str) -> list[AccountConfig]:
     if level == "全部":
-        return list(accounts)
+        return [account for account in accounts if account.include_in_all]
     return [account for account in accounts if account.level == level]
 
 

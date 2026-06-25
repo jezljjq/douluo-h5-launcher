@@ -105,10 +105,17 @@
 
 用户在“存钻”层级点击全部串行，以为运行当前层，但程序去跑所有启用分组，最后找窗口 10。
 
+后续回归：
+
+`层级=全部` 时账号列表显示了所有已读取账号，包含 `include_in_all=false` 的分组，导致 UI 展示范围与 `全部串行` 实际范围可能不一致。
+
 防回归规则：
 
 - 当前层串行：只运行当前层级。
-- 全部串行：运行全部串行分组设置中启用的分组。
+- 当前层级为“全部”时，账号列表只显示 `include_in_all=true` 的分组账号。
+- 当前层级为“全部”时点击当前层串行，只运行当前列表里的账号。
+- 全部串行：运行全部串行分组设置中启用的分组，数据来源必须与“层级=全部”的账号列表一致。
+- 未勾选分组在“全部”列表中不显示，但切换到具体分组后仍可当前层串行或单账号运行。
 - 当前层级不是“全部”时点击全部串行，必须提示语义差异。
 - 运行前必须生成 run_plan 并提前检查缺少窗口。
 - 不能跑到一半才报窗口 10 不存在。
@@ -118,6 +125,10 @@
 - `tests/test_window_slot_regression.py::WindowSlotRegressionTests::test_all_serial_plan_reports_missing_windows_before_any_run`
 - `tests/test_gui_group_settings.py::GuiGroupSettingsTests::test_current_group_plan_for_cunduan_uses_windows_1_to_9_only`
 - `tests/test_gui_group_settings.py::GuiGroupSettingsTests::test_all_serial_plan_reports_all_missing_windows_before_running`
+- `tests/test_gui_group_settings.py::GuiGroupSettingsTests::test_all_level_ui_scope_only_contains_include_in_all_accounts`
+- `tests/test_gui_group_settings.py::GuiGroupSettingsTests::test_current_level_serial_with_all_runs_filtered_all_scope`
+- `tests/test_gui_group_settings.py::GuiGroupSettingsTests::test_current_level_serial_specific_unchecked_group_still_runs`
+- `tests/test_config.py::ConfigTests::test_filter_accounts_all_excludes_unchecked_groups_but_specific_level_does_not`
 
 ## 7. 表格列错位问题
 

@@ -24,13 +24,16 @@ python -m unittest discover -s tests -v
 |------|------|
 | `tests/test_window_slot_regression.py` | 历史窗口槽位、串行语义、表格列、动态分组事故的显式防回归测试 |
 | `tests/test_window_manager.py` | 窗口槽位底层数据结构、profile、兼容性、保存与修复逻辑、严格窗口识别过滤 |
-| `tests/test_gui_group_settings.py` | 全部串行 / 当前层串行 run_plan、分组设置、表格列顺序、客户模式显示文案、收藏候选/账号目录绑定、游戏路径拖拽处理 |
+| `tests/test_gui_group_settings.py` | 全部串行 / 当前层串行 run_plan、分组设置、表格列顺序、客户模式显示文案、收藏候选/账号目录绑定、游戏路径拖拽处理、后台串行接入、GUI 日志区布局 |
 | `tests/test_config.py` | 收藏夹读取、动态分组、窗口号映射、配置合并 |
 | `tests/test_bookmark_discovery.py` | Edge/Chrome Bookmarks 自动扫描、账号目录候选、直接链接和 root path 兼容 |
 | `tests/test_path_utils.py` | 游戏路径 exe/lnk/目录解析、drop 路径解析 |
 | `tests/test_main_startup.py` | GUI 启动权限策略，防止自动管理员提权破坏资源管理器拖拽 |
 | `tests/test_automation_helpers.py` | 通行证识别、Playwright 路径、Dm helper、登录状态判断 |
 | `tests/test_dm_client.py` | Dm 坐标和窗口标题匹配 |
+| `tests/test_background_capability.py` | 后台能力检测报告，防止把前台辅助模式误写成真后台 |
+| `tests/test_background_login.py` | 后台方式一单账号、后台通行证 OCR-only 提取、禁用复制/读取/剪贴板链路、成功窗口保留 |
+| `tests/test_window_operator.py` | WindowOperator 抽象、后台消息点击/输入约束、黑屏保护占位接口、probe JSON 结构 |
 
 ## 历史问题到测试映射
 
@@ -42,6 +45,7 @@ python -m unittest discover -s tests -v
 | 9 窗口 / 31 窗口 profile 混用问题 | `test_profile_9_row_count_cannot_restore_31_fixed_layout` |
 | 批量启动重复开窗口问题 | `test_batch_launch_is_blocked_when_target_windows_already_exist` |
 | 全部串行 / 当前层串行语义问题 | `test_all_serial_plan_reports_missing_windows_before_any_run` |
+| 层级=全部账号列表过滤错误 | `test_all_level_ui_scope_only_contains_include_in_all_accounts`, `test_current_level_serial_with_all_runs_filtered_all_scope`, `test_current_level_serial_specific_unchecked_group_still_runs`, `test_filter_accounts_all_excludes_unchecked_groups_but_specific_level_does_not` |
 | 表格列错位问题 | `test_table_values_stay_aligned_with_declared_columns` |
 | 收藏夹动态分组问题 | `test_bookmark_custom_group_order_and_include_in_all_are_independent` |
 | 配置区路径和收藏夹写死问题 | `test_lnk_resolves_to_target_exe`, `test_invalid_file_uses_customer_friendly_message`, `test_scans_edge_default_profile1_and_chrome_default`, `test_root_name_not_account_is_detected_and_loadable`, `test_bookmark_file_candidate_label_hides_raw_path`, `test_game_program_status_uses_customer_text` |
@@ -49,6 +53,11 @@ python -m unittest discover -s tests -v
 | 游戏路径拖拽闪退和管理员权限阻断问题 | `test_raw_native_game_path_drag_drop_is_disabled_to_avoid_tk_crash`, `test_game_program_hint_reflects_tkinterdnd2_drag_support`, `test_game_path_drop_uses_first_dropped_path_and_drop_source`, `test_drop_invalid_file_uses_drag_wording`, `test_gui_startup_does_not_auto_elevate_so_file_drop_works`, `test_apply_game_path_input_saves_resolved_exe_not_lnk`, `test_game_program_input_and_status_share_same_saved_path` |
 | 辅助软件标题误识别为游戏窗口 / 编号后缀被误过滤 / 标题模板写死 / SetWindowPos 裸错误码 | `test_build_title_template_pattern_escapes_literal_text`, `test_dynamic_title_template_controls_detection`, `test_is_game_window_uses_strict_title_and_excludes_helpers`, `test_is_game_window_filters_by_configured_game_exe_path`, `test_process_mismatch_does_not_reject_numbered_title_with_matching_size`, `test_31_game_windows_plus_helper_counts_as_31`, `test_31_scan_login_windows_plus_helper_counts_as_31_with_process_mismatch`, `test_window_detection_diagnostics_include_reject_reason`, `test_tile_game_windows_reports_access_denied_diagnostics`, `test_regenerate_slots_does_not_save_when_move_fails` |
 | 通行证按钮点击后弹窗未出现却继续输入 | `test_passport_button_cache_success_waits_for_dialog_before_input`, `test_passport_button_cache_failure_clears_cache_and_retemplates`, `test_passport_button_two_failed_clicks_raise_without_input`, `test_fast_dm_chain_path_is_disabled_until_dialog_is_verified`, `test_passport_button_click_must_be_inside_viewport` |
+| 后台能力误标为真后台 | `test_report_contains_all_required_fields`, `test_global_mouse_click_marks_mouse_as_taken`, `test_set_foreground_window_marks_not_true_background`, `test_unverified_background_capabilities_are_not_supported` |
+| 后台登录实验模式误用全局输入 | `test_background_operator_does_not_use_foreground_or_global_mouse`, `test_background_operator_input_uses_window_messages_not_global_keyboard`, `test_background_run_mode_falls_back_explicitly_for_single_account_until_verified` |
+| 后台通行证复制/读取链路误恢复 | `test_background_passport_extraction_disables_copy_read_chain`, `test_background_passport_extraction_source_does_not_call_copy_read_helpers`, `test_background_ocr_failure_raises_clear_error`, `test_login_window_extraction_keeps_copy_before_ocr` |
+| 后台串行误并发或失败即中断 | `test_background_serial_worker_calls_single_runner_in_table_order_and_continues_after_failure`, `test_background_serial_worker_marks_remaining_accounts_stopped`, `test_background_serial_source_does_not_use_foreground_or_global_input` |
+| GUI 日志区被表格压缩 | `test_main_window_dimensions_are_explicit_layout_constants`, `test_log_panel_keeps_minimum_height_and_visible_lines`, `test_log_directory_button_stays_in_log_header_right_side`, `test_log_append_scrolls_to_bottom` |
 
 ## 新 bug 修复流程
 

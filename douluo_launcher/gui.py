@@ -18,6 +18,8 @@ except Exception:
     TkinterDnD = None
 
 from .automation import AccountRunner
+from .background_capability import build_background_capability_report, write_background_capability_report
+from .background_login import BackgroundSingleAccountRunner, check_background_runtime_dependencies
 from .config import (
     AccountConfig,
     BookmarkCandidate,
@@ -84,6 +86,32 @@ WM_POLL_INTERVAL_SECONDS = 0.5
 WM_FINAL_DELAY_SECONDS = 1
 WM_TILE_MODE_FIXED = "固定参数排列"
 WM_TILE_MODE_ROW_COUNT = "根据行数排列"
+RUN_MODE_FOREGROUND_LABEL = "前台辅助模式"
+RUN_MODE_BACKGROUND_LABEL = "后台登录模式（实验）"
+BACKGROUND_SERIAL_CONCURRENCY = 1
+RUN_MODE_BACKGROUND_HINT = "实验功能，支持方式一单账号/当前层串行/全部串行，并发=1"
+GUI_DEFAULT_WIDTH = 1160
+GUI_DEFAULT_HEIGHT = 820
+GUI_MIN_WIDTH = 1080
+GUI_MIN_HEIGHT = 760
+LOG_TEXT_VISIBLE_LINES = 8
+LOG_PANEL_MIN_HEIGHT = 170
+
+
+def _run_mode_key_from_label(label: str) -> str:
+    if str(label or "").strip() == RUN_MODE_BACKGROUND_LABEL:
+        return "background"
+    return "foreground"
+
+
+def _run_mode_key_for_owner(owner) -> str:
+    var = getattr(owner, "run_mode_var", None)
+    if var is None:
+        return "foreground"
+    try:
+        return _run_mode_key_from_label(var.get())
+    except Exception:
+        return "foreground"
 
 
 def _safe_wm_expected_window_size(owner) -> tuple[int, int] | None:
@@ -325,13 +353,13 @@ class LauncherApp(_TK_BASE):
     def __init__(self) -> None:
         super().__init__()
         self.title(f"上号器 — 前台串行模式 v{APP_VERSION}")
-        w, h = 1160, 820
+        w, h = GUI_DEFAULT_WIDTH, GUI_DEFAULT_HEIGHT
         ws = self.winfo_screenwidth()
         hs = self.winfo_screenheight()
         x = (ws - w) // 2
         y = (hs - h) // 2
         self.geometry(f"{w}x{h}+{x}+{y}")
-        self.minsize(1080, 760)
+        self.minsize(GUI_MIN_WIDTH, GUI_MIN_HEIGHT)
 
         self.accounts: list[AccountConfig] = []
         self.status_by_key: dict[str, str] = {}
@@ -347,6 +375,7 @@ class LauncherApp(_TK_BASE):
         self.wm_action_thread: threading.Thread | None = None
         self.running_processes: list[object] = []
         self.running_processes_lock = threading.Lock()
+        self._preserve_background_windows = False
         self.is_closing = False
 
         self.settings_path = tk.StringVar(value=str(app_root() / "automation_settings.json"))
@@ -368,6 +397,8 @@ class LauncherApp(_TK_BASE):
         self.notice_outside_x_var = tk.DoubleVar(value=0.08)
         self.notice_outside_y_var = tk.DoubleVar(value=0.08)
         self.method_var = tk.StringVar(value="method1")
+        self.run_mode_var = tk.StringVar(value=RUN_MODE_FOREGROUND_LABEL)
+        self.run_mode_hint_var = tk.StringVar(value="")
         self.csv_path = tk.StringVar(value="")
         self.level_count_vars = {level: tk.IntVar(value=8) for level in LEVELS}
         self.wm_game_path_var = tk.StringVar(value="")
@@ -406,6 +437,7 @@ class LauncherApp(_TK_BASE):
         self._load_default_config_if_present()
         self._log_admin_status_warning()
         self._log_startup_dm_environment()
+        self._log_background_capability_summary()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(300, self._enable_game_path_drag_drop)
 
@@ -819,7 +851,16 @@ class LauncherApp(_TK_BASE):
         self.account_box.pack(side=tk.LEFT, padx=(0, 16))
 
         ttk.Label(select_row, text="模式").pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Label(select_row, text="前台串行", relief="sunken", width=10, anchor="center", padding=2).pack(side=tk.LEFT, padx=(0, 16))
+        self.run_mode_box = ttk.Combobox(
+            select_row,
+            textvariable=self.run_mode_var,
+            values=(RUN_MODE_FOREGROUND_LABEL, RUN_MODE_BACKGROUND_LABEL),
+            width=18,
+            state="readonly",
+        )
+        self.run_mode_box.pack(side=tk.LEFT, padx=(0, 6))
+        self.run_mode_box.bind("<<ComboboxSelected>>", lambda _: self._on_run_mode_changed())
+        ttk.Label(select_row, textvariable=self.run_mode_hint_var, foreground="#996600").pack(side=tk.LEFT, padx=(0, 16))
 
         ttk.Label(select_row, text="并发").pack(side=tk.LEFT, padx=(0, 4))
         ttk.Label(select_row, text="1", relief="sunken", width=4, anchor="center", padding=2).pack(side=tk.LEFT)
@@ -892,19 +933,21 @@ class LauncherApp(_TK_BASE):
 
         # ===== 5. 日志 =====
         self._log_outer = ttk.LabelFrame(root, text="日志", padding=2)
+        self._log_outer.configure(height=LOG_PANEL_MIN_HEIGHT)
+        self._log_outer.pack_propagate(False)
         self._log_outer.pack(fill=tk.X, pady=(0, 4))
         log_header = ttk.Frame(self._log_outer)
         log_header.pack(fill=tk.X, pady=(0, 2))
         ttk.Button(log_header, text="打开日志目录", command=self._open_log_dir).pack(side=tk.RIGHT, padx=2)
 
-        self.log_text = tk.Text(self._log_outer, height=6, wrap=tk.WORD, font=("Consolas", 9))
+        self.log_text = tk.Text(self._log_outer, height=LOG_TEXT_VISIBLE_LINES, wrap=tk.WORD, font=("Consolas", 9))
         self.log_text.pack(fill=tk.BOTH, expand=True)
 
         # ===== 6. 底部状态栏 =====
         status_frame = ttk.Frame(root, relief="sunken", padding=(8, 3))
         status_frame.pack(fill=tk.X, side=tk.BOTTOM)
         self._status_left = tk.StringVar(value="就绪")
-        self._status_mid = tk.StringVar(value="当前模式：前台串行")
+        self._status_mid = tk.StringVar(value=f"当前模式：{RUN_MODE_FOREGROUND_LABEL}")
         self._status_right = tk.StringVar(value="并发：1")
         ttk.Label(status_frame, textvariable=self._status_left).pack(side=tk.LEFT)
         ttk.Label(status_frame, textvariable=self._status_mid).pack(side=tk.LEFT, padx=(40, 0))
@@ -937,6 +980,29 @@ class LauncherApp(_TK_BASE):
         else:
             self._method1_advanced_frame.grid_remove()
             self._method1_advanced_toggle_btn.configure(text="显示高级配置")
+
+    def _on_run_mode_changed(self) -> None:
+        if self._is_background_run_mode():
+            self.run_mode_hint_var.set(RUN_MODE_BACKGROUND_HINT)
+            self._status_mid.set(f"当前模式：{RUN_MODE_BACKGROUND_LABEL}")
+            self._log(f"已选择{RUN_MODE_BACKGROUND_LABEL}：{RUN_MODE_BACKGROUND_HINT}。")
+        else:
+            self.run_mode_hint_var.set("")
+            self._status_mid.set(f"当前模式：{RUN_MODE_FOREGROUND_LABEL}")
+            self._log(f"已选择{RUN_MODE_FOREGROUND_LABEL}。")
+
+    def _is_background_run_mode(self) -> bool:
+        return _run_mode_key_for_owner(self) == "background"
+
+    def _block_background_unsupported_action(self, action_name: str) -> bool:
+        if not self._is_background_run_mode():
+            return False
+        if action_name in ("单账号运行", "当前层串行", "全部串行"):
+            return False
+        message = "后台模式当前支持方式一单账号、当前层串行、全部串行；方式二未接入"
+        self._log(f"阻止{action_name}：{message}")
+        messagebox.showwarning("后台模式限制", message)
+        return True
 
     def _set_game_program_path(self, path: str) -> None:
         entry_value, status_text = _game_program_display_values(path)
@@ -2957,7 +3023,7 @@ Write-Output $count
         mode_accounts = self._mode_allowed_accounts()
         level = self.level_var.get()
         if level == "全部":
-            return mode_accounts
+            return [account for account in mode_accounts if account.include_in_all]
         return [account for account in mode_accounts if account.level == level]
 
     def _on_level_changed(self) -> None:
@@ -2968,7 +3034,12 @@ Write-Output $count
             f"层级={self.level_var.get()}，当前账号列表 {len(self._filtered_accounts_for_ui())} 个。"
         )
         if self.level_var.get() == "全部":
-            self._log("层级=全部：显示所有账号；全部串行只执行已勾选分组。")
+            filtered = self._filtered_accounts_for_ui()
+            if filtered:
+                self._log("层级=全部：只显示并运行已勾选参与全部串行的账号。")
+            else:
+                self._log("层级=全部：当前没有勾选参与全部串行的账号。")
+                self._status_left.set("当前没有勾选参与全部串行的账号")
 
     def _refresh_mode_account_scope(self, log_change: bool = False) -> None:
         allowed_levels = self._allowed_level_values()
@@ -3240,6 +3311,8 @@ Write-Output $count
 
     def _run_selected_account(self) -> None:
         if self.method_var.get() == "method2":
+            if self._block_background_unsupported_action("方式二"):
+                return
             self._run_method2_single()
             return
         account = self._selected_account()
@@ -3258,34 +3331,55 @@ Write-Output $count
             f"单账号运行: {account.display_name}。"
             f"OCR → 打开游戏页 → 关闭公告 → 通行证 → 输入 → 确认。"
         )
+        if _run_mode_key_from_label(self.run_mode_var.get()) == "background":
+            self._log(
+                f"{RUN_MODE_BACKGROUND_LABEL}：启动方式一单账号实验流程。"
+            )
+            self._start_background_single_run(account)
+            return
         self._start_serial_run([account], batch_fast=False)
 
     def _run_level_serial(self) -> None:
         if self.method_var.get() == "method2":
+            if self._block_background_unsupported_action("方式二"):
+                return
             messagebox.showinfo("提示", "方式二没有层级概念，请使用\"单账号运行\"或\"全部串行\"。")
             return
+        background_mode = _run_mode_key_for_owner(self) == "background"
         level = self.level_var.get()
-        if level == "全部":
-            messagebox.showwarning("请选择层级", "当前层串行需要选择一个具体层级。")
-            return
         accounts = self._filtered_accounts_for_ui()
         if not accounts:
-            messagebox.showwarning("无账号", f"当前层 {level} 没有账号。")
+            if level == "全部":
+                message = "当前没有勾选参与全部串行的账号。"
+            else:
+                message = f"当前层 {level} 没有账号。"
+            self._log(f"阻止当前层串行：{message}")
+            messagebox.showwarning("无账号", message)
             return
-        self._log(f"当前层串行范围确认：只运行当前层级【{level}】，不读取全部串行勾选状态。")
+        if level == "全部":
+            self._log("当前层串行范围确认：层级=全部，运行当前列表中已勾选参与全部串行的账号。")
+        else:
+            self._log(f"当前层串行范围确认：只运行当前层级【{level}】，不读取全部串行勾选状态。")
         if not self._precheck_serial_run(accounts, "当前层串行"):
             return
         if not self._validate_accounts_for_current_mode(accounts):
+            return
+        if background_mode:
+            self._log(f"后台当前层串行: {level}，共 {len(accounts)} 个账号，并发={BACKGROUND_SERIAL_CONCURRENCY}，逐个调用后台单账号流程。")
+            self._start_background_serial_run(accounts, run_label="后台当前层串行")
             return
         self._log(f"当前层串行: {level}，共 {len(accounts)} 个账号，批量快速登录 + 统一校验。")
         self._start_serial_run(accounts, batch_fast=True)
 
     def _run_all_serial(self) -> None:
         if self.method_var.get() == "method2":
+            if self._block_background_unsupported_action("方式二"):
+                return
             self._run_method2_all()
             return
+        background_mode = _run_mode_key_for_owner(self) == "background"
         selected_level = self.level_var.get()
-        if selected_level != "全部":
+        if not background_mode and selected_level != "全部":
             message = (
                 f"当前层级是【{selected_level}】。\n"
                 "“全部串行”将运行所有已启用分组，不是只运行当前层级。\n"
@@ -3302,7 +3396,10 @@ Write-Output $count
         if not all_accounts:
             messagebox.showwarning("无账号", "请先读取收藏夹。")
             return
-        accounts, skipped_accounts = _split_all_serial_accounts(all_accounts)
+        accounts = [account for account in all_accounts if account.include_in_all] if background_mode else self._filtered_accounts_for_ui()
+        skipped_accounts = [account for account in all_accounts if not account.include_in_all]
+        if background_mode:
+            self._log("后台全部串行范围确认：使用层级=全部的 include_in_all=true 过滤逻辑。")
         if accounts:
             self._log("本次全部串行将执行：")
             for group_name, count in self._account_group_counts(accounts):
@@ -3327,6 +3424,13 @@ Write-Output $count
             return
         if not self._validate_accounts_for_current_mode(accounts):
             return
+        if background_mode:
+            self._log(
+                f"后台全部串行: 共 {len(accounts)} 个账号，并发={BACKGROUND_SERIAL_CONCURRENCY}，"
+                f"逐个调用后台单账号流程。{self._account_count_summary(accounts)}"
+            )
+            self._start_background_serial_run(accounts, run_label="后台全部串行")
+            return
         self._log(f"全部串行: 共 {len(accounts)} 个账号，批量快速登录 + 统一校验。{self._account_count_summary(accounts)}")
         self._start_serial_run(accounts, batch_fast=True)
 
@@ -3334,6 +3438,8 @@ Write-Output $count
 
     def _run_method2_single(self) -> None:
         """方式二：单账号运行（选中的CSV账号）"""
+        if self._block_background_unsupported_action("方式二"):
+            return
         if not self.csv_accounts:
             messagebox.showwarning("无账号", "请先导入CSV文件。")
             return
@@ -3349,6 +3455,8 @@ Write-Output $count
 
     def _run_method2_all(self) -> None:
         """方式二：CSV列表全部串行"""
+        if self._block_background_unsupported_action("方式二"):
+            return
         valid = [a for a in self.csv_accounts if "配置缺失" not in a.status]
         if not valid:
             messagebox.showwarning("无有效账号", "CSV中没有有效的账号。")
@@ -3371,6 +3479,7 @@ Write-Output $count
         if self.worker_thread is not None and self.worker_thread.is_alive():
             messagebox.showwarning("任务进行中", "当前有任务正在执行。")
             return
+        self._preserve_background_windows = False
         self._setup_log_file()
         self.stop_event.clear()
         self.csv_passport_by_key.clear()
@@ -3585,17 +3694,18 @@ Write-Output $count
             self._log(line)
         self._log("测试2结束：不执行任何大漠点击流程。")
 
-    def _setup_log_file(self) -> None:
+    def _setup_log_file(self, *, cleanup_old: bool = True) -> None:
         import time as _time
         log_dir = project_root() / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
-        # 清理旧日志，仅保留最新2份
-        existing_logs = sorted(log_dir.glob("run_*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
-        for old in existing_logs[2:]:
-            try:
-                old.unlink()
-            except Exception:
-                pass
+        if cleanup_old:
+            # 清理旧日志，仅保留最新2份
+            existing_logs = sorted(log_dir.glob("run_*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+            for old in existing_logs[2:]:
+                try:
+                    old.unlink()
+                except Exception:
+                    pass
         ts = _time.strftime("%Y%m%d_%H%M%S")
         self._log_file_path = log_dir / f"run_{ts}.log"
         self._log_file = open(str(self._log_file_path), "w", encoding="utf-8")
@@ -3632,6 +3742,15 @@ Write-Output $count
         except Exception as exc:
             self._log(f"启动环境检查失败: {exc}")
 
+    def _log_background_capability_summary(self) -> None:
+        report = build_background_capability_report()
+        self._log(report.frontend_summary)
+        try:
+            report_path = write_background_capability_report()
+            self._log(f"后台能力详细报告：{report_path}")
+        except Exception as exc:
+            self._log(f"后台能力详细报告写入失败：{exc}")
+
     def _log_admin_status_warning(self) -> None:
         try:
             import ctypes
@@ -3663,6 +3782,7 @@ Write-Output $count
         if self.worker_thread and self.worker_thread.is_alive():
             messagebox.showwarning("任务运行中", "已有任务正在运行，请先停止或等待完成。")
             return
+        self._preserve_background_windows = False
         try:
             settings = load_settings(self.settings_path.get())
         except Exception as exc:
@@ -3680,6 +3800,209 @@ Write-Output $count
             daemon=True,
         )
         self.worker_thread.start()
+
+    def _start_background_single_run(self, account: AccountConfig) -> None:
+        if self.worker_thread and self.worker_thread.is_alive():
+            messagebox.showwarning("任务运行中", "已有任务正在运行，请先停止或等待完成。")
+            return
+        dependency_check = check_background_runtime_dependencies()
+        if not dependency_check.ok:
+            modules = "、".join(dependency_check.missing_modules)
+            commands = "\n".join(dependency_check.install_commands)
+            message = f"当前 Python 环境缺少依赖：{modules}\n请执行：{commands}"
+            self._setup_log_file(cleanup_old=False)
+            self._set_status(account, "依赖缺失")
+            self._log("后台模式依赖预检失败。")
+            self._log(f"当前 Python 路径={dependency_check.python_executable}")
+            self._log(f"Python 位数={dependency_check.python_bits}")
+            self._log(f"缺失模块={modules}")
+            self._log(f"建议安装命令={commands}")
+            messagebox.showwarning("后台模式依赖缺失", message)
+            return
+        try:
+            settings = load_settings(self.settings_path.get())
+        except Exception as exc:
+            messagebox.showerror("读取自动化设置失败", str(exc))
+            return
+        settings = self._settings_with_notice_ratio(settings)
+
+        self._setup_log_file(cleanup_old=False)
+        self.stop_event.clear()
+        self._preserve_background_windows = True
+        self._set_status(account, "等待中")
+        self.worker_thread = threading.Thread(
+            target=self._background_single_worker,
+            args=(account, settings),
+            daemon=True,
+        )
+        self.worker_thread.start()
+
+    def _start_background_serial_run(self, accounts: list[AccountConfig], *, run_label: str) -> None:
+        if self.worker_thread and self.worker_thread.is_alive():
+            messagebox.showwarning("任务运行中", "已有任务正在运行，请先停止或等待完成。")
+            return
+        dependency_check = check_background_runtime_dependencies()
+        if not dependency_check.ok:
+            modules = "、".join(dependency_check.missing_modules)
+            commands = "\n".join(dependency_check.install_commands)
+            message = f"当前 Python 环境缺少依赖：{modules}\n请执行：{commands}"
+            self._setup_log_file(cleanup_old=False)
+            for account in accounts:
+                self._set_status(account, "依赖缺失")
+            self._log("后台串行依赖预检失败。")
+            self._log(f"当前 Python 路径={dependency_check.python_executable}")
+            self._log(f"Python 位数={dependency_check.python_bits}")
+            self._log(f"缺失模块={modules}")
+            self._log(f"建议安装命令={commands}")
+            messagebox.showwarning("后台模式依赖缺失", message)
+            return
+        try:
+            settings = load_settings(self.settings_path.get())
+        except Exception as exc:
+            messagebox.showerror("读取自动化设置失败", str(exc))
+            return
+        settings = self._settings_with_notice_ratio(settings)
+
+        self._setup_log_file(cleanup_old=False)
+        self.stop_event.clear()
+        self._preserve_background_windows = True
+        for account in accounts:
+            self._set_status(account, "等待中")
+        self.worker_thread = threading.Thread(
+            target=self._background_serial_worker,
+            args=(list(accounts), settings, run_label),
+            daemon=True,
+        )
+        self.worker_thread.start()
+
+    def _background_single_worker(self, account: AccountConfig, settings) -> None:
+        import time as _time
+
+        start_time = _time.time()
+        self._queue_log(f"{RUN_MODE_BACKGROUND_LABEL}：方式一单账号实验，仅运行 {account.display_name}")
+        self._queue_log("后台实验流程不调用 SetForegroundWindow，不使用全局鼠标/键盘。")
+        self._update_status_bar("后台模式运行中：1/1")
+        runner = BackgroundSingleAccountRunner(
+            account,
+            settings,
+            self.stop_event,
+            log=self._queue_log,
+            update_status=self._queue_status,
+            passport_found=self._queue_passport,
+        )
+        result = runner.run()
+        elapsed = _time.time() - start_time
+        self._queue_timing(account, elapsed)
+        if self.stop_event.is_set():
+            self._update_status_bar("已停止")
+        elif result:
+            self._queue_log(f"[后台模式] 成功: {account.display_name}")
+            self._update_status_bar("后台模式完成：成功1，失败0")
+        else:
+            self._queue_log(f"[后台模式] 失败: {account.display_name}")
+            self._update_status_bar("后台模式完成：成功0，失败1")
+
+    def _background_serial_worker(self, accounts: list[AccountConfig], settings, run_label: str) -> None:
+        import time as _time
+
+        total = len(accounts)
+        start_time = _time.time()
+        success_count = 0
+        skip_count = 0
+        fail_count = 0
+        stopped_count = 0
+        stopped_keys: set[str] = set()
+        latest_status: dict[str, str] = {}
+        passport_by_key: dict[str, str] = {}
+
+        def queue_status(account: AccountConfig, status: str) -> None:
+            latest_status[account.key] = status
+            self._queue_status(account, status)
+
+        def mark_stopped(account: AccountConfig) -> None:
+            nonlocal stopped_count
+            if account.key in stopped_keys:
+                return
+            stopped_keys.add(account.key)
+            stopped_count += 1
+            if latest_status.get(account.key) != "已停止":
+                latest_status[account.key] = "已停止"
+                self._queue_status(account, "已停止")
+
+        def passport_found(account: AccountConfig, passport: str) -> None:
+            passport_by_key[account.key] = passport
+            self._queue_passport(account, passport)
+
+        self._queue_log(
+            f"{run_label}开始：总{total}，并发={BACKGROUND_SERIAL_CONCURRENCY}，逐个调用 BackgroundSingleAccountRunner。"
+        )
+        self._queue_log("后台串行不前置窗口，不使用全局鼠标/键盘。")
+        self._update_status_bar(f"{run_label}运行中：0/{total}")
+
+        for index, account in enumerate(accounts, start=1):
+            if self.stop_event.is_set():
+                for remaining in accounts[index - 1 :]:
+                    mark_stopped(remaining)
+                break
+
+            self._queue_log(f"[后台串行][{index}/{total}] 窗口{account.game_window_no}：开始")
+            self._update_status_bar(f"{run_label}运行中：{index}/{total}")
+            account_started = _time.time()
+            runner = BackgroundSingleAccountRunner(
+                account,
+                settings,
+                self.stop_event,
+                log=self._queue_log_file,
+                update_status=queue_status,
+                passport_found=passport_found,
+            )
+            result = runner.run()
+            elapsed = _time.time() - account_started
+            self._queue_timing(account, elapsed)
+
+            if self.stop_event.is_set():
+                mark_stopped(account)
+                for remaining in accounts[index:]:
+                    mark_stopped(remaining)
+                break
+
+            status = latest_status.get(account.key, "")
+            passport = passport_by_key.get(account.key, "")
+            if result and status == "已进入游戏，跳过":
+                skip_count += 1
+                self._queue_log(f"[后台串行][{index}/{total}] 窗口{account.game_window_no}：已进入游戏，跳过")
+            elif result:
+                success_count += 1
+                if passport:
+                    self._queue_log(f"[后台串行][{index}/{total}] 窗口{account.game_window_no}：识别通行证 {passport}")
+                self._queue_log(f"[后台串行][{index}/{total}] 窗口{account.game_window_no}：成功")
+            else:
+                fail_count += 1
+                if latest_status.get(account.key) != "失败":
+                    queue_status(account, "失败")
+                self._queue_log(f"[后台串行][{index}/{total}] 窗口{account.game_window_no}：失败")
+
+        elapsed_total = _time.time() - start_time
+        if self.stop_event.is_set() or stopped_count:
+            self._queue_log("后台串行已停止。")
+            summary = (
+                f"{run_label}已停止：成功{success_count}，跳过{skip_count}，失败{fail_count}，"
+                f"已停止{stopped_count}，总耗时{elapsed_total:.0f}秒"
+            )
+            self._update_status_bar("已停止")
+        else:
+            summary = (
+                f"{run_label}完成：成功{success_count}，跳过{skip_count}，失败{fail_count}，"
+                f"已停止{stopped_count}，总耗时{elapsed_total:.0f}秒"
+            )
+            self._update_status_bar(f"{run_label}完成：成功{success_count}，跳过{skip_count}，失败{fail_count}")
+        self._queue_log(summary)
+        self._write_file_log(summary)
+        if self._log_file is not None:
+            self._log_file.close()
+            self._log_file = None
+        if hasattr(self, "worker_thread"):
+            self.worker_thread = None
 
     def _serial_worker(self, accounts: list[AccountConfig], settings, batch_fast: bool = False, verify_rounds: int = 3) -> None:
         self._setup_log_file()
@@ -4256,7 +4579,10 @@ else:
         terminated = self._terminate_running_processes()
         if terminated == 0:
             self._log("当前没有需要终止的账号运行子进程。")
-        self._cleanup_external_processes()
+        if self._preserve_background_windows:
+            self._log("后台任务停止：保留已打开窗口，跳过 chromium.exe 清理。")
+        else:
+            self._cleanup_external_processes()
         self._log("任务已停止，不会继续执行后续账号。")
         self._update_status_bar("已停止")
 

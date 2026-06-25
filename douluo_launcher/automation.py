@@ -10,9 +10,11 @@ import json
 import os
 import sys
 from collections.abc import Callable
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from tempfile import gettempdir
+from typing import Any
 
 # 全局：所有子进程默认不弹控制台窗口（覆盖 pytesseract→tesseract.exe 等）
 # 用 class 包装而非 function，避免破坏 asyncio 对 subprocess.Popen 的子类化
@@ -128,6 +130,359 @@ def _preview_text(text: str, limit: int) -> str:
     if len(normalized) > limit:
         return normalized[:limit] + "..."
     return normalized
+
+
+@dataclass(frozen=True)
+class PassportOcrResult:
+    passport: str | None
+    raw_output: str = ""
+    text_region_box: tuple[int, int, int, int] | None = None
+    preprocessed_path: Path | None = None
+    context_path: Path | None = None
+    failure_reason: str = ""
+    evidence_source: str = ""
+    evidence_votes: int = 0
+
+
+@dataclass(frozen=True)
+class RedBarLocalOcrResult:
+    passport: str | None
+    red_bar_box: tuple[int, int, int, int] | None = None
+    local_box: tuple[int, int, int, int] | None = None
+    candidates: dict[str, int] = field(default_factory=dict)
+    variants: tuple[dict[str, Any], ...] = ()
+    accepted: bool = False
+    reject_reason: str = ""
+    raw_output: str = ""
+    crop_image: Any | None = field(default=None, repr=False, compare=False)
+    preprocessed_image: Any | None = field(default=None, repr=False, compare=False)
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, tuple):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    return value
+
+
+def _passport_text_region_box(image) -> tuple[int, int, int, int]:
+    width, height = image.size
+    left = 10 if width > 20 else 0
+    right = max(left + 1, width - 10 if width > 20 else width)
+    top = max(0, min(height - 1, int(height * 0.50)))
+    bottom = max(top + 1, height - 10 if height > 20 else height)
+    return left, top, right, bottom
+
+
+def _extract_exact_hex_candidate(text: str) -> str | None:
+    compact = "".join(ch for ch in str(text or "").lower() if ch in "0123456789abcdef")
+    if re.fullmatch(r"[0-9a-f]{8}", compact):
+        return compact
+    return None
+
+
+def _collect_passport_ocr_raw_outputs(raw_image, text_crop, preprocessed) -> tuple[str, dict[str, object]]:
+    ocr_config: dict[str, object] = {
+        "lang": "chi_sim+eng",
+        "text_region_scales": [2, 3, 4],
+        "text_region_psm": [6, 7],
+        "full_image_scales": [1, 2],
+        "full_image_psm": [6, 3],
+        "preprocess": "resize/autocontrast/grayscale",
+    }
+    try:
+        import pytesseract
+        from PIL import ImageOps
+    except Exception as exc:
+        return f"OCR dependency unavailable: {exc}", ocr_config
+
+    sections: list[str] = []
+    variants: list[tuple[str, object, str]] = []
+    for scale in (2, 3, 4):
+        image = text_crop.resize((text_crop.width * scale, text_crop.height * scale))
+        for psm in (6, 7):
+            variants.append((f"text_region scale={scale} psm={psm}", image, f"--psm {psm}"))
+
+    for scale in (1, 2):
+        image = raw_image.resize((raw_image.width * scale, raw_image.height * scale)) if scale > 1 else raw_image.copy()
+        for psm in (6, 3):
+            variants.append((f"full_rgb scale={scale} psm={psm}", image, f"--psm {psm}"))
+        gray = ImageOps.autocontrast(image.convert("L"))
+        for psm in (6, 3):
+            variants.append((f"full_gray scale={scale} psm={psm}", gray, f"--psm {psm}"))
+
+    variants.append(("latest_preprocessed text_region", preprocessed, "--psm 7"))
+
+    for label, image, config in variants:
+        try:
+            text = pytesseract.image_to_string(image, lang="chi_sim+eng", config=config)
+        except Exception as exc:
+            text = f"OCR error: {exc}"
+        sections.append(f"--- {label} {config} ---\n{text}")
+
+    return "\n".join(sections), ocr_config
+
+
+def _save_passport_ocr_artifacts(
+    raw_image,
+    *,
+    debug_dir: Path,
+    context: dict[str, object],
+    failure_reason: str,
+) -> PassportOcrResult:
+    from PIL import ImageFilter, ImageOps
+
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    input_path = debug_dir / "latest_ocr_input.png"
+    text_region_path = debug_dir / "latest_ocr_text_region.png"
+    preprocessed_path = debug_dir / "latest_ocr_preprocessed.png"
+    raw_text_path = debug_dir / "latest_ocr_raw.txt"
+    context_path = debug_dir / "latest_ocr_context.json"
+
+    image = raw_image.convert("RGB")
+    image.save(input_path)
+    text_region_box = _passport_text_region_box(image)
+    text_crop = image.crop(text_region_box)
+    text_crop.save(text_region_path)
+    preprocessed = text_crop.resize((text_crop.width * 4, text_crop.height * 4))
+    preprocessed = preprocessed.filter(ImageFilter.SHARPEN)
+    preprocessed = ImageOps.autocontrast(preprocessed.convert("L"))
+    preprocessed.save(preprocessed_path)
+
+    raw_output, ocr_config = _collect_passport_ocr_raw_outputs(image, text_crop, preprocessed)
+    raw_text_path.write_text(raw_output, encoding="utf-8")
+
+    payload = {
+        "hwnd": 0,
+        "title": "",
+        "image_size": [int(image.width), int(image.height)],
+        "login_page_state": "",
+        "qr_box": None,
+        "fallback_qr_box": None,
+        "red_bar_box": None,
+        "text_region_box": list(text_region_box),
+        "ocr_config": ocr_config,
+        "ocr_raw_output": raw_output,
+        "failure_reason": failure_reason,
+        **dict(context or {}),
+    }
+    payload["image_size"] = [int(image.width), int(image.height)]
+    payload["text_region_box"] = list(text_region_box)
+    payload["failure_reason"] = failure_reason
+    payload["ocr_config"] = ocr_config
+    payload["ocr_raw_output"] = raw_output
+    context_path.write_text(json.dumps(_json_safe(payload), ensure_ascii=False, indent=2), encoding="utf-8")
+    return PassportOcrResult(
+        passport=None,
+        raw_output=raw_output,
+        text_region_box=text_region_box,
+        preprocessed_path=preprocessed_path,
+        context_path=context_path,
+        failure_reason=failure_reason,
+    )
+
+
+def _save_passport_extract_artifacts(
+    raw_image,
+    *,
+    debug_dir: Path,
+    context: dict[str, object],
+    red_bar_result: RedBarLocalOcrResult | None,
+    failure_reason: str,
+) -> None:
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    image = raw_image.convert("RGB")
+    input_path = debug_dir / "latest_passport_extract_input.png"
+    crop_path = debug_dir / "latest_passport_extract_red_bar_crop.png"
+    preprocessed_path = debug_dir / "latest_passport_extract_red_bar_preprocessed.png"
+    raw_path = debug_dir / "latest_passport_extract_raw.txt"
+    candidates_path = debug_dir / "latest_passport_extract_candidates.json"
+    context_path = debug_dir / "latest_passport_extract_context.json"
+
+    image.save(input_path)
+    if red_bar_result and red_bar_result.crop_image is not None:
+        red_bar_result.crop_image.save(crop_path)
+    if red_bar_result and red_bar_result.preprocessed_image is not None:
+        red_bar_result.preprocessed_image.save(preprocessed_path)
+    raw_output = red_bar_result.raw_output if red_bar_result else ""
+    raw_path.write_text(raw_output, encoding="utf-8")
+
+    candidates_payload = {
+        "red_bar_box": red_bar_result.red_bar_box if red_bar_result else None,
+        "red_bar_local_box": red_bar_result.local_box if red_bar_result else None,
+        "variants": red_bar_result.variants if red_bar_result else (),
+        "candidate_votes": red_bar_result.candidates if red_bar_result else {},
+        "accepted": bool(red_bar_result.accepted) if red_bar_result else False,
+        "passport": red_bar_result.passport if red_bar_result else "",
+        "reject_reason": (red_bar_result.reject_reason if red_bar_result else "") or failure_reason,
+    }
+    candidates_path.write_text(
+        json.dumps(_json_safe(candidates_payload), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    context_payload = {
+        **dict(context or {}),
+        "image_size": [int(image.width), int(image.height)],
+        "red_bar_box": red_bar_result.red_bar_box if red_bar_result else dict(context or {}).get("red_bar_box"),
+        "red_bar_local_box": red_bar_result.local_box if red_bar_result else None,
+        "failure_reason": failure_reason,
+        "extract_artifacts": {
+            "input": input_path,
+            "red_bar_crop": crop_path if crop_path.exists() else None,
+            "red_bar_preprocessed": preprocessed_path if preprocessed_path.exists() else None,
+            "raw": raw_path,
+            "candidates": candidates_path,
+        },
+    }
+    context_path.write_text(
+        json.dumps(_json_safe(context_payload), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def extract_passport_from_login_image(
+    raw_image,
+    *,
+    runner: object,
+    window_index: int,
+    debug_dir: Path,
+    mode: str,
+    raw_path: Path | None = None,
+    login_context: dict[str, object] | None = None,
+    save_failure_artifacts: bool = False,
+    save_debug_artifacts: bool = False,
+) -> PassportOcrResult:
+    """Shared QR-login passport OCR path used by foreground and background modes."""
+    debug_dir = Path(debug_dir)
+    prefix = Path(raw_path).stem if raw_path is not None else f"{mode}_win{window_index}_{time.strftime('%Y%m%d_%H%M%S')}"
+    effective_raw_path = Path(raw_path) if raw_path is not None else debug_dir / f"{prefix}_input.png"
+    context = dict(login_context or {})
+    red_bar_box = context.get("red_bar_box") or context.get("passport_bar_box")
+    red_bar_result: RedBarLocalOcrResult | None = None
+    failure_reason = "passport_hex_not_found"
+    evidence_source = ""
+    evidence_votes = 0
+
+    if mode == "background":
+        passport = None
+        if red_bar_box:
+            red_bar_result = runner._ocr_passport_from_red_bar_region(  # type: ignore[attr-defined]
+                raw_image,
+                red_bar_box,
+                prefix,
+                debug_dir,
+            )
+            if red_bar_result.passport:
+                passport = red_bar_result.passport
+                evidence_source = "red_bar_box"
+                evidence_votes = int(red_bar_result.candidates.get(passport, 0))
+            else:
+                failure_reason = red_bar_result.reject_reason or "red_bar_ocr_failed"
+        else:
+            failure_reason = "red_bar_box_missing"
+    else:
+        passport = runner._ocr_passport_from_text_region(raw_image, prefix, effective_raw_path)  # type: ignore[attr-defined]
+        if passport:
+            evidence_source = "text_region"
+
+    if mode != "background" and not passport and red_bar_box:
+        red_bar_result = runner._ocr_passport_from_red_bar_region(  # type: ignore[attr-defined]
+            raw_image,
+            red_bar_box,
+            prefix,
+            debug_dir,
+        )
+        if red_bar_result.passport:
+            full_image_passport = runner._ocr_passport_from_login_image(raw_image, prefix, effective_raw_path)  # type: ignore[attr-defined]
+            if full_image_passport and str(full_image_passport).lower() != red_bar_result.passport:
+                failure_reason = "red_bar_full_image_conflict"
+                red_bar_result = replace(
+                    red_bar_result,
+                    passport=None,
+                    accepted=False,
+                    reject_reason="RED_BAR_FULL_IMAGE_CONFLICT",
+                )
+            else:
+                passport = red_bar_result.passport
+                evidence_source = "red_bar_box"
+                evidence_votes = int(red_bar_result.candidates.get(passport, 0))
+    if mode != "background" and not passport:
+        passport = runner._ocr_passport_by_template_match(raw_image)  # type: ignore[attr-defined]
+        if passport:
+            evidence_source = "template_match"
+    if mode != "background" and not passport:
+        passport = runner._ocr_passport_from_login_image(raw_image, prefix, effective_raw_path)  # type: ignore[attr-defined]
+        if passport:
+            evidence_source = "full_image"
+
+    if passport:
+        result = PassportOcrResult(
+            passport=str(passport).lower(),
+            evidence_source=evidence_source,
+            evidence_votes=evidence_votes,
+        )
+        if save_debug_artifacts:
+            artifacts = _save_passport_ocr_artifacts(
+                raw_image,
+                debug_dir=debug_dir,
+                context=context,
+                failure_reason="",
+            )
+            return PassportOcrResult(
+                passport=result.passport,
+                raw_output=artifacts.raw_output,
+                text_region_box=artifacts.text_region_box,
+                preprocessed_path=artifacts.preprocessed_path,
+                context_path=artifacts.context_path,
+                evidence_source=result.evidence_source,
+                evidence_votes=result.evidence_votes,
+            )
+        return result
+
+    if mode == "background":
+        if save_failure_artifacts or save_debug_artifacts:
+            _save_passport_extract_artifacts(
+                raw_image,
+                debug_dir=debug_dir,
+                context=context,
+                red_bar_result=red_bar_result,
+                failure_reason=failure_reason,
+            )
+            return PassportOcrResult(
+                passport=None,
+                raw_output=red_bar_result.raw_output if red_bar_result else "",
+                context_path=debug_dir / "latest_passport_extract_context.json",
+                failure_reason=failure_reason,
+                evidence_source="red_bar_box",
+            )
+        return PassportOcrResult(
+            passport=None,
+            failure_reason=failure_reason,
+            evidence_source="red_bar_box",
+        )
+
+    if save_failure_artifacts or save_debug_artifacts:
+        artifacts = _save_passport_ocr_artifacts(
+            raw_image,
+            debug_dir=debug_dir,
+            context=context,
+            failure_reason=failure_reason,
+        )
+        _save_passport_extract_artifacts(
+            raw_image,
+            debug_dir=debug_dir,
+            context=context,
+            red_bar_result=red_bar_result,
+            failure_reason=failure_reason,
+        )
+        return artifacts
+    return PassportOcrResult(passport=None, failure_reason=failure_reason)
 
 
 def _extract_clipboard_hex(text: str) -> str | None:
@@ -1397,18 +1752,24 @@ class AccountRunner:
             self.log(
                 f"[窗口{self.account.game_window_no}] 复制方式获取通行证失败，失败类型={copy_error}，进入 OCR 兜底"
             )
-            passport = self._ocr_passport_from_text_region(image, prefix, raw_path)
-            if passport:
-                return passport, "ocr"
-            # 文字区域失败 → 模板匹配（对 hex 字符区分度优于 Tesseract）
-            passport = self._ocr_passport_by_template_match(image)
-            if passport and len(passport) >= 8:
-                self.log(f"[窗口{self.account.game_window_no}] 模板匹配结果: {passport}")
-                return passport, "ocr"
-            # 回退全图OCR
-            passport = self._ocr_passport_from_login_image(image, prefix, raw_path)
-            if passport:
-                return passport, "ocr"
+            ocr_result = extract_passport_from_login_image(
+                image,
+                runner=self,
+                window_index=self.account.game_window_no,
+                debug_dir=app_root() / self.settings.qr_passport_debug_dir,
+                mode="foreground",
+                raw_path=raw_path,
+                login_context={
+                    "hwnd": selected.hwnd,
+                    "title": selected.title,
+                    "login_page_state": state,
+                    "qr_box": metrics.get("qr_box"),
+                    "fallback_qr_box": metrics.get("fallback_qr_box"),
+                    "red_bar_box": metrics.get("passport_bar_box"),
+                },
+            )
+            if ocr_result.passport:
+                return ocr_result.passport, "ocr"
             self.log(
                 f"[窗口{self.account.game_window_no}] 疑似二维码登录界面，"
                 "但未能识别通行证，返回 unknown 等待复查"
@@ -2162,6 +2523,163 @@ class AccountRunner:
         self.log(f"[窗口{self.account.game_window_no}] 所有 OCR 变体均未识别到 8 位十六进制通行证")
         return None
 
+    def _red_bar_local_box(
+        self,
+        image,
+        red_bar_box: tuple[int, int, int, int] | list[int],
+    ) -> tuple[int, int, int, int]:
+        image_width, image_height = image.size
+        left, top, right, bottom = [int(value) for value in red_bar_box]
+        left = max(0, min(image_width - 1, left))
+        right = max(left + 1, min(image_width, right))
+        top = max(0, min(image_height - 1, top))
+        bottom = max(top + 1, min(image_height, bottom))
+        bar_width = max(1, right - left)
+        bar_height = max(1, bottom - top)
+
+        local_left = left + int(bar_width * 0.50)
+        local_right = left + int(bar_width * 0.72)
+        local_top = top + int(bar_height * 0.15)
+        local_bottom = top + int(bar_height * 0.95)
+        local_left = max(left, min(right - 1, local_left))
+        local_right = max(local_left + 1, min(right, local_right))
+        local_top = max(top, min(bottom - 1, local_top))
+        local_bottom = max(local_top + 1, min(bottom, local_bottom))
+        return local_left, local_top, local_right, local_bottom
+
+    def _decide_red_bar_local_candidate(
+        self,
+        candidates: dict[str, int],
+    ) -> tuple[str | None, str]:
+        normalized: dict[str, int] = {}
+        for candidate, votes in candidates.items():
+            value = str(candidate or "").strip().lower()
+            if not re.fullmatch(r"[0-9a-f]{8}", value):
+                continue
+            normalized[value] = normalized.get(value, 0) + int(votes)
+
+        if not normalized:
+            return None, "RED_BAR_OCR_LOW_CONFIDENCE"
+
+        ordered = sorted(normalized.items(), key=lambda item: (-item[1], item[0]))
+        best, best_votes = ordered[0]
+        second_votes = ordered[1][1] if len(ordered) > 1 else 0
+        if len(ordered) == 1:
+            if best_votes >= 2:
+                return best, ""
+            return None, "RED_BAR_OCR_LOW_CONFIDENCE"
+
+        if best_votes >= 3 and best_votes >= second_votes * 2 and best_votes - second_votes >= 2:
+            return best, ""
+        return None, "RED_BAR_OCR_CONFLICT"
+
+    def _ocr_passport_from_red_bar_region(
+        self,
+        raw_image,
+        red_bar_box: tuple[int, int, int, int] | list[int],
+        prefix: str,
+        debug_dir: Path,
+    ) -> RedBarLocalOcrResult:
+        try:
+            import pytesseract
+            from PIL import ImageOps
+        except Exception as exc:
+            self.log(f"[窗口{self.account.game_window_no}] 红条局部OCR依赖不可用: {exc}")
+            return RedBarLocalOcrResult(
+                passport=None,
+                red_bar_box=tuple(int(value) for value in red_bar_box),
+                reject_reason="RED_BAR_OCR_UNAVAILABLE",
+            )
+
+        image = raw_image.convert("RGB")
+        normalized_red_bar_box = tuple(int(value) for value in red_bar_box)
+        local_box = self._red_bar_local_box(image, normalized_red_bar_box)
+        crop = image.crop(local_box)
+        candidates: dict[str, int] = {}
+        variants: list[dict[str, Any]] = []
+        raw_sections: list[str] = []
+        preprocessed_for_artifact = None
+
+        def add_variant(label: str, variant_image, *, scale: int, preprocess: str) -> None:
+            nonlocal preprocessed_for_artifact
+            if preprocessed_for_artifact is None and preprocess.startswith("binary"):
+                preprocessed_for_artifact = variant_image.copy()
+            config = "--psm 7 -c tessedit_char_whitelist=0123456789abcdefABCDEF"
+            try:
+                text = pytesseract.image_to_string(variant_image, lang="eng", config=config, timeout=2)
+            except TypeError:
+                try:
+                    text = pytesseract.image_to_string(variant_image, lang="eng", config=config)
+                except Exception as exc:
+                    text = f"OCR error: {exc}"
+            except Exception as exc:
+                text = f"OCR error: {exc}"
+            candidate = _extract_exact_hex_candidate(text)
+            if candidate:
+                candidates[candidate] = candidates.get(candidate, 0) + 1
+            variants.append(
+                {
+                    "label": label,
+                    "scale": int(scale),
+                    "preprocess": preprocess,
+                    "config": config,
+                    "raw": text,
+                    "candidate": candidate or "",
+                }
+            )
+            raw_sections.append(f"--- {label} ---\n{text}")
+
+        scales = (1, 2, 3, 4, 5, 6)
+        thresholds = (120, 160, 180)
+        for scale in scales:
+            scaled = crop.resize((crop.width * scale, crop.height * scale))
+            add_variant(f"red_bar scale={scale} rgb", scaled, scale=scale, preprocess="rgb")
+            gray = ImageOps.autocontrast(scaled.convert("L"))
+            add_variant(f"red_bar scale={scale} gray", gray, scale=scale, preprocess="gray_autocontrast")
+            for threshold in thresholds:
+                binary = gray.point(lambda pixel, limit=threshold: 255 if pixel > limit else 0, mode="1")
+                add_variant(
+                    f"red_bar scale={scale} binary_{threshold}",
+                    binary,
+                    scale=scale,
+                    preprocess=f"binary_{threshold}",
+                )
+            if scale in (3, 4):
+                inverted = ImageOps.invert(gray)
+                add_variant(
+                    f"red_bar scale={scale} inverted_gray",
+                    inverted,
+                    scale=scale,
+                    preprocess="inverted_gray",
+                )
+
+        passport, reject_reason = self._decide_red_bar_local_candidate(candidates)
+        accepted = bool(passport)
+        if accepted:
+            self.log(
+                f"[窗口{self.account.game_window_no}] 红条局部OCR强证据: {passport} "
+                f"votes={candidates.get(passport, 0)} candidates={candidates}"
+            )
+        else:
+            self.log(
+                f"[窗口{self.account.game_window_no}] 红条局部OCR未形成强证据: "
+                f"reason={reject_reason} candidates={candidates}"
+            )
+        if preprocessed_for_artifact is None:
+            preprocessed_for_artifact = ImageOps.autocontrast(crop.convert("L"))
+        return RedBarLocalOcrResult(
+            passport=passport,
+            red_bar_box=normalized_red_bar_box,
+            local_box=local_box,
+            candidates=candidates,
+            variants=tuple(variants),
+            accepted=accepted,
+            reject_reason=reject_reason,
+            raw_output="\n".join(raw_sections),
+            crop_image=crop,
+            preprocessed_image=preprocessed_for_artifact,
+        )
+
     def _ocr_passport_by_template_match(self, raw_image) -> str | None:
         """用模板匹配方式识别通行证 hex 字符。
 
@@ -2400,7 +2918,7 @@ class AccountRunner:
             return None, "OCR_AMBIGUOUS_CHAR"
 
         best, best_votes = ordered[0]
-        if total_votes < 4:
+        if total_votes < 3:
             self.log(f"[窗口{self.account.game_window_no}] {label} OCR存疑位置: 全部（总票数不足）")
             self.log(
                 f"[窗口{self.account.game_window_no}] {label} OCR是否接受: 否，失败类型=OCR_LOW_CONFIDENCE"
@@ -2518,6 +3036,10 @@ class AccountRunner:
                     if hex_val:
                         self.log(f"[窗口{self.account.game_window_no}] 全图OCR成功: {hex_val}")
                         _add_result(hex_val, img.copy())
+                hex_val = extract_hex_passport(text)
+                if hex_val:
+                    self.log(f"[窗口{self.account.game_window_no}] 全图OCR成功(hex搜索): {hex_val}")
+                    _add_result(hex_val, img.copy())
                 # 方式2: 冒号后捕获宽松文本，走纠错管线
                 # OCR 乱码时"本次通行证"可能被识别为乱码，QR检测可提供外部确认
                 if "通行证" in text:
@@ -2546,6 +3068,10 @@ class AccountRunner:
                     if hex_val:
                         self.log(f"[窗口{self.account.game_window_no}] 全图OCR灰度成功: {hex_val}")
                         _add_result(hex_val, gray.copy())
+                hex_val = extract_hex_passport(text)
+                if hex_val:
+                    self.log(f"[窗口{self.account.game_window_no}] 全图OCR灰度成功(hex搜索): {hex_val}")
+                    _add_result(hex_val, gray.copy())
                 if "通行证" in text:
                     m = re.search(r":\s*(\S{7,10})(?:\s|$)", text)
                     if m:

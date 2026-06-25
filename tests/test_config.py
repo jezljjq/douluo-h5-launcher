@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from douluo_launcher.config import (
+    AccountConfig,
     SINGLE_LEVEL_NAME,
     compute_game_window_no,
     describe_bookmark_file,
@@ -258,8 +259,33 @@ class ConfigTests(unittest.TestCase):
             )
             accounts = load_accounts_from_bookmarks(path, "账号")
 
-        self.assertEqual(len(filter_accounts(accounts, "全部")), 2)
+        accounts = [
+            AccountConfig(account.level, account.bookmark_no, account.game_window_no, account.url,
+                          include_in_all=(account.level == "第一层"))
+            for account in accounts
+        ]
+
+        self.assertEqual([account.level for account in filter_accounts(accounts, "全部")], ["第一层"])
         self.assertEqual(len(filter_accounts(accounts, "第一层")), 1)
+        self.assertEqual(len(filter_accounts(accounts, "第二层")), 1)
+
+    def test_filter_accounts_all_excludes_unchecked_groups_but_specific_level_does_not(self) -> None:
+        accounts = [
+            AccountConfig("第一层", 1, 1, "https://example.com/l1", include_in_all=True),
+            AccountConfig("第二层", 1, 9, "https://example.com/l2", include_in_all=False),
+            AccountConfig("存钻", 1, 1, "https://example.com/z1", include_in_all=False),
+        ]
+
+        self.assertEqual([account.level for account in filter_accounts(accounts, "全部")], ["第一层"])
+        self.assertEqual([account.level for account in filter_accounts(accounts, "存钻")], ["存钻"])
+
+    def test_filter_accounts_all_returns_empty_when_no_group_is_checked(self) -> None:
+        accounts = [
+            AccountConfig("第一层", 1, 1, "https://example.com/l1", include_in_all=False),
+            AccountConfig("存钻", 1, 1, "https://example.com/z1", include_in_all=False),
+        ]
+
+        self.assertEqual(filter_accounts(accounts, "全部"), [])
 
     def test_load_settings_accepts_new_bookmark_fields(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
