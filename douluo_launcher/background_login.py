@@ -66,6 +66,17 @@ class BackgroundPassportCopyResult:
     details: dict[str, Any] | None = None
 
 
+@dataclass(frozen=True)
+class BackgroundLoginResult:
+    status: str
+    success: bool = False
+    reason: str = ""
+    final_verified: bool = False
+
+    def __bool__(self) -> bool:
+        return bool(self.success or self.status == "skipped_logged_in")
+
+
 def check_background_runtime_dependencies(
     *,
     import_module: Callable[[str], object] | None = None,
@@ -102,9 +113,19 @@ class _BrowserSession:
     browser: object
     page: object
     hwnd: int
+    context: object | None = None
     owns_playwright: bool = False
 
     def close(self) -> None:
+        try:
+            self.page.close()
+        except Exception:
+            pass
+        if self.context is not None:
+            try:
+                self.context.close()
+            except Exception:
+                pass
         try:
             self.browser.close()
         except Exception:
@@ -128,7 +149,7 @@ class _LoginWindowSnapshot:
 
 _BACKGROUND_OPEN_SESSIONS: list[_BrowserSession] = []
 _BACKGROUND_OPEN_SESSIONS_LOCK = threading.Lock()
-_BACKGROUND_PLAYWRIGHT: object | None = None
+_BACKGROUND_PLAYWRIGHTS_BY_THREAD: dict[int, object] = {}
 _BACKGROUND_PLAYWRIGHT_LOCK = threading.Lock()
 
 
@@ -138,13 +159,34 @@ def _remember_background_session(session: _BrowserSession) -> None:
 
 
 def _get_background_playwright():
-    global _BACKGROUND_PLAYWRIGHT
+    thread_id = int(threading.get_ident())
     with _BACKGROUND_PLAYWRIGHT_LOCK:
-        if _BACKGROUND_PLAYWRIGHT is None:
+        playwright = _BACKGROUND_PLAYWRIGHTS_BY_THREAD.get(thread_id)
+        if playwright is None:
             from playwright.sync_api import sync_playwright
 
-            _BACKGROUND_PLAYWRIGHT = sync_playwright().start()
-        return _BACKGROUND_PLAYWRIGHT
+            playwright = sync_playwright().start()
+            _BACKGROUND_PLAYWRIGHTS_BY_THREAD[thread_id] = playwright
+        return playwright
+
+
+def release_background_playwright_for_current_thread() -> None:
+    thread_id = int(threading.get_ident())
+    with _BACKGROUND_PLAYWRIGHT_LOCK:
+        playwright = _BACKGROUND_PLAYWRIGHTS_BY_THREAD.get(thread_id)
+    if playwright is None:
+        return
+    with _BACKGROUND_OPEN_SESSIONS_LOCK:
+        retained = any(session.playwright is playwright for session in _BACKGROUND_OPEN_SESSIONS)
+    if retained:
+        return
+    with _BACKGROUND_PLAYWRIGHT_LOCK:
+        if _BACKGROUND_PLAYWRIGHTS_BY_THREAD.get(thread_id) is playwright:
+            _BACKGROUND_PLAYWRIGHTS_BY_THREAD.pop(thread_id, None)
+    try:
+        playwright.stop()
+    except Exception:
+        pass
 
 
 def _ensure_playwright_browsers_path_for_background() -> Path | None:
@@ -369,72 +411,114 @@ class BackgroundSingleAccountRunner:
         self._debug_dir.mkdir(parents=True, exist_ok=True)
         self._helper = AccountRunner(account, settings, stop_event, log, update_status, passport_found=passport_found)
 
-    def run(self) -> bool:
+    def run(self) -> BackgroundLoginResult:
         session: _BrowserSession | None = None
         keep_open = False
         started = time.perf_counter()
         try:
             self._ensure_not_stopped()
             self.log(f"[后台模式][窗口{self.account.game_window_no}] 方式一单账号实验开始")
+            self._ensure_not_stopped()
             self.update_status(self.account, "后台截图中")
+            self._ensure_not_stopped()
             snapshot = self._capture_login_window_background()
+            self._ensure_not_stopped()
             if self._should_skip_ocr(snapshot):
+                self._ensure_not_stopped()
                 self.update_status(self.account, "已进入游戏，跳过")
                 self.log(
                     f"[后台模式][窗口{self.account.game_window_no}] 已进入游戏，跳过 OCR"
                 )
                 elapsed = time.perf_counter() - started
                 self.log(f"[后台模式][窗口{self.account.game_window_no}] 后台单账号流程跳过，用时 {elapsed:.1f}s")
-                return True
+                return BackgroundLoginResult(
+                    status="skipped_logged_in",
+                    success=False,
+                    reason="登录窗口已是 logged_in，跳过 OCR",
+                    final_verified=True,
+                )
 
+            self._ensure_not_stopped()
             self.update_status(self.account, "识别通行证中")
+            self._ensure_not_stopped()
             passport = self._extract_passport_from_login_window_background(snapshot)
+            self._ensure_not_stopped()
             if self.passport_found is not None:
                 self.passport_found(self.account, passport)
             self.log(f"[后台模式][窗口{self.account.game_window_no}] 通行证识别成功：{passport}")
 
+            self._ensure_not_stopped()
             self.update_status(self.account, "打开正式页中")
+            self._ensure_not_stopped()
             session = self._open_formal_game_page()
+            self._ensure_not_stopped()
             self.log(
                 f"[后台模式][窗口{self.account.game_window_no}] 正式游戏页已打开 hwnd={session.hwnd}"
             )
 
+            self._ensure_not_stopped()
             self.update_status(self.account, "关闭公告中")
+            self._ensure_not_stopped()
             image = self.operator.screenshot(session.hwnd).convert("RGB")
+            self._ensure_not_stopped()
             image.save(self._tmp_path("01_game_page_before_notice.png"))
+            self._ensure_not_stopped()
             notice_closed, image = self._close_blocking_overlay(session.hwnd, image)
+            self._ensure_not_stopped()
             if not notice_closed:
                 raise RuntimeError("后台关闭公告/区服弹窗失败")
             image.save(self._tmp_path("02_after_notice.png"))
 
+            self._ensure_not_stopped()
             self.update_status(self.account, "点击通行证中")
+            self._ensure_not_stopped()
             self.log(f"[后台模式][窗口{self.account.game_window_no}] 后台点击右侧通行证按钮")
             dialog_image = self._open_passport_dialog(session.hwnd, image)
+            self._ensure_not_stopped()
             self.update_status(self.account, "输入通行证中")
 
+            self._ensure_not_stopped()
             self.log(f"[后台模式][窗口{self.account.game_window_no}] 后台输入通行证")
             input_image = self._input_passport_background(session.hwnd, dialog_image, passport)
+            self._ensure_not_stopped()
 
             self.update_status(self.account, "确认中")
+            self._ensure_not_stopped()
             self.log(f"[后台模式][窗口{self.account.game_window_no}] 后台点击确认")
             confirmed = self._click_confirm_background(session.hwnd, input_image)
             if not confirmed:
                 raise RuntimeError("后台确认失败，通行证弹窗仍未关闭")
+            final_verified, verify_reason = self._verify_background_login_success(session.hwnd, snapshot.hwnd)
+            if not final_verified:
+                self.log(
+                    f"[后台模式][窗口{self.account.game_window_no}] "
+                    f"登录确认后未检测到成功状态，标记失败：{verify_reason}"
+                )
+                raise RuntimeError(f"登录确认后未检测到成功状态，标记失败：{verify_reason}")
             self._save_latest_success_artifacts(session.hwnd)
             self.update_status(self.account, "成功")
             elapsed = time.perf_counter() - started
-            self.log(f"[后台模式][窗口{self.account.game_window_no}] 后台单账号流程完成，用时 {elapsed:.1f}s")
-            keep_open = True
-            _remember_background_session(session)
-            return True
+            self.log(
+                f"[后台模式][窗口{self.account.game_window_no}] "
+                f"后台单账号流程完成，用时 {elapsed:.1f}s，最终校验={verify_reason}"
+            )
+            keep_open = bool(getattr(self.settings, "background_keep_success_browser", False))
+            if keep_open:
+                _remember_background_session(session)
+            return BackgroundLoginResult(
+                status="success",
+                success=True,
+                reason=verify_reason,
+                final_verified=True,
+            )
         except InterruptedError:
             self.update_status(self.account, "已停止")
             self.log(f"[后台模式][窗口{self.account.game_window_no}] 任务已停止")
-            return False
+            return BackgroundLoginResult(status="stopped", success=False, reason="任务已停止", final_verified=False)
         except Exception as exc:
             self.update_status(self.account, "失败")
             self.log(f"[后台模式][窗口{self.account.game_window_no}] 后台步骤失败：{exc}")
-            return False
+            return BackgroundLoginResult(status="failed", success=False, reason=str(exc), final_verified=False)
         finally:
             if session is not None and not keep_open:
                 session.close()
@@ -473,6 +557,7 @@ class BackgroundSingleAccountRunner:
             self.log(f"[后台模式][窗口{self.account.game_window_no}] 保存成功现场失败：{exc}")
 
     def _capture_login_window_background(self) -> _LoginWindowSnapshot:
+        self._ensure_not_stopped()
         selected, candidates = select_login_window_by_game_no(self.account.game_window_no)
         self.log(
             f"[后台模式][窗口{self.account.game_window_no}] 登录程序候选窗口数={len(candidates)}"
@@ -480,7 +565,9 @@ class BackgroundSingleAccountRunner:
         if selected is None:
             raise RuntimeError(f"未找到登录程序窗口{self.account.game_window_no}")
 
+        self._ensure_not_stopped()
         image = self.operator.screenshot(selected.hwnd).convert("RGB")
+        self._ensure_not_stopped()
         raw_path = self._tmp_path("login_window_full.png")
         image.save(raw_path)
         self.log(
@@ -488,7 +575,9 @@ class BackgroundSingleAccountRunner:
             f"hwnd={selected.hwnd} title={selected.title}"
         )
         prefix = raw_path.stem
+        self._ensure_not_stopped()
         state, metrics = self._helper.detect_login_page_state(image)
+        self._ensure_not_stopped()
         self.log(
             f"[后台模式][窗口{self.account.game_window_no}] 登录窗口状态={state} "
             f"reason={metrics.get('final_reason')}"
@@ -506,11 +595,14 @@ class BackgroundSingleAccountRunner:
         self,
         snapshot: _LoginWindowSnapshot | None = None,
     ) -> str:
+        self._ensure_not_stopped()
         snapshot = snapshot or self._capture_login_window_background()
+        self._ensure_not_stopped()
         self.log(
             f"[后台模式][窗口{self.account.game_window_no}] "
             "后台复制/读取已禁用，直接使用 OCR 多证据识别通行证"
         )
+        self._ensure_not_stopped()
         result = extract_passport_from_login_image(
             snapshot.image,
             runner=self._helper,
@@ -528,14 +620,16 @@ class BackgroundSingleAccountRunner:
             },
             save_failure_artifacts=True,
         )
+        self._ensure_not_stopped()
         if not result.passport:
             self.log(f"[后台模式][窗口{self.account.game_window_no}] 后台 OCR 未能可靠识别本次通行证")
             raise RuntimeError("后台 OCR 未能可靠识别本次通行证")
         passport = result.passport.lower()
         votes = max(0, int(getattr(result, "evidence_votes", 0) or 0))
+        source = str(getattr(result, "evidence_source", "") or "shared_ocr")
         self.log(
             f"[后台模式][窗口{self.account.game_window_no}] "
-            f"red_bar_box 局部 OCR 强证据：{passport}，votes={votes}"
+            f"OCR 识别成功：{passport}，来源={source}，votes={votes}"
         )
         return passport
 
@@ -651,6 +745,7 @@ class BackgroundSingleAccountRunner:
         before_hwnds = {int(window.hwnd) for window in list_browser_windows("")}
         playwright = _get_background_playwright()
         browser = None
+        context = None
         try:
             launcher = getattr(playwright, self.settings.browser)
             browser = launcher.launch(
@@ -660,9 +755,8 @@ class BackgroundSingleAccountRunner:
                     "--window-position=100,100",
                 ],
             )
-            page = browser.new_page(
-                viewport={"width": self.settings.window_width, "height": self.settings.window_height}
-            )
+            context = browser.new_context(viewport={"width": self.settings.window_width, "height": self.settings.window_height})
+            page = context.new_page()
             page.goto(self.account.url, wait_until="domcontentloaded", timeout=self.settings.page_load_timeout_ms)
             deadline = time.time() + 12
             selected = None
@@ -678,14 +772,59 @@ class BackgroundSingleAccountRunner:
             if selected is None:
                 raise RuntimeError("未找到后台测试浏览器窗口")
             time.sleep(max(0.5, self.settings.after_goto_wait_ms / 1000.0))
-            return _BrowserSession(playwright=playwright, browser=browser, page=page, hwnd=int(selected.hwnd))
+            return _BrowserSession(
+                playwright=playwright,
+                browser=browser,
+                page=page,
+                hwnd=int(selected.hwnd),
+                context=context,
+            )
         except Exception:
+            if context is not None:
+                try:
+                    context.close()
+                except Exception:
+                    pass
             if browser is not None:
                 try:
                     browser.close()
                 except Exception:
                     pass
             raise
+
+    def _verify_background_login_success(self, session_hwnd: int, login_hwnd: int) -> tuple[bool, str]:
+        deadline = time.time() + max(1.0, self.settings.state_check_timeout_ms / 1000.0)
+        reasons: list[str] = []
+        while time.time() <= deadline:
+            self._ensure_not_stopped()
+            reasons = []
+            try:
+                formal_image = self.operator.screenshot(int(session_hwnd)).convert("RGB")
+                formal_image.save(self._tmp_path("06_final_verify_formal.png"))
+                if self._helper._looks_like_game_notice_page(formal_image):  # type: ignore[attr-defined]
+                    return True, "正式页检测到公告/已登录视觉特征"
+                if self._helper._looks_like_game_ui_page(formal_image):  # type: ignore[attr-defined]
+                    return True, "正式页检测到游戏主界面视觉特征"
+                if self._passport_input_box_point(formal_image):
+                    reasons.append("正式页仍显示通行证输入框")
+                else:
+                    reasons.append("正式页未检测到游戏主界面")
+            except Exception as exc:
+                reasons.append(f"正式页校验异常: {exc}")
+
+            try:
+                login_image = self.operator.screenshot(int(login_hwnd)).convert("RGB")
+                login_image.save(self._tmp_path("06_final_verify_login_window.png"))
+                state, metrics = self._helper.detect_login_page_state(login_image)
+                if str(state) == "logged_in":
+                    return True, f"登录窗口状态为 logged_in: {metrics.get('final_reason')}"
+                reasons.append(f"登录窗口状态仍为 {state}: {metrics.get('final_reason')}")
+            except Exception as exc:
+                reasons.append(f"登录窗口校验异常: {exc}")
+
+            time.sleep(0.5)
+
+        return False, "；".join(reason for reason in reasons if reason) or "没有 logged_in 成功证据"
 
     def _window_children(self, hwnd: int) -> list[dict[str, object]]:
         import ctypes

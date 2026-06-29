@@ -1,5 +1,7 @@
 import inspect
+import sys
 import threading
+import types
 import unittest
 import tempfile
 from pathlib import Path
@@ -7,10 +9,12 @@ from unittest import mock
 
 from PIL import Image
 
+import douluo_launcher.background_login as background_login_module
 from douluo_launcher.automation import PassportOcrResult
 from douluo_launcher.background_login import (
     BACKGROUND_INSTALL_COMMANDS,
     BackgroundSingleAccountRunner,
+    _BrowserSession,
     _LoginWindowSnapshot,
     check_background_runtime_dependencies,
 )
@@ -20,6 +24,28 @@ from douluo_launcher.window_operator import BackgroundOperator
 
 
 class BackgroundLoginTests(unittest.TestCase):
+    def test_browser_session_close_closes_page_context_and_browser(self) -> None:
+        calls: list[str] = []
+
+        class Closable:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def close(self) -> None:
+                calls.append(self.name)
+
+        session = _BrowserSession(
+            playwright=object(),
+            browser=Closable("browser"),
+            context=Closable("context"),
+            page=Closable("page"),
+            hwnd=123,
+        )
+
+        session.close()
+
+        self.assertEqual(calls, ["page", "context", "browser"])
+
     def test_background_single_runner_uses_background_operator(self) -> None:
         account = AccountConfig("第一层", 1, 1, "https://example.com")
         runner = BackgroundSingleAccountRunner(
@@ -152,6 +178,77 @@ class BackgroundLoginTests(unittest.TestCase):
         self.assertTrue(ocr.call_args.kwargs["save_failure_artifacts"])
         self.assertTrue(any("后台 OCR 未能可靠识别本次通行证" in line for line in logs))
 
+    def test_background_run_stops_after_screenshot_before_ocr(self) -> None:
+        account = AccountConfig("第一层", 1, 1, "https://example.com")
+        stop_event = threading.Event()
+        statuses: list[str] = []
+        runner = BackgroundSingleAccountRunner(
+            account,
+            AutomationSettings(),
+            stop_event,
+            log=lambda _message: None,
+            update_status=lambda _account, status: statuses.append(status),
+        )
+        snapshot = _LoginWindowSnapshot(
+            hwnd=71756,
+            title="斗罗大陆H5-1号",
+            image=Image.new("RGB", (768, 1056), "white"),
+            raw_path=Path("debug_background") / "login.png",
+            state="qr_page",
+            metrics={"image_size": (768, 1056)},
+        )
+
+        def capture_and_stop():
+            stop_event.set()
+            return snapshot
+
+        runner._capture_login_window_background = capture_and_stop  # type: ignore[method-assign]
+        runner._should_skip_ocr = mock.Mock(return_value=False)  # type: ignore[method-assign]
+        runner._extract_passport_from_login_window_background = mock.Mock(  # type: ignore[method-assign]
+            side_effect=AssertionError("OCR must not run after stop")
+        )
+
+        self.assertFalse(runner.run())
+        self.assertIn("已停止", statuses)
+        runner._should_skip_ocr.assert_not_called()
+        runner._extract_passport_from_login_window_background.assert_not_called()
+
+    def test_background_run_stops_after_ocr_before_opening_formal_page(self) -> None:
+        account = AccountConfig("第一层", 1, 1, "https://example.com")
+        stop_event = threading.Event()
+        statuses: list[str] = []
+        runner = BackgroundSingleAccountRunner(
+            account,
+            AutomationSettings(),
+            stop_event,
+            log=lambda _message: None,
+            update_status=lambda _account, status: statuses.append(status),
+        )
+        snapshot = _LoginWindowSnapshot(
+            hwnd=71756,
+            title="斗罗大陆H5-1号",
+            image=Image.new("RGB", (768, 1056), "white"),
+            raw_path=Path("debug_background") / "login.png",
+            state="qr_page",
+            metrics={"image_size": (768, 1056)},
+        )
+
+        runner._capture_login_window_background = mock.Mock(return_value=snapshot)  # type: ignore[method-assign]
+        runner._should_skip_ocr = mock.Mock(return_value=False)  # type: ignore[method-assign]
+
+        def extract_and_stop(_snapshot):
+            stop_event.set()
+            return "82bb3f13"
+
+        runner._extract_passport_from_login_window_background = extract_and_stop  # type: ignore[method-assign]
+        runner._open_formal_game_page = mock.Mock(  # type: ignore[method-assign]
+            side_effect=AssertionError("formal page must not open after stop")
+        )
+
+        self.assertFalse(runner.run())
+        self.assertIn("已停止", statuses)
+        runner._open_formal_game_page.assert_not_called()
+
     def test_background_passport_extraction_disables_copy_read_chain(self) -> None:
         account = AccountConfig("第一层", 1, 1, "https://example.com")
         logs: list[str] = []
@@ -211,7 +308,7 @@ class BackgroundLoginTests(unittest.TestCase):
         post_copy.assert_not_called()
         ocr.assert_called_once()
         self.assertTrue(any("后台复制/读取已禁用，直接使用 OCR 多证据识别通行证" in line for line in logs))
-        self.assertTrue(any("red_bar_box 局部 OCR 强证据：fd829a15，votes=4" in line for line in logs))
+        self.assertTrue(any("OCR 识别成功：fd829a15，来源=red_bar_box，votes=4" in line for line in logs))
         self.assertFalse(any("WM_GETTEXT" in line or "UIA" in line or "clipboard" in line or "尝试后台复制" in line for line in logs))
 
     def test_background_passport_extraction_source_does_not_call_copy_read_helpers(self) -> None:
@@ -258,6 +355,35 @@ class BackgroundLoginTests(unittest.TestCase):
 
         browser.close.assert_called_once()
         playwright.stop.assert_not_called()
+
+    def test_background_playwright_is_not_reused_across_worker_threads(self) -> None:
+        created: list[mock.Mock] = []
+
+        class FakeStarter:
+            def start(self):
+                playwright = mock.Mock(name=f"playwright-{len(created) + 1}")
+                created.append(playwright)
+                return playwright
+
+        fake_playwright_package = types.ModuleType("playwright")
+        fake_sync_api = types.ModuleType("playwright.sync_api")
+        fake_sync_api.sync_playwright = lambda: FakeStarter()  # type: ignore[attr-defined]
+
+        background_login_module._BACKGROUND_PLAYWRIGHTS_BY_THREAD.clear()
+        self.addCleanup(background_login_module._BACKGROUND_PLAYWRIGHTS_BY_THREAD.clear)
+        with mock.patch.dict(
+            sys.modules,
+            {"playwright": fake_playwright_package, "playwright.sync_api": fake_sync_api},
+        ):
+            with mock.patch("douluo_launcher.background_login.threading.get_ident", return_value=101):
+                first = background_login_module._get_background_playwright()
+                same_thread = background_login_module._get_background_playwright()
+            with mock.patch("douluo_launcher.background_login.threading.get_ident", return_value=202):
+                second = background_login_module._get_background_playwright()
+
+        self.assertIs(first, same_thread)
+        self.assertIsNot(first, second)
+        self.assertEqual(len(created), 2)
 
     def test_missing_cv2_dependency_reports_32bit_install_command(self) -> None:
         def fake_import(module_name: str):
@@ -318,7 +444,7 @@ class BackgroundLoginTests(unittest.TestCase):
         runner._helper._ocr_passport_from_text_region.assert_not_called()
         runner._open_formal_game_page.assert_not_called()
 
-    def test_background_single_runner_uses_required_status_labels_and_keeps_success_window(self) -> None:
+    def test_background_single_runner_requires_final_verification_before_success(self) -> None:
         account = AccountConfig("第一层", 1, 1, "https://example.com")
         statuses: list[str] = []
         closed = {"value": False}
@@ -359,6 +485,71 @@ class BackgroundLoginTests(unittest.TestCase):
         runner._open_passport_dialog = mock.Mock(return_value=Image.new("RGB", (80, 80), "white"))  # type: ignore[method-assign]
         runner._input_passport_background = mock.Mock(return_value=Image.new("RGB", (80, 80), "white"))  # type: ignore[method-assign]
         runner._click_confirm_background = mock.Mock(return_value=True)  # type: ignore[method-assign]
+        runner._verify_background_login_success = mock.Mock(return_value=(False, "未检测到 logged_in 证据"))  # type: ignore[attr-defined]
+        runner._save_latest_success_artifacts = mock.Mock()  # type: ignore[attr-defined]
+
+        with mock.patch(
+            "douluo_launcher.background_login.extract_passport_from_login_image",
+            return_value=PassportOcrResult(
+                passport="fd829a15",
+                raw_output="",
+                text_region_box=(10, 528, 758, 1046),
+                evidence_source="red_bar_box",
+                evidence_votes=3,
+            ),
+        ) as ocr:
+            result = runner.run()
+
+        self.assertFalse(result)
+        self.assertEqual(getattr(result, "status", ""), "failed")
+        self.assertFalse(getattr(result, "final_verified", True))
+        self.assertTrue(closed["value"])
+        self.assertIn("失败", statuses)
+        runner._save_latest_success_artifacts.assert_not_called()
+        ocr.assert_called_once()
+
+    def test_background_single_runner_closes_success_browser_by_default(self) -> None:
+        account = AccountConfig("第一层", 1, 1, "https://example.com")
+        statuses: list[str] = []
+        closed = {"value": False}
+
+        class FakeSession:
+            hwnd = 8765
+
+            def close(self) -> None:
+                closed["value"] = True
+
+        class FakeOperator:
+            uses_global_mouse = False
+            uses_global_keyboard = False
+            calls_set_foreground_window = False
+
+            def screenshot(self, _hwnd: int):
+                return Image.new("RGB", (80, 80), "white")
+
+        runner = BackgroundSingleAccountRunner(
+            account,
+            AutomationSettings(),
+            threading.Event(),
+            log=lambda _message: None,
+            update_status=lambda _account, status: statuses.append(status),
+            operator=FakeOperator(),  # type: ignore[arg-type]
+        )
+        snapshot = _LoginWindowSnapshot(
+            hwnd=100,
+            title="斗罗大陆H5-1号",
+            image=Image.new("RGB", (80, 80), "white"),
+            raw_path=Path("debug_background") / "login.png",
+            state="qr_page",
+            metrics={"qr_page_evidence": True},
+        )
+        runner._capture_login_window_background = mock.Mock(return_value=snapshot)  # type: ignore[method-assign]
+        runner._open_formal_game_page = mock.Mock(return_value=FakeSession())  # type: ignore[method-assign]
+        runner._close_blocking_overlay = mock.Mock(return_value=(True, Image.new("RGB", (80, 80), "white")))  # type: ignore[method-assign]
+        runner._open_passport_dialog = mock.Mock(return_value=Image.new("RGB", (80, 80), "white"))  # type: ignore[method-assign]
+        runner._input_passport_background = mock.Mock(return_value=Image.new("RGB", (80, 80), "white"))  # type: ignore[method-assign]
+        runner._click_confirm_background = mock.Mock(return_value=True)  # type: ignore[method-assign]
+        runner._verify_background_login_success = mock.Mock(return_value=(True, "正式页检测到游戏界面"))  # type: ignore[attr-defined]
         runner._save_latest_success_artifacts = mock.Mock()  # type: ignore[attr-defined]
 
         with mock.patch(
@@ -374,7 +565,9 @@ class BackgroundLoginTests(unittest.TestCase):
             result = runner.run()
 
         self.assertTrue(result)
-        self.assertFalse(closed["value"])
+        self.assertEqual(getattr(result, "status", ""), "success")
+        self.assertTrue(getattr(result, "final_verified", False))
+        self.assertTrue(closed["value"])
         self.assertEqual(
             statuses,
             [
@@ -393,6 +586,61 @@ class BackgroundLoginTests(unittest.TestCase):
         runner._input_passport_background.assert_called_once()
         self.assertEqual(runner._input_passport_background.call_args.args[2], "fd829a15")
         runner._save_latest_success_artifacts.assert_called_once()
+
+    def test_background_single_runner_can_keep_verified_success_browser_when_configured(self) -> None:
+        account = AccountConfig("第一层", 1, 1, "https://example.com")
+        closed = {"value": False}
+        settings = AutomationSettings(background_keep_success_browser=True)
+
+        class FakeSession:
+            hwnd = 8765
+
+            def close(self) -> None:
+                closed["value"] = True
+
+        class FakeOperator:
+            uses_global_mouse = False
+            uses_global_keyboard = False
+            calls_set_foreground_window = False
+
+            def screenshot(self, _hwnd: int):
+                return Image.new("RGB", (80, 80), "white")
+
+        runner = BackgroundSingleAccountRunner(
+            account,
+            settings,
+            threading.Event(),
+            log=lambda _message: None,
+            update_status=lambda _account, _status: None,
+            operator=FakeOperator(),  # type: ignore[arg-type]
+        )
+        snapshot = _LoginWindowSnapshot(
+            hwnd=100,
+            title="斗罗大陆H5-1号",
+            image=Image.new("RGB", (80, 80), "white"),
+            raw_path=Path("debug_background") / "login.png",
+            state="qr_page",
+            metrics={"qr_page_evidence": True},
+        )
+        runner._capture_login_window_background = mock.Mock(return_value=snapshot)  # type: ignore[method-assign]
+        runner._open_formal_game_page = mock.Mock(return_value=FakeSession())  # type: ignore[method-assign]
+        runner._close_blocking_overlay = mock.Mock(return_value=(True, Image.new("RGB", (80, 80), "white")))  # type: ignore[method-assign]
+        runner._open_passport_dialog = mock.Mock(return_value=Image.new("RGB", (80, 80), "white"))  # type: ignore[method-assign]
+        runner._input_passport_background = mock.Mock(return_value=Image.new("RGB", (80, 80), "white"))  # type: ignore[method-assign]
+        runner._click_confirm_background = mock.Mock(return_value=True)  # type: ignore[method-assign]
+        runner._verify_background_login_success = mock.Mock(return_value=(True, "正式页检测到游戏界面"))  # type: ignore[attr-defined]
+        runner._save_latest_success_artifacts = mock.Mock()  # type: ignore[attr-defined]
+
+        with mock.patch(
+            "douluo_launcher.background_login.extract_passport_from_login_image",
+            return_value=PassportOcrResult(passport="fd829a15", raw_output="", text_region_box=None),
+        ):
+            result = runner.run()
+
+        self.assertTrue(result)
+        self.assertEqual(getattr(result, "status", ""), "success")
+        self.assertTrue(getattr(result, "final_verified", False))
+        self.assertFalse(closed["value"])
 
     def test_qr_page_does_not_skip_ocr(self) -> None:
         account = AccountConfig("第一层", 1, 1, "https://example.com")

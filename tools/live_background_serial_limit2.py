@@ -354,7 +354,7 @@ def run_background_serial_limit2(
                 "uses_global_keyboard": bool(operator.uses_global_keyboard),
                 "calls_set_foreground_window": bool(operator.calls_set_foreground_window),
             },
-            "success_windows_preserved": True,
+            "success_windows_preserved": bool(getattr(settings, "background_keep_success_browser", False)),
             "log_path": str(log_path),
         }
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")

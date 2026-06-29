@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from douluo_launcher.config import AccountConfig
-from douluo_launcher.background_login import BackgroundDependencyCheck
+from douluo_launcher.background_login import BackgroundDependencyCheck, BackgroundLoginResult
 from douluo_launcher.gui import (
     ACCOUNT_TABLE_COLUMN_INDEX,
     ACCOUNT_TABLE_COLUMNS,
@@ -16,6 +16,8 @@ from douluo_launcher.gui import (
     GUI_MIN_HEIGHT,
     GUI_MIN_WIDTH,
     LOG_PANEL_MIN_HEIGHT,
+    LOG_PANEL_COLLAPSED_HEIGHT,
+    LOG_PANEL_EXPANDED_HEIGHT,
     LOG_TEXT_VISIBLE_LINES,
     _account_table_values,
     _allowed_level_values_for_accounts,
@@ -343,6 +345,49 @@ class GuiGroupSettingsTests(unittest.TestCase):
         self.assertIn((3, "已停止"), fake.statuses)
         self.assertTrue(any("后台串行已停止。" in line for line in fake.logs))
 
+    def test_background_serial_worker_does_not_count_unverified_result_as_success(self) -> None:
+        accounts = [AccountConfig("第一层", 1, 1, "https://example.com/l1", include_in_all=True)]
+
+        class FakeRunner:
+            def __init__(self, account, settings, stop_event, log, update_status, passport_found):
+                self.account = account
+                self.update_status = update_status
+
+            def run(self) -> BackgroundLoginResult:
+                self.update_status(self.account, "失败")
+                return BackgroundLoginResult(
+                    status="failed",
+                    success=False,
+                    reason="final verification failed",
+                    final_verified=False,
+                )
+
+        fake = SimpleNamespace(
+            stop_event=SimpleNamespace(is_set=lambda: False),
+            ui_queue=SimpleNamespace(put=lambda _item: None),
+            timing_by_key={},
+            statuses=[],
+            logs=[],
+            file_logs=[],
+            bars=[],
+            _log_file=None,
+            _log_file_path=None,
+        )
+        fake._queue_status = lambda account, status: fake.statuses.append((account.game_window_no, status))
+        fake._queue_passport = lambda account, passport: None
+        fake._queue_timing = lambda account, seconds: None
+        fake._queue_log = lambda message: fake.logs.append(message)
+        fake._queue_log_file = lambda message: fake.file_logs.append(message)
+        fake._update_status_bar = lambda message: fake.bars.append(message)
+        fake._write_file_log = lambda message: fake.file_logs.append(message)
+
+        with mock.patch("douluo_launcher.gui.BackgroundSingleAccountRunner", FakeRunner):
+            LauncherApp._background_serial_worker(fake, accounts, object(), "后台当前层串行")
+
+        self.assertIn((1, "失败"), fake.statuses)
+        self.assertTrue(any("窗口1：失败" in line for line in fake.logs))
+        self.assertTrue(any("成功0，跳过0，失败1" in line for line in fake.logs))
+
     def test_background_serial_source_does_not_use_foreground_or_global_input(self) -> None:
         source = inspect.getsource(LauncherApp._background_serial_worker)
 
@@ -503,19 +548,31 @@ class GuiGroupSettingsTests(unittest.TestCase):
         self.assertIn("GUI_DEFAULT_HEIGHT", source)
         self.assertIn("self.minsize(GUI_MIN_WIDTH, GUI_MIN_HEIGHT)", source)
 
-    def test_log_panel_keeps_minimum_height_and_visible_lines(self) -> None:
+    def test_log_panel_defaults_to_collapsed_toolbar_height(self) -> None:
         self.assertEqual(LOG_TEXT_VISIBLE_LINES, 8)
-        self.assertGreaterEqual(LOG_PANEL_MIN_HEIGHT, 160)
+        self.assertEqual(LOG_PANEL_COLLAPSED_HEIGHT, 42)
+        self.assertGreaterEqual(LOG_PANEL_EXPANDED_HEIGHT, 120)
+        self.assertLessEqual(LOG_PANEL_EXPANDED_HEIGHT, 170)
+        self.assertEqual(LOG_PANEL_MIN_HEIGHT, LOG_PANEL_EXPANDED_HEIGHT)
         source = inspect.getsource(LauncherApp._build_widgets)
 
-        self.assertIn("self._log_outer.configure(height=LOG_PANEL_MIN_HEIGHT)", source)
-        self.assertIn("self._log_outer.pack_propagate(False)", source)
+        self.assertIn("self._content_area.rowconfigure(0, weight=1)", source)
+        self.assertIn("self._content_area.rowconfigure(1, weight=0, minsize=LOG_PANEL_COLLAPSED_HEIGHT)", source)
+        self.assertIn("self._table_frame_m1.grid(row=0", source)
+        self.assertIn("self._log_outer.grid(row=1", source)
+        self.assertIn("self.log_panel_expanded = tk.BooleanVar(value=False)", source)
+        self.assertIn("self._log_outer.configure(height=LOG_PANEL_COLLAPSED_HEIGHT)", source)
+        self.assertIn("self._log_outer.grid_propagate(False)", source)
+        self.assertIn("self._log_outer.rowconfigure(1, weight=1)", source)
+        self.assertIn("self._log_text_frame.grid(row=1", source)
+        self.assertIn("self._sync_log_panel_visibility()", source)
         self.assertIn("height=LOG_TEXT_VISIBLE_LINES", source)
 
     def test_log_directory_button_stays_in_log_header_right_side(self) -> None:
         source = inspect.getsource(LauncherApp._build_widgets)
 
         self.assertIn('text="打开日志目录"', source)
+        self.assertIn('text="展开日志"', source)
         self.assertIn("pack(side=tk.RIGHT", source)
 
     def test_log_append_scrolls_to_bottom(self) -> None:
@@ -523,6 +580,97 @@ class GuiGroupSettingsTests(unittest.TestCase):
 
         self.assertIn("self.log_text.insert(tk.END", source)
         self.assertIn("self.log_text.see(tk.END)", source)
+
+    def test_log_panel_toggle_switches_body_and_height_without_clearing_text(self) -> None:
+        class BoolVar:
+            def __init__(self) -> None:
+                self.value = False
+
+            def get(self) -> bool:
+                return self.value
+
+            def set(self, value: bool) -> None:
+                self.value = bool(value)
+
+        class FakeContentArea:
+            def __init__(self) -> None:
+                self.row_heights: list[int] = []
+
+            def rowconfigure(self, _row: int, **kwargs) -> None:
+                self.row_heights.append(int(kwargs["minsize"]))
+
+        class FakeOuter:
+            def __init__(self) -> None:
+                self.heights: list[int] = []
+
+            def configure(self, **kwargs) -> None:
+                self.heights.append(int(kwargs["height"]))
+
+        class FakeFrame:
+            def __init__(self) -> None:
+                self.visible = True
+                self.grid_calls = 0
+                self.remove_calls = 0
+
+            def grid(self, **_kwargs) -> None:
+                self.visible = True
+                self.grid_calls += 1
+
+            def grid_remove(self) -> None:
+                self.visible = False
+                self.remove_calls += 1
+
+        class FakeButton:
+            def __init__(self) -> None:
+                self.texts: list[str] = []
+
+            def configure(self, **kwargs) -> None:
+                self.texts.append(str(kwargs["text"]))
+
+        class FakeLogText:
+            def __init__(self) -> None:
+                self.lines: list[str] = []
+                self.see_calls = 0
+
+            def insert(self, _where, text: str) -> None:
+                self.lines.append(text)
+
+            def see(self, _where) -> None:
+                self.see_calls += 1
+
+        fake = SimpleNamespace(
+            log_panel_expanded=BoolVar(),
+            _content_area=FakeContentArea(),
+            _log_outer=FakeOuter(),
+            _log_text_frame=FakeFrame(),
+            log_toggle_btn=FakeButton(),
+            log_text=FakeLogText(),
+            written=[],
+        )
+        fake._write_file_log = lambda message: fake.written.append(message)
+        fake._sync_log_panel_visibility = lambda: LauncherApp._sync_log_panel_visibility(fake)
+
+        LauncherApp._sync_log_panel_visibility(fake)
+        self.assertFalse(fake._log_text_frame.visible)
+        self.assertEqual(fake._content_area.row_heights[-1], LOG_PANEL_COLLAPSED_HEIGHT)
+        self.assertEqual(fake._log_outer.heights[-1], LOG_PANEL_COLLAPSED_HEIGHT)
+        self.assertEqual(fake.log_toggle_btn.texts[-1], "展开日志")
+
+        LauncherApp._log(fake, "hidden line")
+        self.assertEqual(fake.log_text.lines, ["hidden line\n"])
+        self.assertEqual(fake.log_text.see_calls, 1)
+
+        LauncherApp._toggle_log_panel(fake)
+        self.assertTrue(fake._log_text_frame.visible)
+        self.assertEqual(fake._content_area.row_heights[-1], LOG_PANEL_EXPANDED_HEIGHT)
+        self.assertEqual(fake._log_outer.heights[-1], LOG_PANEL_EXPANDED_HEIGHT)
+        self.assertEqual(fake.log_toggle_btn.texts[-1], "收起日志")
+        self.assertEqual(fake.log_text.lines, ["hidden line\n"])
+
+        LauncherApp._toggle_log_panel(fake)
+        self.assertFalse(fake._log_text_frame.visible)
+        self.assertEqual(fake._content_area.row_heights[-1], LOG_PANEL_COLLAPSED_HEIGHT)
+        self.assertEqual(fake.log_toggle_btn.texts[-1], "展开日志")
 
     def test_account_table_values_match_declared_column_order(self) -> None:
         account = AccountConfig(

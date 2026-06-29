@@ -182,6 +182,7 @@ class AutomationSettings:
     qr_variance_min: float = 2500.0
     logged_in_black_ratio_max: float = 0.28
     logged_in_edge_density_max: float = 0.60
+    background_keep_success_browser: bool = False
 
 
 def compute_game_window_no(

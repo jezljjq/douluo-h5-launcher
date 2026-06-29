@@ -134,7 +134,7 @@ def render_background_capability_markdown(report: BackgroundCapabilityReport | N
             "",
             "实验说明：项目已新增后台登录模式框架和 `tools/background_operator_probe.py` 探针脚本。"
             "探针已验证后台截图、点击、输入真实生效；后台模式已接入方式一单账号、当前层串行、全部串行（并发=1）。",
-            "后台 WM_GETTEXT、UIA、后台复制和剪贴板 marker 链路已真实验证失败并废弃；后台通行证提取直接使用 red_bar_box 局部 OCR 多证据主路径。",
+            "后台 WM_GETTEXT、UIA、后台复制和剪贴板 marker 链路已真实验证失败并废弃；后台通行证提取使用后台截图进入前台同款 OCR 兜底链，red_bar_box 仅作为受 QR 几何约束的增强证据。",
             "前台辅助模式仍保持复制优先、OCR 兜底。",
             "",
             "结论：默认稳定流程仍是前台辅助模式；后台登录模式当前支持方式一单账号、当前层串行、全部串行，"

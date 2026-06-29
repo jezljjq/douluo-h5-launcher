@@ -46,15 +46,16 @@ class AutomationHelperTests(unittest.TestCase):
         self.assertEqual(extract_hex_passport("foo 8598a293 bar"), "8598a293")
         self.assertEqual(extract_hex_passport("8598 a293"), "8598a293")
 
-    def test_background_login_image_ocr_failure_saves_red_bar_artifacts_without_fallbacks(self) -> None:
+    def test_background_login_image_ocr_failure_saves_shared_chain_artifacts(self) -> None:
         runner = self._make_runner()
-        runner._ocr_passport_from_text_region = self._forbidden_background_ocr_call("text_region")  # type: ignore[method-assign]
-        runner._ocr_passport_by_template_match = self._forbidden_background_ocr_call("template")  # type: ignore[method-assign]
-        runner._ocr_passport_from_login_image = self._forbidden_background_ocr_call("full_image")  # type: ignore[method-assign]
-        runner._ocr_passport_from_red_bar_region = lambda *_args, **_kwargs: automation_module.RedBarLocalOcrResult(  # type: ignore[method-assign]
+        calls: list[str] = []
+        runner._ocr_passport_from_text_region = lambda *_args, **_kwargs: calls.append("text_region") or None  # type: ignore[method-assign]
+        runner._ocr_passport_by_template_match = lambda *_args, **_kwargs: calls.append("template") or None  # type: ignore[method-assign]
+        runner._ocr_passport_from_login_image = lambda *_args, **_kwargs: calls.append("full_image") or None  # type: ignore[method-assign]
+        runner._ocr_passport_from_red_bar_region = lambda *_args, **_kwargs: calls.append("red_bar") or automation_module.RedBarLocalOcrResult(  # type: ignore[method-assign]
             passport=None,
-            red_bar_box=(46, 885, 721, 950),
-            local_box=(400, 900, 520, 940),
+            red_bar_box=(46, 560, 721, 625),
+            local_box=(400, 575, 520, 615),
             candidates={},
             accepted=False,
             reject_reason="RED_BAR_OCR_LOW_CONFIDENCE",
@@ -78,7 +79,7 @@ class AutomationHelperTests(unittest.TestCase):
                     "login_page_state": "qr_page",
                     "qr_box": None,
                     "fallback_qr_box": (243, 199, 578, 534),
-                    "red_bar_box": (46, 885, 721, 950),
+                    "red_bar_box": (46, 560, 721, 625),
                 },
                 save_failure_artifacts=True,
             )
@@ -89,14 +90,14 @@ class AutomationHelperTests(unittest.TestCase):
             self.assertTrue((debug_dir / "latest_passport_extract_red_bar_crop.png").exists())
             self.assertTrue((debug_dir / "latest_passport_extract_red_bar_preprocessed.png").exists())
             self.assertTrue((debug_dir / "latest_passport_extract_raw.txt").exists())
-            self.assertFalse((debug_dir / "latest_ocr_input.png").exists())
             context = json.loads((debug_dir / "latest_passport_extract_context.json").read_text(encoding="utf-8"))
 
+        self.assertEqual(calls, ["text_region", "red_bar", "template", "full_image"])
         self.assertEqual(context["hwnd"], 71756)
         self.assertEqual(context["title"], "斗罗大陆H5-1号")
         self.assertEqual(context["image_size"], [768, 1056])
         self.assertEqual(context["login_page_state"], "qr_page")
-        self.assertEqual(context["red_bar_box"], [46, 885, 721, 950])
+        self.assertEqual(context["red_bar_box"], [46, 560, 721, 625])
         self.assertEqual(context["failure_reason"], "RED_BAR_OCR_LOW_CONFIDENCE")
 
     @staticmethod
@@ -126,20 +127,20 @@ class AutomationHelperTests(unittest.TestCase):
         self.assertEqual(result.passport, "d40786fa")
         self.assertEqual(calls, ["text_region", "template", "full_image"])
 
-    def test_background_login_image_ocr_uses_only_red_bar_local_evidence(self) -> None:
+    def test_background_login_image_ocr_uses_shared_foreground_fallback_chain(self) -> None:
         runner = self._make_runner()
         calls: list[str] = []
-        runner._ocr_passport_from_text_region = self._forbidden_background_ocr_call("text_region")  # type: ignore[method-assign]
-        runner._ocr_passport_by_template_match = self._forbidden_background_ocr_call("template")  # type: ignore[method-assign]
-        runner._ocr_passport_from_login_image = self._forbidden_background_ocr_call("full_image")  # type: ignore[method-assign]
+        runner._ocr_passport_from_text_region = lambda *_args, **_kwargs: calls.append("text_region") or None  # type: ignore[method-assign]
+        runner._ocr_passport_by_template_match = lambda *_args, **_kwargs: calls.append("template") or None  # type: ignore[method-assign]
+        runner._ocr_passport_from_login_image = lambda *_args, **_kwargs: calls.append("full_image") or "D40786FA"  # type: ignore[method-assign]
         runner._ocr_passport_from_red_bar_region = lambda *_args, **_kwargs: calls.append("red_bar") or automation_module.RedBarLocalOcrResult(  # type: ignore[method-assign]
-            passport="d40786fa",
+            passport=None,
             red_bar_box=(100, 200, 900, 300),
             local_box=(500, 215, 676, 295),
-            candidates={"d40786fa": 3},
+            candidates={},
             variants=(),
-            accepted=True,
-            reject_reason="",
+            accepted=False,
+            reject_reason="RED_BAR_OCR_LOW_CONFIDENCE",
         )
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -154,9 +155,99 @@ class AutomationHelperTests(unittest.TestCase):
             )
 
         self.assertEqual(result.passport, "d40786fa")
+        self.assertEqual(result.evidence_source, "full_image")
+        self.assertEqual(calls, ["text_region", "red_bar", "template", "full_image"])
+
+    def test_background_login_image_ocr_rejects_red_bar_far_from_qr_box(self) -> None:
+        runner = self._make_runner()
+        calls: list[str] = []
+        runner._ocr_passport_from_text_region = lambda *_args, **_kwargs: calls.append("text_region") or None  # type: ignore[method-assign]
+        runner._ocr_passport_from_red_bar_region = lambda *_args, **_kwargs: calls.append("red_bar") or automation_module.RedBarLocalOcrResult(  # type: ignore[method-assign]
+            passport="badc0de0",
+            red_bar_box=(46, 885, 721, 950),
+            candidates={"badc0de0": 3},
+            accepted=True,
+        )
+        runner._ocr_passport_by_template_match = lambda *_args, **_kwargs: calls.append("template") or None  # type: ignore[method-assign]
+        runner._ocr_passport_from_login_image = lambda *_args, **_kwargs: calls.append("full_image") or "D40786FA"  # type: ignore[method-assign]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = extract_passport_from_login_image(
+                Image.new("RGB", (768, 1056), "white"),
+                runner=runner,
+                window_index=1,
+                debug_dir=Path(temp_dir),
+                mode="background",
+                raw_path=Path(temp_dir) / "source.png",
+                login_context={
+                    "qr_box": (243, 199, 578, 534),
+                    "red_bar_box": (46, 885, 721, 950),
+                },
+            )
+
+        self.assertEqual(result.passport, "d40786fa")
+        self.assertEqual(result.evidence_source, "full_image")
+        self.assertEqual(calls, ["text_region", "template", "full_image"])
+
+    def test_background_login_image_ocr_does_not_let_weak_fallback_qr_veto_red_bar(self) -> None:
+        runner = self._make_runner()
+        calls: list[str] = []
+        runner._ocr_passport_from_text_region = lambda *_args, **_kwargs: calls.append("text_region") or None  # type: ignore[method-assign]
+        runner._ocr_passport_from_red_bar_region = lambda *_args, **_kwargs: calls.append("red_bar") or automation_module.RedBarLocalOcrResult(  # type: ignore[method-assign]
+            passport="d534d958",
+            red_bar_box=(46, 885, 721, 950),
+            candidates={"d534d958": 3},
+            accepted=True,
+        )
+        runner._ocr_passport_from_login_image = lambda *_args, **_kwargs: calls.append("full_image") or "d534d958"  # type: ignore[method-assign]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = extract_passport_from_login_image(
+                Image.new("RGB", (768, 1056), "white"),
+                runner=runner,
+                window_index=2,
+                debug_dir=Path(temp_dir),
+                mode="background",
+                raw_path=Path(temp_dir) / "source.png",
+                login_context={
+                    "fallback_qr_box": (243, 199, 578, 534),
+                    "red_bar_box": (46, 885, 721, 950),
+                },
+            )
+
+        self.assertEqual(result.passport, "d534d958")
         self.assertEqual(result.evidence_source, "red_bar_box")
-        self.assertEqual(result.evidence_votes, 3)
-        self.assertEqual(calls, ["red_bar"])
+        self.assertEqual(calls, ["text_region", "red_bar", "full_image"])
+
+    def test_background_login_image_ocr_accepts_landscape_red_bar_near_qr_box(self) -> None:
+        runner = self._make_runner()
+        calls: list[str] = []
+        runner._ocr_passport_from_text_region = lambda *_args, **_kwargs: calls.append("text_region") or None  # type: ignore[method-assign]
+        runner._ocr_passport_from_red_bar_region = lambda *_args, **_kwargs: calls.append("red_bar") or automation_module.RedBarLocalOcrResult(  # type: ignore[method-assign]
+            passport="e005be02",
+            red_bar_box=(58, 511, 917, 573),
+            candidates={"e005be02": 3},
+            accepted=True,
+        )
+        runner._ocr_passport_from_login_image = lambda *_args, **_kwargs: calls.append("full_image") or None  # type: ignore[method-assign]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = extract_passport_from_login_image(
+                Image.new("RGB", (976, 639), "white"),
+                runner=runner,
+                window_index=1,
+                debug_dir=Path(temp_dir),
+                mode="background",
+                raw_path=Path(temp_dir) / "source.png",
+                login_context={
+                    "fallback_qr_box": (367, 153, 602, 388),
+                    "red_bar_box": (58, 511, 917, 573),
+                },
+            )
+
+        self.assertEqual(result.passport, "e005be02")
+        self.assertEqual(result.evidence_source, "red_bar_box")
+        self.assertEqual(calls, ["text_region", "red_bar", "full_image"])
 
     def test_red_bar_local_box_uses_red_bar_ratios_not_fixed_pixels(self) -> None:
         runner = self._make_runner()
@@ -164,7 +255,26 @@ class AutomationHelperTests(unittest.TestCase):
 
         box = runner._red_bar_local_box(image, (100, 200, 900, 300))
 
-        self.assertEqual(box, (500, 215, 676, 295))
+        self.assertEqual(box, (500, 215, 756, 295))
+
+    def test_red_bar_local_box_keeps_window4_passport_tail_inside_crop(self) -> None:
+        runner = self._make_runner()
+        image = Image.new("RGB", (768, 1056), "white")
+
+        box = runner._red_bar_local_box(image, (46, 885, 721, 950))
+
+        self.assertLessEqual(box[0], 383)
+        self.assertGreaterEqual(box[2], 599)
+        self.assertGreaterEqual(box[2] - box[0], 216)
+
+    def test_red_bar_local_box_keeps_landscape_passport_head_inside_crop(self) -> None:
+        runner = self._make_runner()
+        image = Image.new("RGB", (976, 639), "white")
+
+        box = runner._red_bar_local_box(image, (58, 511, 917, 573))
+
+        self.assertLessEqual(box[0], 487)
+        self.assertGreaterEqual(box[2], 762)
 
     def test_red_bar_local_ocr_accepts_multi_vote_candidate(self) -> None:
         runner = self._make_runner()
@@ -258,7 +368,7 @@ class AutomationHelperTests(unittest.TestCase):
             self.assertTrue((debug_dir / "latest_passport_extract_red_bar_preprocessed.png").exists())
             self.assertTrue((debug_dir / "latest_passport_extract_raw.txt").exists())
             self.assertEqual(context["red_bar_box"], [100, 200, 900, 300])
-            self.assertEqual(context["red_bar_local_box"], [500, 215, 676, 295])
+            self.assertEqual(context["red_bar_local_box"], [500, 215, 756, 295])
             self.assertFalse(candidates["accepted"])
             self.assertEqual(candidates["reject_reason"], "RED_BAR_OCR_LOW_CONFIDENCE")
 
@@ -293,6 +403,23 @@ class AutomationHelperTests(unittest.TestCase):
         self.assertIsNone(failure)
         self.assertIsNone(rejected)
         self.assertEqual(rejected_failure, "OCR_LOW_CONFIDENCE")
+
+    def test_full_image_candidate_can_break_red_bar_conflict_when_supported_by_allowed_candidates(self) -> None:
+        runner = self._make_runner()
+
+        accepted, failure = runner._decide_ocr_candidate(
+            "全图",
+            {
+                "a3b44c0b": 5,
+                "cc23d1d1": 1,
+                "1e1e1111": 1,
+                "23b44c0b": 1,
+            },
+            allowed_candidates={"a3b44c0b", "adb44c0b"},
+        )
+
+        self.assertEqual(accepted, "a3b44c0b")
+        self.assertIsNone(failure)
 
     def test_repairs_packaged_playwright_browser_path(self) -> None:
         bad_path = r"D:\app\_internal\playwright\driver\package\.local-browsers"

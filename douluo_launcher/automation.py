@@ -346,6 +346,56 @@ def _save_passport_extract_artifacts(
     )
 
 
+def _normalize_ocr_box(box: object) -> tuple[int, int, int, int] | None:
+    if box is None:
+        return None
+    try:
+        values = tuple(int(value) for value in box)  # type: ignore[arg-type]
+    except Exception:
+        return None
+    if len(values) != 4:
+        return None
+    left, top, right, bottom = values
+    if right <= left or bottom <= top:
+        return None
+    return left, top, right, bottom
+
+
+def _red_bar_box_matches_qr_context(
+    image,
+    red_bar_box: object,
+    context: dict[str, object],
+) -> tuple[int, int, int, int] | None:
+    bar = _normalize_ocr_box(red_bar_box)
+    if bar is None:
+        return None
+
+    image_width, image_height = image.size
+    left, top, right, bottom = bar
+    if left < 0 or top < 0 or right > image_width or bottom > image_height:
+        return None
+
+    qr_box = _normalize_ocr_box(context.get("qr_box"))
+    if qr_box is None:
+        return bar
+
+    qr_left, qr_top, qr_right, qr_bottom = qr_box
+    qr_height = max(1, qr_bottom - qr_top)
+    max_gap = max(64, int(image_height * 0.25), int(qr_height * 0.65))
+    if top > qr_bottom + max_gap:
+        return None
+    if bottom < qr_top:
+        return None
+
+    overlap_left = max(left, qr_left)
+    overlap_right = min(right, qr_right)
+    overlap_width = max(0, overlap_right - overlap_left)
+    qr_width = max(1, qr_right - qr_left)
+    if overlap_width / qr_width < 0.2:
+        return None
+    return bar
+
+
 def extract_passport_from_login_image(
     raw_image,
     *,
@@ -363,35 +413,21 @@ def extract_passport_from_login_image(
     prefix = Path(raw_path).stem if raw_path is not None else f"{mode}_win{window_index}_{time.strftime('%Y%m%d_%H%M%S')}"
     effective_raw_path = Path(raw_path) if raw_path is not None else debug_dir / f"{prefix}_input.png"
     context = dict(login_context or {})
-    red_bar_box = context.get("red_bar_box") or context.get("passport_bar_box")
+    original_red_bar_box = context.get("red_bar_box") or context.get("passport_bar_box")
+    red_bar_box = _red_bar_box_matches_qr_context(raw_image, original_red_bar_box, context)
+    if original_red_bar_box and red_bar_box is None:
+        context["rejected_red_bar_box"] = original_red_bar_box
+        context["red_bar_reject_reason"] = "RED_BAR_QR_GEOMETRY_MISMATCH"
     red_bar_result: RedBarLocalOcrResult | None = None
     failure_reason = "passport_hex_not_found"
     evidence_source = ""
     evidence_votes = 0
 
-    if mode == "background":
-        passport = None
-        if red_bar_box:
-            red_bar_result = runner._ocr_passport_from_red_bar_region(  # type: ignore[attr-defined]
-                raw_image,
-                red_bar_box,
-                prefix,
-                debug_dir,
-            )
-            if red_bar_result.passport:
-                passport = red_bar_result.passport
-                evidence_source = "red_bar_box"
-                evidence_votes = int(red_bar_result.candidates.get(passport, 0))
-            else:
-                failure_reason = red_bar_result.reject_reason or "red_bar_ocr_failed"
-        else:
-            failure_reason = "red_bar_box_missing"
-    else:
-        passport = runner._ocr_passport_from_text_region(raw_image, prefix, effective_raw_path)  # type: ignore[attr-defined]
-        if passport:
-            evidence_source = "text_region"
+    passport = runner._ocr_passport_from_text_region(raw_image, prefix, effective_raw_path)  # type: ignore[attr-defined]
+    if passport:
+        evidence_source = "text_region"
 
-    if mode != "background" and not passport and red_bar_box:
+    if not passport and red_bar_box:
         red_bar_result = runner._ocr_passport_from_red_bar_region(  # type: ignore[attr-defined]
             raw_image,
             red_bar_box,
@@ -412,12 +448,23 @@ def extract_passport_from_login_image(
                 passport = red_bar_result.passport
                 evidence_source = "red_bar_box"
                 evidence_votes = int(red_bar_result.candidates.get(passport, 0))
-    if mode != "background" and not passport:
+        else:
+            failure_reason = red_bar_result.reject_reason or "red_bar_ocr_failed"
+    elif not passport and original_red_bar_box:
+        failure_reason = "RED_BAR_QR_GEOMETRY_MISMATCH"
+
+    if not passport:
         passport = runner._ocr_passport_by_template_match(raw_image)  # type: ignore[attr-defined]
         if passport:
             evidence_source = "template_match"
-    if mode != "background" and not passport:
-        passport = runner._ocr_passport_from_login_image(raw_image, prefix, effective_raw_path)  # type: ignore[attr-defined]
+    if not passport:
+        allowed_candidates = set((red_bar_result.candidates or {}).keys()) if red_bar_result else None
+        passport = runner._ocr_passport_from_login_image(  # type: ignore[attr-defined]
+            raw_image,
+            prefix,
+            effective_raw_path,
+            allowed_candidates=allowed_candidates,
+        )
         if passport:
             evidence_source = "full_image"
 
@@ -444,28 +491,6 @@ def extract_passport_from_login_image(
                 evidence_votes=result.evidence_votes,
             )
         return result
-
-    if mode == "background":
-        if save_failure_artifacts or save_debug_artifacts:
-            _save_passport_extract_artifacts(
-                raw_image,
-                debug_dir=debug_dir,
-                context=context,
-                red_bar_result=red_bar_result,
-                failure_reason=failure_reason,
-            )
-            return PassportOcrResult(
-                passport=None,
-                raw_output=red_bar_result.raw_output if red_bar_result else "",
-                context_path=debug_dir / "latest_passport_extract_context.json",
-                failure_reason=failure_reason,
-                evidence_source="red_bar_box",
-            )
-        return PassportOcrResult(
-            passport=None,
-            failure_reason=failure_reason,
-            evidence_source="red_bar_box",
-        )
 
     if save_failure_artifacts or save_debug_artifacts:
         artifacts = _save_passport_ocr_artifacts(
@@ -2538,7 +2563,7 @@ class AccountRunner:
         bar_height = max(1, bottom - top)
 
         local_left = left + int(bar_width * 0.50)
-        local_right = left + int(bar_width * 0.72)
+        local_right = left + int(bar_width * 0.82)
         local_top = top + int(bar_height * 0.15)
         local_bottom = top + int(bar_height * 0.95)
         local_left = max(left, min(right - 1, local_left))
@@ -2861,7 +2886,13 @@ class AccountRunner:
             return "".join(chars)
         return None
 
-    def _decide_ocr_candidate(self, label: str, results: dict[str, int]) -> tuple[str | None, str | None]:
+    def _decide_ocr_candidate(
+        self,
+        label: str,
+        results: dict[str, int],
+        *,
+        allowed_candidates: set[str] | None = None,
+    ) -> tuple[str | None, str | None]:
         normalized: dict[str, int] = {}
         for candidate, votes in results.items():
             value = (candidate or "").strip().lower()
@@ -2887,6 +2918,16 @@ class AccountRunner:
                 f"[窗口{self.account.game_window_no}] {label} OCR候选票数: "
                 f"{candidate}={votes}/{total_votes}"
             )
+        best, best_votes = ordered[0]
+        second_votes = ordered[1][1] if len(ordered) > 1 else 0
+        allowed = {value.strip().lower() for value in (allowed_candidates or set())}
+        allow_supported_best = (
+            best in allowed
+            and total_votes >= 3
+            and best_votes >= 3
+            and best_votes >= second_votes + 2
+            and best_votes / max(total_votes, 1) >= 0.60
+        )
 
         ambiguous_positions: list[int] = []
         low_confidence_positions: list[int] = []
@@ -2910,6 +2951,15 @@ class AccountRunner:
             )
 
         if ambiguous_positions:
+            if allow_supported_best:
+                positions = ",".join(str(pos) for pos in ambiguous_positions)
+                self.log(
+                    f"[窗口{self.account.game_window_no}] {label} OCR存疑位置: {positions}（弱c/e噪声，red_bar候选交叉支持）"
+                )
+                self.log(
+                    f"[窗口{self.account.game_window_no}] {label} OCR是否接受: 是，结果={best}"
+                )
+                return best, None
             positions = ",".join(str(pos) for pos in ambiguous_positions)
             self.log(f"[窗口{self.account.game_window_no}] {label} OCR存疑位置: {positions}（c/e竞争）")
             self.log(
@@ -2917,7 +2967,6 @@ class AccountRunner:
             )
             return None, "OCR_AMBIGUOUS_CHAR"
 
-        best, best_votes = ordered[0]
         if total_votes < 3:
             self.log(f"[窗口{self.account.game_window_no}] {label} OCR存疑位置: 全部（总票数不足）")
             self.log(
@@ -2926,6 +2975,15 @@ class AccountRunner:
             return None, "OCR_LOW_CONFIDENCE"
 
         if best_votes != total_votes or low_confidence_positions:
+            if allow_supported_best:
+                positions = ",".join(str(pos) for pos in sorted(set(low_confidence_positions))) or "候选不一致"
+                self.log(
+                    f"[窗口{self.account.game_window_no}] {label} OCR存疑位置: {positions}（red_bar候选交叉支持）"
+                )
+                self.log(
+                    f"[窗口{self.account.game_window_no}] {label} OCR是否接受: 是，结果={best}"
+                )
+                return best, None
             positions = ",".join(str(pos) for pos in sorted(set(low_confidence_positions))) or "候选不一致"
             self.log(f"[窗口{self.account.game_window_no}] {label} OCR存疑位置: {positions}")
             self.log(
@@ -2992,7 +3050,14 @@ class AccountRunner:
 
         return best
 
-    def _ocr_passport_from_login_image(self, raw_image, prefix: str, raw_path: Path) -> str | None:
+    def _ocr_passport_from_login_image(
+        self,
+        raw_image,
+        prefix: str,
+        raw_path: Path,
+        *,
+        allowed_candidates: set[str] | None = None,
+    ) -> str | None:
         import numpy as np
         try:
             import pytesseract
@@ -3084,7 +3149,11 @@ class AccountRunner:
             self.log(f"[窗口{self.account.game_window_no}] 全图OCR未能识别到8位hex通行证")
             return None
 
-        best, failure_type = self._decide_ocr_candidate("全图", results)
+        best, failure_type = self._decide_ocr_candidate(
+            "全图",
+            results,
+            allowed_candidates=allowed_candidates,
+        )
         if failure_type:
             self.log(f"[窗口{self.account.game_window_no}] 全图OCR失败类型={failure_type}")
             return None

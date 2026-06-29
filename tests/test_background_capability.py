@@ -45,7 +45,7 @@ class BackgroundCapabilityTests(unittest.TestCase):
         self.assertIn("| 后台点击 | 支持 |", markdown)
         self.assertIn("| 是否会抢鼠标 | 后台否；前台是 |", markdown)
         self.assertIn("后台 WM_GETTEXT、UIA、后台复制和剪贴板 marker 链路已真实验证失败并废弃", markdown)
-        self.assertIn("后台通行证提取直接使用 red_bar_box 局部 OCR 多证据主路径", markdown)
+        self.assertIn("后台通行证提取使用后台截图进入前台同款 OCR 兜底链", markdown)
         self.assertIn("前台辅助模式仍保持复制优先、OCR 兜底", markdown)
 
 

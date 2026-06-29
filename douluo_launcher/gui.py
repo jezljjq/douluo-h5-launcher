@@ -19,7 +19,11 @@ except Exception:
 
 from .automation import AccountRunner
 from .background_capability import build_background_capability_report, write_background_capability_report
-from .background_login import BackgroundSingleAccountRunner, check_background_runtime_dependencies
+from .background_login import (
+    BackgroundSingleAccountRunner,
+    check_background_runtime_dependencies,
+    release_background_playwright_for_current_thread,
+)
 from .config import (
     AccountConfig,
     BookmarkCandidate,
@@ -95,7 +99,9 @@ GUI_DEFAULT_HEIGHT = 820
 GUI_MIN_WIDTH = 1080
 GUI_MIN_HEIGHT = 760
 LOG_TEXT_VISIBLE_LINES = 8
-LOG_PANEL_MIN_HEIGHT = 170
+LOG_PANEL_COLLAPSED_HEIGHT = 42
+LOG_PANEL_EXPANDED_HEIGHT = 150
+LOG_PANEL_MIN_HEIGHT = LOG_PANEL_EXPANDED_HEIGHT
 
 
 def _run_mode_key_from_label(label: str) -> str:
@@ -880,8 +886,14 @@ class LauncherApp(_TK_BASE):
                                    command=self._stop_tasks, font=("", 9, "bold"))
         self.stop_btn.pack(side=tk.LEFT, padx=2)
 
+        self._content_area = ttk.Frame(root)
+        self._content_area.pack(fill=tk.BOTH, expand=True)
+        self._content_area.columnconfigure(0, weight=1)
+        self._content_area.rowconfigure(0, weight=1)
+        self._content_area.rowconfigure(1, weight=0, minsize=LOG_PANEL_COLLAPSED_HEIGHT)
+
         # ===== 4. 账号列表 =====
-        self._table_frame_m1 = ttk.LabelFrame(root, text="账号列表（方式一）", padding=2)
+        self._table_frame_m1 = ttk.LabelFrame(self._content_area, text="账号列表（方式一）", padding=2)
         self.tree = ttk.Treeview(self._table_frame_m1, columns=ACCOUNT_TABLE_COLUMNS, show="headings", height=7)
         for column in ACCOUNT_TABLE_COLUMNS:
             self.tree.heading(column, text=ACCOUNT_TABLE_HEADINGS[column])
@@ -898,7 +910,7 @@ class LauncherApp(_TK_BASE):
         self.tree.tag_configure("skip", foreground="#888888")
 
         # 账号列表（方式二）
-        self._table_frame_m2 = ttk.LabelFrame(root, text="CSV账号列表（方式二）", padding=2)
+        self._table_frame_m2 = ttk.LabelFrame(self._content_area, text="CSV账号列表（方式二）", padding=2)
         csv_columns = ("name", "url", "username", "password_status", "window", "passport", "status", "timing")
         self.csv_tree = ttk.Treeview(self._table_frame_m2, columns=csv_columns, show="headings", height=7)
         self.csv_tree.heading("name", text="名称")
@@ -929,19 +941,31 @@ class LauncherApp(_TK_BASE):
         self.csv_tree.tag_configure("skip", foreground="#888888")
 
         # 初始显示方式一表格
-        self._table_frame_m1.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+        self._table_frame_m1.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
 
         # ===== 5. 日志 =====
-        self._log_outer = ttk.LabelFrame(root, text="日志", padding=2)
-        self._log_outer.configure(height=LOG_PANEL_MIN_HEIGHT)
-        self._log_outer.pack_propagate(False)
-        self._log_outer.pack(fill=tk.X, pady=(0, 4))
+        self.log_panel_expanded = tk.BooleanVar(value=False)
+        self._log_outer = ttk.LabelFrame(self._content_area, text="日志", padding=2)
+        self._log_outer.configure(height=LOG_PANEL_COLLAPSED_HEIGHT)
+        self._log_outer.grid_propagate(False)
+        self._log_outer.columnconfigure(0, weight=1)
+        self._log_outer.rowconfigure(0, weight=0)
+        self._log_outer.rowconfigure(1, weight=1)
+        self._log_outer.grid(row=1, column=0, sticky="ew", pady=(0, 4))
         log_header = ttk.Frame(self._log_outer)
-        log_header.pack(fill=tk.X, pady=(0, 2))
-        ttk.Button(log_header, text="打开日志目录", command=self._open_log_dir).pack(side=tk.RIGHT, padx=2)
+        log_header.grid(row=0, column=0, sticky="ew", pady=(0, 2))
+        self.log_dir_btn = ttk.Button(log_header, text="打开日志目录", command=self._open_log_dir)
+        self.log_dir_btn.pack(side=tk.RIGHT, padx=2)
+        self.log_toggle_btn = ttk.Button(log_header, text="展开日志", command=self._toggle_log_panel)
+        self.log_toggle_btn.pack(side=tk.RIGHT, padx=2)
 
-        self.log_text = tk.Text(self._log_outer, height=LOG_TEXT_VISIBLE_LINES, wrap=tk.WORD, font=("Consolas", 9))
-        self.log_text.pack(fill=tk.BOTH, expand=True)
+        self._log_text_frame = ttk.Frame(self._log_outer)
+        self._log_text_frame.grid(row=1, column=0, sticky="nsew")
+        self._log_text_frame.columnconfigure(0, weight=1)
+        self._log_text_frame.rowconfigure(0, weight=1)
+        self.log_text = tk.Text(self._log_text_frame, height=LOG_TEXT_VISIBLE_LINES, wrap=tk.WORD, font=("Consolas", 9))
+        self.log_text.grid(row=0, column=0, sticky="nsew")
+        self._sync_log_panel_visibility()
 
         # ===== 6. 底部状态栏 =====
         status_frame = ttk.Frame(root, relief="sunken", padding=(8, 3))
@@ -964,6 +988,25 @@ class LauncherApp(_TK_BASE):
             self.debug_frame.pack(fill=tk.X, pady=(0, 8), before=self._debug_toggle_btn)
             self._debug_visible.set(True)
             self._debug_toggle_btn.configure(text="▾ 调试")
+
+    def _toggle_log_panel(self) -> None:
+        self.log_panel_expanded.set(not bool(self.log_panel_expanded.get()))
+        self._sync_log_panel_visibility()
+
+    def _sync_log_panel_visibility(self) -> None:
+        if not hasattr(self, "_log_outer") or not hasattr(self, "_log_text_frame"):
+            return
+        expanded = bool(self.log_panel_expanded.get())
+        height = LOG_PANEL_EXPANDED_HEIGHT if expanded else LOG_PANEL_COLLAPSED_HEIGHT
+        self._content_area.rowconfigure(1, weight=0, minsize=height)
+        self._log_outer.configure(height=height)
+        if expanded:
+            self._log_text_frame.grid(row=1, column=0, sticky="nsew")
+            self.log_toggle_btn.configure(text="收起日志")
+            self.log_text.see(tk.END)
+        else:
+            self._log_text_frame.grid_remove()
+            self.log_toggle_btn.configure(text="展开日志")
 
     def _toggle_advanced_config(self) -> None:
         self.advanced_config_visible.set(not self.advanced_config_visible.get())
@@ -3188,11 +3231,11 @@ Write-Output $count
             w.grid() if not is_m1 else w.grid_remove()
         # 表格
         if is_m1:
-            self._table_frame_m2.pack_forget()
-            self._table_frame_m1.pack(fill=tk.BOTH, expand=True, pady=(0, 8), before=self._log_outer)
+            self._table_frame_m2.grid_remove()
+            self._table_frame_m1.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
         else:
-            self._table_frame_m1.pack_forget()
-            self._table_frame_m2.pack(fill=tk.BOTH, expand=True, pady=(0, 8), before=self._log_outer)
+            self._table_frame_m1.grid_remove()
+            self._table_frame_m2.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
         # 账号下拉框
         if is_m1:
             self._refresh_account_choices()
@@ -3893,14 +3936,20 @@ Write-Output $count
         result = runner.run()
         elapsed = _time.time() - start_time
         self._queue_timing(account, elapsed)
-        if self.stop_event.is_set():
+        result_status = str(getattr(result, "status", "") or "")
+        result_success = bool(getattr(result, "success", bool(result)) and getattr(result, "final_verified", bool(result)))
+        if self.stop_event.is_set() or result_status == "stopped":
             self._update_status_bar("已停止")
-        elif result:
+        elif result_success:
             self._queue_log(f"[后台模式] 成功: {account.display_name}")
             self._update_status_bar("后台模式完成：成功1，失败0")
+        elif result_status == "skipped_logged_in":
+            self._queue_log(f"[后台模式] 已进入游戏，跳过: {account.display_name}")
+            self._update_status_bar("后台模式完成：成功0，跳过1，失败0")
         else:
             self._queue_log(f"[后台模式] 失败: {account.display_name}")
             self._update_status_bar("后台模式完成：成功0，失败1")
+        release_background_playwright_for_current_thread()
 
     def _background_serial_worker(self, accounts: list[AccountConfig], settings, run_label: str) -> None:
         import time as _time
@@ -3959,8 +4008,10 @@ Write-Output $count
             result = runner.run()
             elapsed = _time.time() - account_started
             self._queue_timing(account, elapsed)
+            result_status = str(getattr(result, "status", "") or "")
+            result_success = bool(getattr(result, "success", bool(result)) and getattr(result, "final_verified", bool(result)))
 
-            if self.stop_event.is_set():
+            if self.stop_event.is_set() or result_status == "stopped":
                 mark_stopped(account)
                 for remaining in accounts[index:]:
                     mark_stopped(remaining)
@@ -3968,10 +4019,10 @@ Write-Output $count
 
             status = latest_status.get(account.key, "")
             passport = passport_by_key.get(account.key, "")
-            if result and status == "已进入游戏，跳过":
+            if result_status == "skipped_logged_in" or status == "已进入游戏，跳过":
                 skip_count += 1
                 self._queue_log(f"[后台串行][{index}/{total}] 窗口{account.game_window_no}：已进入游戏，跳过")
-            elif result:
+            elif result_success:
                 success_count += 1
                 if passport:
                     self._queue_log(f"[后台串行][{index}/{total}] 窗口{account.game_window_no}：识别通行证 {passport}")
@@ -4001,6 +4052,7 @@ Write-Output $count
         if self._log_file is not None:
             self._log_file.close()
             self._log_file = None
+        release_background_playwright_for_current_thread()
         if hasattr(self, "worker_thread"):
             self.worker_thread = None
 
