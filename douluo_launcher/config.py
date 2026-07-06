@@ -183,6 +183,16 @@ class AutomationSettings:
     logged_in_black_ratio_max: float = 0.28
     logged_in_edge_density_max: float = 0.60
     background_keep_success_browser: bool = False
+    auto_replace_speed_panel: bool = True
+    custom_speed_panel_enabled: bool = True
+    speed_engine: str = "timer_hook"
+    default_speed_rate: float = 1.0
+    speed_hook_stage: str = "after_game_ready"
+    speed_panel_position: str = "left_top"
+    speed_panel_left: int = 12
+    speed_panel_top: int = 12
+    speed_panel_debug: bool = False
+    speed_panel_remove_original_toggle: bool = True
 
 
 def compute_game_window_no(

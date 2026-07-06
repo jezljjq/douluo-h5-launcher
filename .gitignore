@@ -16,6 +16,14 @@ venv/
 logs/
 *.log
 
+# 运行时数据
+client_direct_sessions.json
+debug_client_direct/
+backups/
+backup_before_*/
+WIP_before_*.patch
+WIP_before_*.txt
+
 # 调试截图 - 自动生成
 debug_ocr/*
 debug_ocr/latest_*

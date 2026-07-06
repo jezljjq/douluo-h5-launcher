@@ -3,6 +3,7 @@ from __future__ import annotations
 import queue
 import json
 import os
+import re
 import threading
 import time
 import tkinter as tk
@@ -10,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
+from urllib.parse import urlparse
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -23,6 +25,25 @@ from .background_login import (
     BackgroundSingleAccountRunner,
     check_background_runtime_dependencies,
     release_background_playwright_for_current_thread,
+)
+from .client_batch_store import (
+    ClientBatchBinding,
+    ClientBatchStore,
+    RepairProbe,
+    check_port_range_available,
+    find_next_available_port_range,
+)
+from .client_cdp import cdp_port_for_index, is_tcp_port_available, mask_sensitive_text
+from .client_direct_login import (
+    ClientDirectLoginConfig,
+    ClientBinding,
+    ClientDirectRunRecord,
+    PreparedClientDirectLoginConfig,
+    execute_client_direct_login,
+    execute_prepared_client_direct_login,
+    is_complete_direct_login_url,
+    prepare_client_direct_client,
+    wait_for_client_hwnd_by_pid,
 )
 from .config import (
     AccountConfig,
@@ -51,13 +72,20 @@ from .path_utils import first_dropped_file_path, resolve_game_executable_path
 from .version import APP_VERSION
 from .window_manager import (
     GAME_TITLE_KEYWORD,
+    SWP_NOACTIVATE,
+    SWP_NOZORDER,
     WINDOW_DETECTION_LOG_PATH,
+    GameWindow,
     RowTileConfig,
     TileConfig,
+    WindowRect,
     calculate_row_tile_plan,
+    calculate_tile_position,
     check_window_slots_compatibility,
     close_game_windows,
     extract_window_number,
+    get_window_rect,
+    get_process_path_by_pid,
     has_valid_window_slots,
     launch_game_process,
     layout_params_from_tile_config,
@@ -92,12 +120,49 @@ WM_TILE_MODE_FIXED = "固定参数排列"
 WM_TILE_MODE_ROW_COUNT = "根据行数排列"
 RUN_MODE_FOREGROUND_LABEL = "前台辅助模式"
 RUN_MODE_BACKGROUND_LABEL = "后台登录模式（实验）"
+RUN_MODE_CLIENT_DIRECT_LABEL = "客户端直登模式"
+RUN_MODE_CHOICES = (RUN_MODE_CLIENT_DIRECT_LABEL, RUN_MODE_FOREGROUND_LABEL)
 BACKGROUND_SERIAL_CONCURRENCY = 1
 RUN_MODE_BACKGROUND_HINT = "实验功能，支持方式一单账号/当前层串行/全部串行，并发=1"
+RUN_MODE_CLIENT_DIRECT_HINT = "客户端直登模式，支持单账号/当前层准备、排列、登录"
+CLIENT_DIRECT_CDP_PORT = 9222
+CLIENT_DIRECT_CONCURRENCY_MIN = 1
+CLIENT_DIRECT_CONCURRENCY_MAX = 8
+CLIENT_DIRECT_LOGIN_SCOPE_PENDING = "待登录账号"
+CLIENT_DIRECT_LOGIN_SCOPE_SELECTED = "选中账号"
+CLIENT_DIRECT_LOGIN_SCOPE_FAILED = "失败账号"
+CLIENT_DIRECT_LOGIN_SCOPE_ALL = "全部账号"
+CLIENT_DIRECT_LOGIN_SCOPE_CHOICES = (
+    CLIENT_DIRECT_LOGIN_SCOPE_PENDING,
+    CLIENT_DIRECT_LOGIN_SCOPE_SELECTED,
+    CLIENT_DIRECT_LOGIN_SCOPE_FAILED,
+    CLIENT_DIRECT_LOGIN_SCOPE_ALL,
+)
+CLIENT_DIRECT_LOGIN_PENDING_STATUSES = {
+    "客户端已启动/待登录",
+    "prepared",
+    "ready_to_login",
+    "login_pending",
+    "pending",
+    "待登录",
+}
+CLIENT_DIRECT_LOGIN_FAILED_STATUSES = {
+    "login_failed",
+    "cdp_unavailable",
+    "CDP不可用",
+    "canvas_timeout",
+    "serverMobile_failed",
+    "enter_game_failed",
+    "客户端直登失败",
+    "启动失败",
+    "URL无效",
+    "端口占用",
+    "客户端已关闭",
+}
 GUI_DEFAULT_WIDTH = 1160
-GUI_DEFAULT_HEIGHT = 820
+GUI_DEFAULT_HEIGHT = 940
 GUI_MIN_WIDTH = 1080
-GUI_MIN_HEIGHT = 760
+GUI_MIN_HEIGHT = 820
 LOG_TEXT_VISIBLE_LINES = 8
 LOG_PANEL_COLLAPSED_HEIGHT = 42
 LOG_PANEL_EXPANDED_HEIGHT = 150
@@ -105,9 +170,34 @@ LOG_PANEL_MIN_HEIGHT = LOG_PANEL_EXPANDED_HEIGHT
 
 
 def _run_mode_key_from_label(label: str) -> str:
-    if str(label or "").strip() == RUN_MODE_BACKGROUND_LABEL:
+    clean_label = str(label or "").strip()
+    if clean_label == RUN_MODE_BACKGROUND_LABEL:
         return "background"
+    if clean_label == RUN_MODE_CLIENT_DIRECT_LABEL:
+        return "client_direct"
     return "foreground"
+
+
+def _direct_login_entry_label(url: str) -> str:
+    try:
+        parsed = urlparse(str(url or "").strip())
+    except Exception:
+        return "<invalid-url>"
+    host = parsed.hostname or ""
+    path = parsed.path or "/"
+    return f"{host}{path}"
+
+
+def _account_url_display_value(url: str) -> str:
+    try:
+        parsed = urlparse(str(url or "").strip())
+    except Exception:
+        return "<invalid-url> 参数不完整"
+    host = parsed.hostname or ""
+    path = parsed.path or "/"
+    entry = f"{host} {path}".strip()
+    completeness = "参数完整" if is_complete_direct_login_url(url) else "参数不完整"
+    return f"{entry} {completeness}".strip()
 
 
 def _run_mode_key_for_owner(owner) -> str:
@@ -118,6 +208,46 @@ def _run_mode_key_for_owner(owner) -> str:
         return _run_mode_key_from_label(var.get())
     except Exception:
         return "foreground"
+
+
+def _safe_bool_var(owner, name: str, default: bool) -> bool:
+    var = getattr(owner, name, None)
+    if var is None:
+        return bool(default)
+    try:
+        return bool(var.get())
+    except Exception:
+        return bool(default)
+
+
+def _safe_string_var(owner, name: str, default: str) -> str:
+    var = getattr(owner, name, None)
+    if var is None:
+        return str(default)
+    try:
+        value = str(var.get()).strip()
+    except Exception:
+        return str(default)
+    return value or str(default)
+
+
+def _run_bounded_client_direct_tasks(items, concurrency: int, worker):
+    queued = list(items)
+    if not queued:
+        return
+    try:
+        requested_concurrency = int(concurrency or CLIENT_DIRECT_CONCURRENCY_MIN)
+    except Exception:
+        requested_concurrency = CLIENT_DIRECT_CONCURRENCY_MIN
+    clean_concurrency = max(
+        CLIENT_DIRECT_CONCURRENCY_MIN,
+        min(CLIENT_DIRECT_CONCURRENCY_MAX, requested_concurrency),
+    )
+    max_workers = min(clean_concurrency, len(queued))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(worker, item) for item in queued]
+        for future in as_completed(futures):
+            yield future.result()
 
 
 def _safe_wm_expected_window_size(owner) -> tuple[int, int] | None:
@@ -186,7 +316,7 @@ def _account_table_values(
         account.game_window_no,
         "是" if account.include_in_all else "否",
         passport,
-        account.url,
+        _account_url_display_value(account.url),
         status,
         timing,
     )
@@ -306,6 +436,14 @@ class SerialRunPlan:
     max_window_no: int
 
 
+@dataclass(frozen=True)
+class ClientDirectAccountRef:
+    key: str
+    display_name: str
+    url: str
+    game_window_no: int = 0
+
+
 def _group_counts_for_accounts(accounts: list[AccountConfig] | tuple[AccountConfig, ...]) -> tuple[tuple[str, int], ...]:
     counts: dict[str, int] = {}
     for account in accounts:
@@ -358,7 +496,7 @@ _TK_BASE = TkinterDnD.Tk if TkinterDnD is not None else tk.Tk
 class LauncherApp(_TK_BASE):
     def __init__(self) -> None:
         super().__init__()
-        self.title(f"上号器 — 前台串行模式 v{APP_VERSION}")
+        self.title(f"斗罗大陆H5上号器 - 客户端直登批次版 v{APP_VERSION}")
         w, h = GUI_DEFAULT_WIDTH, GUI_DEFAULT_HEIGHT
         ws = self.winfo_screenwidth()
         hs = self.winfo_screenheight()
@@ -382,6 +520,9 @@ class LauncherApp(_TK_BASE):
         self.running_processes: list[object] = []
         self.running_processes_lock = threading.Lock()
         self._preserve_background_windows = False
+        self.client_batch_store = ClientBatchStore()
+        self.client_direct_bindings: dict[str, ClientDirectRunRecord] = {}
+        self.client_direct_bindings_lock = threading.RLock()
         self.is_closing = False
 
         self.settings_path = tk.StringVar(value=str(app_root() / "automation_settings.json"))
@@ -403,8 +544,27 @@ class LauncherApp(_TK_BASE):
         self.notice_outside_x_var = tk.DoubleVar(value=0.08)
         self.notice_outside_y_var = tk.DoubleVar(value=0.08)
         self.method_var = tk.StringVar(value="method1")
-        self.run_mode_var = tk.StringVar(value=RUN_MODE_FOREGROUND_LABEL)
+        self.run_mode_var = tk.StringVar(value=RUN_MODE_CLIENT_DIRECT_LABEL)
         self.run_mode_hint_var = tk.StringVar(value="")
+        self.client_direct_auto_enter_var = tk.BooleanVar(value=True)
+        self.client_direct_concurrency_var = tk.IntVar(value=CLIENT_DIRECT_CONCURRENCY_MIN)
+        self.client_direct_login_scope_var = tk.StringVar(value=CLIENT_DIRECT_LOGIN_SCOPE_PENDING)
+        self.client_direct_base_port_var = tk.IntVar(value=CLIENT_DIRECT_CDP_PORT)
+        self.auto_replace_speed_panel_var = tk.BooleanVar(value=True)
+        self.custom_speed_panel_enabled_var = tk.BooleanVar(value=True)
+        self.speed_panel_debug_var = tk.BooleanVar(value=False)
+        self.speed_panel_remove_original_toggle_var = tk.BooleanVar(value=True)
+        self.speed_engine_var = tk.StringVar(value="timer_hook")
+        self.default_speed_rate_var = tk.StringVar(value="1.0")
+        self.speed_hook_stage_var = tk.StringVar(value="after_game_ready")
+        self.speed_panel_position_var = tk.StringVar(value="左上角")
+        self.client_direct_port_range_var = tk.StringVar(value="9222 ~ 9222")
+        self.client_direct_batch_count_var = tk.StringVar(value="本批数量：1")
+        self.client_direct_batch_status_var = tk.StringVar(
+            value="绑定=0 | 存活=0 | 已关闭=0 | CDP不可用=0 | 窗口失效=0"
+        )
+        self.client_direct_batch_select_var = tk.StringVar(value="无可用批次")
+        self.client_direct_batch_display_id_map: dict[str, str] = {}
         self.csv_path = tk.StringVar(value="")
         self.level_count_vars = {level: tk.IntVar(value=8) for level in LEVELS}
         self.wm_game_path_var = tk.StringVar(value="")
@@ -437,6 +597,7 @@ class LauncherApp(_TK_BASE):
         self._apply_settings_defaults()
         self._build_widgets()
         self._load_window_manager_settings()
+        self._load_client_direct_sessions()
         self._log_bookmark_startup_state()
         self._auto_load_csv()
         self.after(100, self._drain_ui_queue)
@@ -464,6 +625,14 @@ class LauncherApp(_TK_BASE):
         self.max_workers_var.set(settings.max_workers)
         self.notice_outside_x_var.set(settings.notice_close_outside_ratio[0])
         self.notice_outside_y_var.set(settings.notice_close_outside_ratio[1])
+        self.auto_replace_speed_panel_var.set(bool(settings.auto_replace_speed_panel))
+        self.custom_speed_panel_enabled_var.set(bool(settings.custom_speed_panel_enabled))
+        self.speed_panel_debug_var.set(bool(getattr(settings, "speed_panel_debug", False)))
+        self.speed_panel_remove_original_toggle_var.set(bool(getattr(settings, "speed_panel_remove_original_toggle", True)))
+        self.speed_engine_var.set(str(settings.speed_engine or "timer_hook"))
+        self.default_speed_rate_var.set(str(float(settings.default_speed_rate or 1.0)))
+        self.speed_hook_stage_var.set(str(settings.speed_hook_stage or "after_game_ready"))
+        self.speed_panel_position_var.set("左上角")
 
     def _bookmark_candidates_summary(self) -> str:
         candidates = find_bookmark_file_candidates()
@@ -539,80 +708,109 @@ class LauncherApp(_TK_BASE):
             self._log(f"保存收藏夹配置失败：{exc}")
 
     def _build_widgets(self) -> None:
-        root = ttk.Frame(self, padding=(12, 8, 12, 4))
+        root = ttk.Frame(self, padding=(10, 6, 10, 4))
         root.pack(fill=tk.BOTH, expand=True)
 
         # ===== 1. 窗口管理 =====
-        window_frame = ttk.LabelFrame(root, text="窗口管理", padding=6)
-        window_frame.pack(fill=tk.X, pady=(0, 8))
+        window_frame = ttk.LabelFrame(root, text="窗口管理", padding=4)
+        window_frame.pack(fill=tk.X, pady=(0, 6))
+        window_frame.columnconfigure(0, weight=1)
         window_frame.columnconfigure(1, weight=1)
 
-        # 第1行：游戏路径
-        ttk.Label(window_frame, text="游戏程序", width=10, anchor="e").grid(
-            row=0, column=0, sticky="e", padx=(4, 6), pady=3
+        self.wm_game_path_row = ttk.Frame(window_frame)
+        self.wm_game_path_row.grid(row=0, column=0, columnspan=2, sticky="ew", padx=4, pady=(0, 4))
+        self.wm_game_path_row.columnconfigure(1, weight=1)
+        ttk.Label(self.wm_game_path_row, text="游戏程序：", width=12, anchor="e").grid(
+            row=0, column=0, sticky="e", padx=(0, 8)
         )
-        self.wm_game_path_box = ttk.Frame(window_frame)
-        self.wm_game_path_box.grid(
-            row=0, column=1, columnspan=12, sticky="ew", padx=4, pady=3
-        )
+        self.wm_game_path_box = ttk.Frame(self.wm_game_path_row)
+        self.wm_game_path_box.grid(row=0, column=1, sticky="ew")
         self.wm_game_path_box.columnconfigure(0, weight=1)
         self.wm_game_path_entry = ttk.Entry(self.wm_game_path_box, textvariable=self.wm_game_path_var)
         self.wm_game_path_entry.grid(row=0, column=0, sticky="ew")
+        ttk.Button(
+            self.wm_game_path_row,
+            text="选择游戏图标/程序",
+            width=18,
+            command=self._pick_game_path,
+        ).grid(row=0, column=2, sticky="ew", padx=(8, 0))
+
+        self.wm_hint_frame = ttk.Frame(window_frame)
+        self.wm_hint_frame.grid(row=1, column=0, columnspan=2, sticky="ew", padx=4, pady=(0, 4))
+        self.wm_hint_frame.columnconfigure(1, weight=1)
+        ttk.Label(self.wm_hint_frame, text="提示：", width=12, anchor="e").grid(row=0, column=0, sticky="e", padx=(0, 8))
         self.wm_game_hint_label = ttk.Label(
-            self.wm_game_path_box,
+            self.wm_hint_frame,
             textvariable=self.wm_game_hint_var,
             foreground="#006666",
         )
-        self.wm_game_hint_label.grid(row=1, column=0, sticky="w", pady=(2, 0))
+        self.wm_game_hint_label.grid(row=0, column=1, sticky="w")
         self.wm_game_status_label = ttk.Label(
-            self.wm_game_path_box,
+            self.wm_hint_frame,
             textvariable=self.wm_game_status_var,
             foreground="#666666",
         )
-        self.wm_game_status_label.grid(row=2, column=0, sticky="w", pady=(2, 0))
-        ttk.Button(window_frame, text="选择游戏图标/程序", width=16, command=self._pick_game_path).grid(
-            row=0, column=13, sticky="ew", padx=4, pady=3
+        self.wm_game_status_label.grid(row=0, column=2, sticky="w", padx=(24, 0))
+
+        self.wm_compact_frame = ttk.Frame(window_frame)
+        self.wm_compact_frame.grid(row=2, column=0, columnspan=2, sticky="ew", padx=4, pady=(0, 0))
+        self.wm_compact_frame.columnconfigure(0, weight=1)
+        self.wm_compact_frame.columnconfigure(1, weight=1)
+
+        self.wm_legacy_launch_frame = ttk.Frame(self.wm_compact_frame)
+        self.wm_legacy_launch_frame.grid(row=1, column=1, sticky="ew", padx=(16, 0), pady=(0, 4))
+        ttk.Label(self.wm_legacy_launch_frame, text="旧启动项：", width=12, anchor="e").grid(
+            row=0, column=0, sticky="e", padx=(0, 8)
+        )
+        self.wm_launch_count_label = ttk.Label(self.wm_legacy_launch_frame, text="打开数量")
+        self.wm_launch_count_label.grid(row=0, column=1, sticky="e", padx=(0, 4))
+        self.wm_launch_count_spin = ttk.Spinbox(
+            self.wm_legacy_launch_frame,
+            from_=1,
+            to=99,
+            increment=1,
+            textvariable=self.wm_launch_count_var,
+            width=6,
+        )
+        self.wm_launch_count_spin.grid(row=0, column=2, sticky="w", padx=(0, 16))
+        self.wm_launch_interval_label = ttk.Label(self.wm_legacy_launch_frame, text="启动间隔(ms)")
+        self.wm_launch_interval_label.grid(row=0, column=3, sticky="e", padx=(0, 4))
+        self.wm_launch_interval_spin = ttk.Spinbox(
+            self.wm_legacy_launch_frame,
+            from_=0,
+            to=60000,
+            increment=100,
+            textvariable=self.wm_launch_interval_var,
+            width=6,
+        )
+        self.wm_launch_interval_spin.grid(row=0, column=4, sticky="w", padx=(0, 16))
+        self.wm_auto_tile_after_launch_check = ttk.Checkbutton(
+            self.wm_legacy_launch_frame,
+            text="启动后自动排列",
+            variable=self.wm_auto_tile_after_launch_var,
+        )
+        self.wm_auto_tile_after_launch_check.grid(row=0, column=5, sticky="w")
+        self.wm_legacy_launch_grid_widgets = (
+            self.wm_legacy_launch_frame,
         )
 
-        # 第2行：启动参数、自动编号、标题模板、重命名
-        ttk.Label(window_frame, text="打开数量").grid(row=1, column=0, sticky="e", padx=(4, 6), pady=3)
-        ttk.Spinbox(window_frame, from_=1, to=99, increment=1,
-                    textvariable=self.wm_launch_count_var, width=6).grid(row=1, column=1, sticky="w", padx=(0, 12), pady=3)
-        ttk.Label(window_frame, text="启动间隔(ms)").grid(row=1, column=2, sticky="e", padx=(0, 6), pady=3)
-        ttk.Spinbox(window_frame, from_=0, to=60000, increment=100,
-                    textvariable=self.wm_launch_interval_var, width=6).grid(row=1, column=3, sticky="w", padx=(0, 12), pady=3)
-        ttk.Checkbutton(window_frame, text="启动后自动排列",
-                        variable=self.wm_auto_tile_after_launch_var).grid(row=1, column=4, sticky="w", padx=(0, 12), pady=3)
-        ttk.Checkbutton(window_frame, text="排列后自动编号标题",
-                        variable=self.wm_auto_rename_after_tile_var).grid(row=1, column=5, sticky="w", padx=(0, 12), pady=3)
-        ttk.Label(window_frame, text="标题模板").grid(row=1, column=6, sticky="e", padx=(0, 6), pady=3)
-        ttk.Entry(window_frame, textvariable=self.wm_title_template_var, width=24).grid(
-            row=1, column=7, columnspan=5, sticky="ew", padx=(0, 8), pady=3
+        self.wm_layout_frame = ttk.Frame(self.wm_compact_frame)
+        self.wm_layout_frame.grid(row=0, column=0, rowspan=2, sticky="nw", pady=(0, 2))
+        self.wm_layout_frame.columnconfigure(1, minsize=88)
+        self.wm_layout_frame.columnconfigure(3, minsize=88)
+        ttk.Label(self.wm_layout_frame, text="布局参数：", width=12, anchor="e").grid(
+            row=0, column=0, rowspan=4, sticky="ne", padx=(0, 8), pady=3
         )
-        ttk.Button(window_frame, text="重命名", width=8,
-                   command=self._wm_rename_windows).grid(row=1, column=12, sticky="ew", padx=(0, 6), pady=3)
-
-        # 第3行：排列方式和保护选项
-        ttk.Label(window_frame, text="排列方式").grid(row=2, column=0, sticky="e", padx=(4, 6), pady=3)
+        ttk.Label(self.wm_layout_frame, text="排列方式").grid(row=0, column=1, sticky="w", padx=(0, 4), pady=2)
         self.wm_tile_mode_combo = ttk.Combobox(
-            window_frame,
+            self.wm_layout_frame,
             textvariable=self.wm_tile_mode_var,
             values=(WM_TILE_MODE_FIXED, WM_TILE_MODE_ROW_COUNT),
             state="readonly",
             width=14,
         )
-        self.wm_tile_mode_combo.grid(row=2, column=1, columnspan=2, sticky="w", padx=(0, 12), pady=3)
+        self.wm_tile_mode_combo.grid(row=0, column=2, sticky="w", padx=(0, 24), pady=2)
         self.wm_tile_mode_combo.bind("<<ComboboxSelected>>", lambda _: self._wm_on_tile_mode_changed())
-        ttk.Label(window_frame, text="根据行数排列会自动缩放窗口").grid(
-            row=2, column=3, columnspan=2, sticky="w", padx=(0, 12), pady=3
-        )
-        ttk.Checkbutton(
-            window_frame,
-            text="禁止超出屏幕宽度",
-            variable=self.wm_prevent_overflow_var,
-        ).grid(row=2, column=5, columnspan=3, sticky="w", padx=(0, 12), pady=3)
-
-        # 第4行：窗口尺寸和排列参数
         self.wm_fixed_param_widgets = []
         self.wm_row_param_widgets = []
 
@@ -621,103 +819,137 @@ class LauncherApp(_TK_BASE):
             return widget
 
         fixed_specs = (
-            ("窗口宽度", "entry", self.wm_window_width_var, None, None),
-            ("窗口高度", "entry", self.wm_window_height_var, None, None),
-            ("每行数量", "spin", self.wm_per_row_var, 1, 99),
-            ("起点X", "spin", self.wm_start_x_var, -5000, 5000),
-            ("起点Y", "spin", self.wm_start_y_var, -5000, 5000),
-            ("横向偏移", "spin", self.wm_offset_x_var, -5000, 5000),
-            ("纵向偏移", "spin", self.wm_offset_y_var, -5000, 5000),
+            (0, 3, "每行数量", "spin", self.wm_per_row_var, 1, 99),
+            (1, 1, "窗口宽度", "entry", self.wm_window_width_var, None, None),
+            (1, 3, "窗口高度", "entry", self.wm_window_height_var, None, None),
+            (2, 1, "起点X", "spin", self.wm_start_x_var, -5000, 5000),
+            (2, 3, "起点Y", "spin", self.wm_start_y_var, -5000, 5000),
+            (3, 1, "横向偏移", "spin", self.wm_offset_x_var, -5000, 5000),
+            (3, 3, "纵向偏移", "spin", self.wm_offset_y_var, -5000, 5000),
         )
-        for index, (label, kind, variable, min_value, max_value) in enumerate(fixed_specs):
-            label_column = index * 2
+        for row, label_column, label, kind, variable, min_value, max_value in fixed_specs:
             input_column = label_column + 1
             label_widget = add_widget(
-                ttk.Label(window_frame, text=label),
-                3,
+                ttk.Label(self.wm_layout_frame, text=label),
+                row,
                 label_column,
-                sticky="e",
-                padx=(4 if index == 0 else 8, 4),
-                pady=3,
+                sticky="w",
+                padx=(0, 4),
+                pady=1,
             )
             if kind == "entry":
                 input_widget = add_widget(
-                    ttk.Entry(window_frame, textvariable=variable, width=7),
-                    3,
+                    ttk.Entry(self.wm_layout_frame, textvariable=variable, width=7),
+                    row,
                     input_column,
                     sticky="w",
-                    padx=(0, 4),
-                    pady=3,
+                    padx=(0, 12),
+                    pady=1,
                 )
             else:
                 input_widget = add_widget(
-                    ttk.Spinbox(window_frame, from_=min_value, to=max_value, increment=1,
+                    ttk.Spinbox(self.wm_layout_frame, from_=min_value, to=max_value, increment=1,
                                 textvariable=variable, width=6),
-                    3,
+                    row,
                     input_column,
                     sticky="w",
-                    padx=(0, 4),
-                    pady=3,
+                    padx=(0, 12),
+                    pady=1,
                 )
             self.wm_fixed_param_widgets.extend((label_widget, input_widget))
 
-        row_label = add_widget(
-            ttk.Label(window_frame, text="每行数量"),
-            3,
-            0,
-            sticky="e",
-            padx=(4, 4),
-            pady=3,
+        self.wm_title_frame = ttk.Frame(self.wm_compact_frame)
+        self.wm_title_frame.grid(row=0, column=1, sticky="new", padx=(16, 0), pady=(0, 4))
+        self.wm_title_frame.columnconfigure(3, weight=1)
+        ttk.Label(self.wm_title_frame, text="标题设置：", width=12, anchor="e").grid(
+            row=0, column=0, sticky="e", padx=(0, 8)
         )
-        row_input = add_widget(
-            ttk.Spinbox(window_frame, from_=1, to=99, increment=1,
-                        textvariable=self.wm_per_row_var, width=6),
-            3,
-            1,
-            sticky="w",
-            padx=(0, 4),
-            pady=3,
+        ttk.Checkbutton(
+            self.wm_title_frame,
+            text="排列后自动编号标题",
+            variable=self.wm_auto_rename_after_tile_var,
+        ).grid(row=0, column=1, sticky="w", padx=(0, 20))
+        ttk.Label(self.wm_title_frame, text="标题模板").grid(row=0, column=2, sticky="e", padx=(0, 4))
+        ttk.Entry(self.wm_title_frame, textvariable=self.wm_title_template_var, width=28).grid(
+            row=0, column=3, sticky="w", padx=(0, 8)
         )
-        self.wm_row_param_widgets.extend((row_label, row_input))
+        ttk.Button(self.wm_title_frame, text="重命名", width=8, command=self._wm_rename_windows).grid(
+            row=0, column=4, sticky="w"
+        )
+        ttk.Checkbutton(
+            self.wm_title_frame,
+            text="禁止超出屏幕宽度",
+            variable=self.wm_prevent_overflow_var,
+        ).grid(row=1, column=1, columnspan=3, sticky="w", pady=(4, 0))
 
-        # 第5行：窗口操作按钮
-        window_action_row = ttk.Frame(window_frame)
-        window_action_row.grid(row=4, column=0, columnspan=14, sticky="w", pady=(6, 0))
+        window_action_row = ttk.Frame(self.wm_compact_frame)
+        window_action_row.grid(row=2, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        ttk.Label(window_action_row, text="窗口操作：", width=12, anchor="e").pack(side=tk.LEFT, padx=(0, 8))
         self.wm_launch_btn = ttk.Button(window_action_row, text="批量启动窗口", width=18,
                                         command=self._wm_launch_windows)
-        self.wm_launch_btn.pack(side=tk.LEFT, padx=(4, 10))
+        self.wm_launch_btn.pack(side=tk.LEFT, padx=(0, 8))
         self.wm_identify_btn = ttk.Button(window_action_row, text="识别窗口", width=18,
                                           command=self._wm_identify_windows)
-        self.wm_identify_btn.pack(side=tk.LEFT, padx=(0, 10))
+        self.wm_identify_btn.pack(side=tk.LEFT, padx=(0, 8))
         self.wm_tile_btn = ttk.Button(window_action_row, text="排列窗口", width=18,
                                       command=self._wm_tile_windows)
-        self.wm_tile_btn.pack(side=tk.LEFT, padx=(0, 10))
+        self.wm_tile_btn.pack(side=tk.LEFT, padx=(0, 8))
         self.wm_refresh_slots_btn = ttk.Button(window_action_row, text="刷新槽位映射", width=18,
                                                command=self._wm_refresh_window_slots)
-        self.wm_refresh_slots_btn.pack(side=tk.LEFT, padx=(0, 10))
+        self.wm_refresh_slots_btn.pack(side=tk.LEFT, padx=(0, 8))
         self.wm_regenerate_slots_btn = ttk.Button(window_action_row, text="重新生成槽位", width=18,
                                                   command=self._wm_regenerate_slots)
-        self.wm_regenerate_slots_btn.pack(side=tk.LEFT, padx=(0, 10))
+        self.wm_regenerate_slots_btn.pack(side=tk.LEFT, padx=(0, 8))
         ttk.Label(window_action_row, text="目标槽位").pack(side=tk.LEFT, padx=(0, 4))
         ttk.Spinbox(window_action_row, from_=1, to=99, increment=1,
                     textvariable=self.wm_repair_slot_var, width=5).pack(side=tk.LEFT, padx=(0, 6))
         self.wm_repair_slot_btn = ttk.Button(window_action_row, text="修复窗口", width=12,
                                              command=self._wm_repair_window_slot)
-        self.wm_repair_slot_btn.pack(side=tk.LEFT, padx=(0, 10))
+        self.wm_repair_slot_btn.pack(side=tk.LEFT, padx=(0, 8))
         tk.Button(window_action_row, text="关闭窗口", width=18, fg="#cc0000",
-                  command=self._wm_close_windows, font=("", 9, "bold")).pack(side=tk.LEFT, padx=(0, 10))
+                  command=self._wm_close_windows, font=("", 9, "bold")).pack(side=tk.LEFT, padx=(0, 8))
 
-        # ===== 2. 配置上号器 =====
-        config_frame = ttk.LabelFrame(root, text="配置上号器", padding=6)
-        config_frame.pack(fill=tk.X, pady=(0, 8))
+        # ===== 2. 工作模式 =====
+        work_mode_frame = ttk.LabelFrame(root, text="工作模式", padding=4)
+        work_mode_frame.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(work_mode_frame, text="工作模式").pack(side=tk.LEFT, padx=(4, 8))
+        self.run_mode_client_btn = tk.Radiobutton(
+            work_mode_frame,
+            text=RUN_MODE_CLIENT_DIRECT_LABEL,
+            variable=self.run_mode_var,
+            value=RUN_MODE_CLIENT_DIRECT_LABEL,
+            indicatoron=False,
+            width=18,
+            padx=10,
+            pady=4,
+            command=self._on_run_mode_changed,
+        )
+        self.run_mode_client_btn.pack(side=tk.LEFT, padx=(0, 8))
+        self.run_mode_foreground_btn = tk.Radiobutton(
+            work_mode_frame,
+            text=RUN_MODE_FOREGROUND_LABEL,
+            variable=self.run_mode_var,
+            value=RUN_MODE_FOREGROUND_LABEL,
+            indicatoron=False,
+            width=18,
+            padx=10,
+            pady=4,
+            command=self._on_run_mode_changed,
+        )
+        self.run_mode_foreground_btn.pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(work_mode_frame, textvariable=self.run_mode_hint_var, foreground="#996600").pack(side=tk.LEFT)
+
+        # ===== 3. 读取收藏夹 / 账号配置 =====
+        config_frame = ttk.LabelFrame(root, text="读取收藏夹 / 账号配置", padding=4)
+        config_frame.pack(fill=tk.X, pady=(0, 6))
         config_frame.columnconfigure(1, weight=1)
 
-        method_row = ttk.Frame(config_frame)
-        method_row.grid(row=0, column=0, columnspan=5, sticky="w", pady=(0, 6))
-        ttk.Label(method_row, text="上号方式").pack(side=tk.LEFT, padx=(4, 8))
-        ttk.Radiobutton(method_row, text="方式一：通行证上号", variable=self.method_var, value="method1",
+        self.method_row = ttk.Frame(config_frame)
+        self.method_row.grid(row=0, column=0, columnspan=5, sticky="w", pady=(0, 6))
+        ttk.Label(self.method_row, text="上号方式").pack(side=tk.LEFT, padx=(4, 8))
+        ttk.Radiobutton(self.method_row, text="方式一：通行证上号", variable=self.method_var, value="method1",
                         command=self._on_method_changed).pack(side=tk.LEFT, padx=(0, 24))
-        ttk.Radiobutton(method_row, text="方式二：账号密码 + 通行证上号", variable=self.method_var, value="method2",
+        ttk.Radiobutton(self.method_row, text="方式二：账号密码 + 通行证上号", variable=self.method_var, value="method2",
                         command=self._on_method_changed).pack(side=tk.LEFT)
 
         self._method1_row1 = ttk.Label(config_frame, text="浏览器收藏夹", width=12, anchor="e")
@@ -816,6 +1048,65 @@ class LauncherApp(_TK_BASE):
                 textvariable=self.level_count_vars[level],
                 width=5,
             ).pack(side=tk.LEFT, padx=(0, 12))
+        self._client_direct_port_settings_label = ttk.Label(
+            self._method1_advanced_frame, text="端口设置", width=14, anchor="e"
+        )
+        self._client_direct_port_settings_label.grid(row=5, column=0, sticky="e", padx=(4, 6), pady=3)
+        self._client_direct_port_settings_frame = ttk.Frame(self._method1_advanced_frame)
+        self._client_direct_port_settings_frame.grid(row=5, column=1, columnspan=2, sticky="w", padx=4, pady=3)
+        ttk.Label(self._client_direct_port_settings_frame, text="默认端口起点").pack(side=tk.LEFT, padx=(0, 4))
+        self.client_direct_base_port_spin = ttk.Spinbox(
+            self._client_direct_port_settings_frame,
+            from_=1024,
+            to=65500,
+            increment=1,
+            textvariable=self.client_direct_base_port_var,
+            width=7,
+            command=self._sync_client_direct_port_range,
+        )
+        self.client_direct_base_port_spin.pack(side=tk.LEFT)
+        ttk.Label(self._client_direct_port_settings_frame, text="自动寻找连续可用端口").pack(
+            side=tk.LEFT, padx=(10, 0)
+        )
+
+        self._client_speed_panel_label = ttk.Label(
+            self._method1_advanced_frame, text="加速面板", width=14, anchor="e"
+        )
+        self._client_speed_panel_label.grid(row=6, column=0, sticky="e", padx=(4, 6), pady=3)
+        self._client_speed_panel_frame = ttk.Frame(self._method1_advanced_frame)
+        self._client_speed_panel_frame.grid(row=6, column=1, columnspan=2, sticky="w", padx=4, pady=3)
+        ttk.Checkbutton(
+            self._client_speed_panel_frame,
+            text="替换网页加速浮层",
+            variable=self.auto_replace_speed_panel_var,
+        ).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Checkbutton(
+            self._client_speed_panel_frame,
+            text="显示自定义变速器",
+            variable=self.custom_speed_panel_enabled_var,
+        ).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Checkbutton(
+            self._client_speed_panel_frame,
+            text="原浮层诊断日志",
+            variable=self.speed_panel_debug_var,
+        ).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Checkbutton(
+            self._client_speed_panel_frame,
+            text="删除原入口按钮",
+            variable=self.speed_panel_remove_original_toggle_var,
+        ).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(self._client_speed_panel_frame, text="默认倍率").pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Entry(self._client_speed_panel_frame, textvariable=self.default_speed_rate_var, width=6).pack(
+            side=tk.LEFT, padx=(0, 10)
+        )
+        ttk.Label(self._client_speed_panel_frame, text="位置").pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Combobox(
+            self._client_speed_panel_frame,
+            textvariable=self.speed_panel_position_var,
+            values=("左上角",),
+            width=8,
+            state="readonly",
+        ).pack(side=tk.LEFT)
         self._method1_advanced_frame.grid_remove()
 
         self._method2_row1 = ttk.Label(config_frame, text="CSV文件", width=12, anchor="e")
@@ -831,13 +1122,13 @@ class LauncherApp(_TK_BASE):
         self._method2_btn_pick.grid_remove()
         self._method2_btn_import.grid_remove()
 
-        # ===== 3. 运行 =====
-        run_frame = ttk.LabelFrame(root, text="运行", padding=6)
-        run_frame.pack(fill=tk.X, pady=(0, 8))
+        # ===== 4. 运行 =====
+        run_frame = ttk.LabelFrame(root, text="当前模式运行区", padding=4)
+        run_frame.pack(fill=tk.X, pady=(0, 6))
 
         # 选择行
         select_row = ttk.Frame(run_frame)
-        select_row.pack(fill=tk.X, pady=(0, 6))
+        select_row.pack(fill=tk.X, pady=(0, 3))
 
         ttk.Label(select_row, text="层级").pack(side=tk.LEFT, padx=(2, 4))
         self.level_box = ttk.Combobox(select_row, textvariable=self.level_var,
@@ -855,34 +1146,137 @@ class LauncherApp(_TK_BASE):
         ttk.Label(select_row, text="账号").pack(side=tk.LEFT, padx=(0, 4))
         self.account_box = ttk.Combobox(select_row, textvariable=self.account_var, width=28, state="readonly")
         self.account_box.pack(side=tk.LEFT, padx=(0, 16))
-
-        ttk.Label(select_row, text="模式").pack(side=tk.LEFT, padx=(0, 4))
-        self.run_mode_box = ttk.Combobox(
+        ttk.Label(
             select_row,
-            textvariable=self.run_mode_var,
-            values=(RUN_MODE_FOREGROUND_LABEL, RUN_MODE_BACKGROUND_LABEL),
-            width=18,
+            text="账号范围用于决定本批客户端数量和登录账号。",
+            foreground="#666666",
+        ).pack(side=tk.LEFT, padx=(0, 12))
+
+        self.client_direct_run_frame = ttk.LabelFrame(run_frame, text="客户端直登批次", padding=4)
+        client_direct_frame = self.client_direct_run_frame
+        client_direct_frame.pack(fill=tk.X, pady=(0, 4))
+        client_direct_frame.columnconfigure(0, weight=1)
+
+        self.client_direct_top_row = ttk.Frame(client_direct_frame)
+        self.client_direct_top_row.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+        self.client_direct_auto_enter_check = ttk.Checkbutton(
+            self.client_direct_top_row,
+            text="自动进入游戏",
+            variable=self.client_direct_auto_enter_var,
+        )
+        self.client_direct_auto_enter_check.pack(side=tk.LEFT, padx=(0, 18))
+        self.client_direct_auto_enter_check.state(["disabled"])
+        ttk.Label(self.client_direct_top_row, text="并发数：").pack(side=tk.LEFT, padx=(0, 4))
+        self.client_direct_concurrency_spin = ttk.Spinbox(
+            self.client_direct_top_row,
+            from_=CLIENT_DIRECT_CONCURRENCY_MIN,
+            to=CLIENT_DIRECT_CONCURRENCY_MAX,
+            increment=1,
+            textvariable=self.client_direct_concurrency_var,
+            width=4,
+            command=self._client_direct_concurrency,
+        )
+        self.client_direct_concurrency_spin.pack(side=tk.LEFT, padx=(0, 18))
+        ttk.Label(self.client_direct_top_row, text="登录范围：").pack(side=tk.LEFT, padx=(0, 4))
+        self.client_direct_login_scope_box = ttk.Combobox(
+            self.client_direct_top_row,
+            textvariable=self.client_direct_login_scope_var,
+            values=CLIENT_DIRECT_LOGIN_SCOPE_CHOICES,
+            width=10,
             state="readonly",
         )
-        self.run_mode_box.pack(side=tk.LEFT, padx=(0, 6))
-        self.run_mode_box.bind("<<ComboboxSelected>>", lambda _: self._on_run_mode_changed())
-        ttk.Label(select_row, textvariable=self.run_mode_hint_var, foreground="#996600").pack(side=tk.LEFT, padx=(0, 16))
+        self.client_direct_login_scope_box.pack(side=tk.LEFT, padx=(0, 18))
+        ttk.Label(self.client_direct_top_row, text="预计端口范围：").pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Label(self.client_direct_top_row, textvariable=self.client_direct_port_range_var, foreground="#666666").pack(
+            side=tk.LEFT, padx=(0, 18)
+        )
+        ttk.Label(self.client_direct_top_row, textvariable=self.client_direct_batch_count_var, foreground="#666666").pack(
+            side=tk.LEFT, padx=(0, 22)
+        )
+        ttk.Label(self.client_direct_top_row, text="当前批次：").pack(side=tk.LEFT, padx=(0, 4))
+        self.client_direct_batch_box = ttk.Combobox(
+            self.client_direct_top_row,
+            textvariable=self.client_direct_batch_select_var,
+            width=42,
+            state="readonly",
+        )
+        self.client_direct_batch_box.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.client_direct_batch_box.bind("<<ComboboxSelected>>", lambda _: self._on_client_direct_batch_selected())
 
-        ttk.Label(select_row, text="并发").pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Label(select_row, text="1", relief="sunken", width=4, anchor="center", padding=2).pack(side=tk.LEFT)
+        self.client_direct_batch_row = ttk.Frame(client_direct_frame)
+        self.client_direct_batch_row.grid(row=1, column=0, sticky="ew", pady=(0, 4))
+        self.client_direct_delete_batch_btn = ttk.Button(
+            self.client_direct_batch_row,
+            text="删除当前批次",
+            width=14,
+            command=self._delete_client_direct_current_batch,
+        )
+        self.client_direct_delete_batch_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self.client_direct_cleanup_batches_btn = ttk.Button(
+            self.client_direct_batch_row,
+            text="清理失效批次",
+            width=14,
+            command=self._cleanup_dead_client_direct_batches,
+        )
+        self.client_direct_cleanup_batches_btn.pack(side=tk.LEFT, padx=(0, 22))
+        ttk.Label(self.client_direct_batch_row, text="状态统计：").pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Label(
+            self.client_direct_batch_row,
+            textvariable=self.client_direct_batch_status_var,
+            foreground="#006666",
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        ttk.Label(select_row, text="重新次数").pack(side=tk.LEFT, padx=(16, 4))
-        ttk.Spinbox(select_row, from_=1, to=9, textvariable=self.batch_verify_rounds_var,
+        self.client_direct_action_row_1 = ttk.Frame(client_direct_frame)
+        self.client_direct_action_row_1.grid(row=2, column=0, sticky="ew")
+        client_direct_buttons = (
+            ("准备客户端", 14, self._prepare_client_direct_current_scope, 0, 0),
+            ("一键准备并登录", 16, self._prepare_arrange_login_client_direct_current_scope, 0, 1),
+            ("追加准备", 12, self._append_client_direct_current_scope, 0, 2),
+            ("排列本批客户端", 16, self._arrange_prepared_client_direct_current_scope, 0, 3),
+            ("执行客户端登录", 16, self._login_prepared_client_direct_current_scope, 0, 4),
+        )
+        for text, width, command, row, column in client_direct_buttons:
+            ttk.Button(self.client_direct_action_row_1, text=text, width=width, command=command).grid(
+                row=row, column=column, sticky="ew", padx=2, pady=1
+            )
+
+        self.client_direct_action_row_2 = ttk.Frame(client_direct_frame)
+        self.client_direct_action_row_2.grid(row=3, column=0, sticky="ew")
+        client_direct_repair_buttons = (
+            ("修复本批窗口", 14, self._repair_client_direct_current_batch, 0, 0),
+            ("清空本批绑定", 14, self._clear_client_direct_current_batch, 0, 1),
+            ("关闭本批客户端", 14, self._close_client_direct_current_batch, 0, 2),
+        )
+        for text, width, command, row, column in client_direct_repair_buttons:
+            ttk.Button(self.client_direct_action_row_2, text=text, width=width, command=command).grid(
+                row=row, column=column, sticky="ew", padx=2, pady=1
+            )
+        self.client_direct_stop_btn = tk.Button(
+            self.client_direct_action_row_2,
+            text="停止任务",
+            width=12,
+            fg="#cc0000",
+            command=self._stop_tasks,
+            font=("", 9, "bold"),
+        )
+        self.client_direct_stop_btn.grid(row=0, column=3, sticky="ew", padx=2, pady=1)
+
+        self.foreground_run_frame = ttk.LabelFrame(run_frame, text="前台辅助模式", padding=4)
+        self.foreground_run_frame.pack(fill=tk.X, pady=(0, 4))
+        foreground_param_row = ttk.Frame(self.foreground_run_frame)
+        foreground_param_row.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(foreground_param_row, text="并发").pack(side=tk.LEFT, padx=(2, 4))
+        ttk.Label(foreground_param_row, text="1", relief="sunken", width=4, anchor="center", padding=2).pack(side=tk.LEFT)
+        ttk.Label(foreground_param_row, text="重试次数").pack(side=tk.LEFT, padx=(16, 4))
+        ttk.Spinbox(foreground_param_row, from_=1, to=9, textvariable=self.batch_verify_rounds_var,
                     width=5).pack(side=tk.LEFT)
 
-        # 操作行
-        action_row = ttk.Frame(run_frame)
-        action_row.pack(fill=tk.X)
-
-        ttk.Button(action_row, text="单账号运行", width=14, command=self._run_selected_account).pack(side=tk.LEFT, padx=2)
-        ttk.Button(action_row, text="当前层串行", width=14, command=self._run_level_serial).pack(side=tk.LEFT, padx=2)
-        ttk.Button(action_row, text="全部串行", width=14, command=self._run_all_serial).pack(side=tk.LEFT, padx=2)
-        self.stop_btn = tk.Button(action_row, text="停止任务", width=12, fg="#cc0000",
+        foreground_action_row = ttk.Frame(self.foreground_run_frame)
+        foreground_action_row.pack(fill=tk.X)
+        ttk.Button(foreground_action_row, text="单账号运行", width=14, command=self._run_selected_account).pack(side=tk.LEFT, padx=2)
+        ttk.Button(foreground_action_row, text="当前层串行", width=14, command=self._run_level_serial).pack(side=tk.LEFT, padx=2)
+        ttk.Button(foreground_action_row, text="全部串行", width=14, command=self._run_all_serial).pack(side=tk.LEFT, padx=2)
+        self.stop_btn = tk.Button(foreground_action_row, text="停止任务", width=12, fg="#cc0000",
                                    command=self._stop_tasks, font=("", 9, "bold"))
         self.stop_btn.pack(side=tk.LEFT, padx=2)
 
@@ -893,8 +1287,8 @@ class LauncherApp(_TK_BASE):
         self._content_area.rowconfigure(1, weight=0, minsize=LOG_PANEL_COLLAPSED_HEIGHT)
 
         # ===== 4. 账号列表 =====
-        self._table_frame_m1 = ttk.LabelFrame(self._content_area, text="账号列表（方式一）", padding=2)
-        self.tree = ttk.Treeview(self._table_frame_m1, columns=ACCOUNT_TABLE_COLUMNS, show="headings", height=7)
+        self._table_frame_m1 = ttk.LabelFrame(self._content_area, text="账号列表 / 当前账号来源", padding=2)
+        self.tree = ttk.Treeview(self._table_frame_m1, columns=ACCOUNT_TABLE_COLUMNS, show="headings", height=10, selectmode="extended")
         for column in ACCOUNT_TABLE_COLUMNS:
             self.tree.heading(column, text=ACCOUNT_TABLE_HEADINGS[column])
             self.tree.column(column, **ACCOUNT_TABLE_COLUMNS_CONFIG[column])
@@ -912,7 +1306,7 @@ class LauncherApp(_TK_BASE):
         # 账号列表（方式二）
         self._table_frame_m2 = ttk.LabelFrame(self._content_area, text="CSV账号列表（方式二）", padding=2)
         csv_columns = ("name", "url", "username", "password_status", "window", "passport", "status", "timing")
-        self.csv_tree = ttk.Treeview(self._table_frame_m2, columns=csv_columns, show="headings", height=7)
+        self.csv_tree = ttk.Treeview(self._table_frame_m2, columns=csv_columns, show="headings", height=10)
         self.csv_tree.heading("name", text="名称")
         self.csv_tree.heading("url", text="链接")
         self.csv_tree.heading("username", text="账号")
@@ -945,7 +1339,7 @@ class LauncherApp(_TK_BASE):
 
         # ===== 5. 日志 =====
         self.log_panel_expanded = tk.BooleanVar(value=False)
-        self._log_outer = ttk.LabelFrame(self._content_area, text="日志", padding=2)
+        self._log_outer = ttk.Frame(self._content_area, padding=2)
         self._log_outer.configure(height=LOG_PANEL_COLLAPSED_HEIGHT)
         self._log_outer.grid_propagate(False)
         self._log_outer.columnconfigure(0, weight=1)
@@ -953,9 +1347,14 @@ class LauncherApp(_TK_BASE):
         self._log_outer.rowconfigure(1, weight=1)
         self._log_outer.grid(row=1, column=0, sticky="ew", pady=(0, 4))
         log_header = ttk.Frame(self._log_outer)
-        log_header.grid(row=0, column=0, sticky="ew", pady=(0, 2))
+        log_header.grid(row=0, column=0, sticky="ew")
+        ttk.Label(log_header, text="日志").pack(side=tk.LEFT, padx=(2, 8))
         self.log_dir_btn = ttk.Button(log_header, text="打开日志目录", command=self._open_log_dir)
         self.log_dir_btn.pack(side=tk.RIGHT, padx=2)
+        self.log_clear_btn = ttk.Button(log_header, text="清空日志", command=self._clear_log_text)
+        self.log_clear_btn.pack(side=tk.RIGHT, padx=2)
+        self.log_copy_btn = ttk.Button(log_header, text="复制日志", command=self._copy_log_text)
+        self.log_copy_btn.pack(side=tk.RIGHT, padx=2)
         self.log_toggle_btn = ttk.Button(log_header, text="展开日志", command=self._toggle_log_panel)
         self.log_toggle_btn.pack(side=tk.RIGHT, padx=2)
 
@@ -971,11 +1370,12 @@ class LauncherApp(_TK_BASE):
         status_frame = ttk.Frame(root, relief="sunken", padding=(8, 3))
         status_frame.pack(fill=tk.X, side=tk.BOTTOM)
         self._status_left = tk.StringVar(value="就绪")
-        self._status_mid = tk.StringVar(value=f"当前模式：{RUN_MODE_FOREGROUND_LABEL}")
+        self._status_mid = tk.StringVar(value=f"当前模式：{RUN_MODE_CLIENT_DIRECT_LABEL}")
         self._status_right = tk.StringVar(value="并发：1")
         ttk.Label(status_frame, textvariable=self._status_left).pack(side=tk.LEFT)
         ttk.Label(status_frame, textvariable=self._status_mid).pack(side=tk.LEFT, padx=(40, 0))
         ttk.Label(status_frame, textvariable=self._status_right).pack(side=tk.RIGHT)
+        self._on_run_mode_changed()
 
     def _toggle_debug(self) -> None:
         if not hasattr(self, "debug_frame") or not hasattr(self, "_debug_visible"):
@@ -1008,6 +1408,22 @@ class LauncherApp(_TK_BASE):
             self._log_text_frame.grid_remove()
             self.log_toggle_btn.configure(text="展开日志")
 
+    def _copy_log_text(self) -> None:
+        try:
+            text = self.log_text.get("1.0", tk.END).strip()
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            self._status_left.set("日志已复制")
+        except Exception as exc:
+            messagebox.showwarning("复制日志", f"复制日志失败：{exc}")
+
+    def _clear_log_text(self) -> None:
+        try:
+            self.log_text.delete("1.0", tk.END)
+            self._status_left.set("日志已清空")
+        except Exception as exc:
+            messagebox.showwarning("清空日志", f"清空日志失败：{exc}")
+
     def _toggle_advanced_config(self) -> None:
         self.advanced_config_visible.set(not self.advanced_config_visible.get())
         self._sync_advanced_config_visibility()
@@ -1015,8 +1431,7 @@ class LauncherApp(_TK_BASE):
     def _sync_advanced_config_visibility(self) -> None:
         if not hasattr(self, "_method1_advanced_frame"):
             return
-        is_method1 = self.method_var.get() == "method1"
-        visible = bool(self.advanced_config_visible.get()) and is_method1
+        visible = bool(self.advanced_config_visible.get()) and self._account_source_uses_bookmarks()
         if visible:
             self._method1_advanced_frame.grid()
             self._method1_advanced_toggle_btn.configure(text="隐藏高级配置")
@@ -1029,13 +1444,229 @@ class LauncherApp(_TK_BASE):
             self.run_mode_hint_var.set(RUN_MODE_BACKGROUND_HINT)
             self._status_mid.set(f"当前模式：{RUN_MODE_BACKGROUND_LABEL}")
             self._log(f"已选择{RUN_MODE_BACKGROUND_LABEL}：{RUN_MODE_BACKGROUND_HINT}。")
+        elif self._is_client_direct_run_mode():
+            self.run_mode_hint_var.set(RUN_MODE_CLIENT_DIRECT_HINT)
+            self._status_mid.set(f"当前模式：{RUN_MODE_CLIENT_DIRECT_LABEL}")
+            auto_text = "自动进入游戏" if self._client_direct_auto_enter_game() else "停在公告/进入游戏前"
+            self._log(f"已选择{RUN_MODE_CLIENT_DIRECT_LABEL}：{RUN_MODE_CLIENT_DIRECT_HINT}，{auto_text}。")
         else:
             self.run_mode_hint_var.set("")
             self._status_mid.set(f"当前模式：{RUN_MODE_FOREGROUND_LABEL}")
             self._log(f"已选择{RUN_MODE_FOREGROUND_LABEL}。")
+        self._sync_work_mode_visibility()
+        self._sync_account_source_controls()
+        self._sync_client_direct_controls()
+        self._sync_work_mode_buttons()
 
     def _is_background_run_mode(self) -> bool:
         return _run_mode_key_for_owner(self) == "background"
+
+    def _is_client_direct_run_mode(self) -> bool:
+        return _run_mode_key_for_owner(self) == "client_direct"
+
+    def _sync_client_direct_controls(self) -> None:
+        check = getattr(self, "client_direct_auto_enter_check", None)
+        spin = getattr(self, "client_direct_base_port_spin", None)
+        if self._is_client_direct_run_mode():
+            if check is not None:
+                check.state(["!disabled"])
+            if spin is not None:
+                spin.state(["!disabled"])
+        else:
+            if check is not None:
+                check.state(["disabled"])
+            if spin is not None:
+                spin.state(["disabled"])
+        self._sync_client_direct_port_range()
+
+    def _sync_work_mode_visibility(self) -> None:
+        client_direct = self._is_client_direct_run_mode()
+        client_frame = getattr(self, "client_direct_run_frame", None)
+        foreground_frame = getattr(self, "foreground_run_frame", None)
+        if client_frame is not None:
+            if client_direct:
+                client_frame.pack(fill=tk.X, pady=(0, 4))
+            else:
+                client_frame.pack_forget()
+        if foreground_frame is not None:
+            if client_direct:
+                foreground_frame.pack_forget()
+            else:
+                foreground_frame.pack(fill=tk.X, pady=(0, 4))
+
+        for widget in getattr(self, "wm_legacy_launch_grid_widgets", ()):
+            if client_direct:
+                widget.grid_remove()
+            else:
+                widget.grid()
+        launch_btn = getattr(self, "wm_launch_btn", None)
+        if launch_btn is not None:
+            if client_direct:
+                launch_btn.pack_forget()
+            else:
+                try:
+                    launch_btn.pack(side=tk.LEFT, padx=(4, 10), before=self.wm_identify_btn)
+                except Exception:
+                    launch_btn.pack(side=tk.LEFT, padx=(4, 10))
+
+    def _sync_work_mode_buttons(self) -> None:
+        client_direct = self._is_client_direct_run_mode()
+        pairs = (
+            (getattr(self, "run_mode_client_btn", None), client_direct),
+            (getattr(self, "run_mode_foreground_btn", None), not client_direct),
+        )
+        for button, selected in pairs:
+            if button is None:
+                continue
+            try:
+                button.configure(
+                    relief=tk.SUNKEN if selected else tk.RAISED,
+                    bg="#d9edf7" if selected else self.cget("bg"),
+                    activebackground="#d9edf7" if selected else self.cget("bg"),
+                )
+            except Exception:
+                pass
+
+    def _account_source_uses_bookmarks(self) -> bool:
+        return self._is_client_direct_run_mode() or self.method_var.get() == "method1"
+
+    def _sync_account_source_controls(self) -> None:
+        use_bookmarks = self._account_source_uses_bookmarks()
+        client_direct = self._is_client_direct_run_mode()
+        if hasattr(self, "method_row"):
+            if client_direct:
+                self.method_row.grid_remove()
+            else:
+                self.method_row.grid()
+        for w in (
+            self._method1_row1,
+            self._method1_btn_auto_bookmark,
+            self._method1_btn_load,
+            self._method1_row2a,
+            self._method1_bookmark_candidate_combo,
+            self._method1_row3a,
+            self._method1_root_combo,
+            self._method1_advanced_toggle_btn,
+        ):
+            w.grid() if use_bookmarks else w.grid_remove()
+        if use_bookmarks:
+            self._sync_advanced_config_visibility()
+        else:
+            self._method1_advanced_frame.grid_remove()
+        for w in (self._method2_row1, self._method2_csv_entry, self._method2_btn_pick, self._method2_btn_import):
+            w.grid() if not use_bookmarks else w.grid_remove()
+        if use_bookmarks:
+            self._table_frame_m2.grid_remove()
+            self._table_frame_m1.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
+            self._refresh_account_choices()
+        else:
+            self._table_frame_m1.grid_remove()
+            self._table_frame_m2.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
+        if hasattr(self, "group_settings_btn"):
+            self.group_settings_btn.configure(state=tk.NORMAL if use_bookmarks else tk.DISABLED)
+
+    def _client_direct_auto_enter_game(self) -> bool:
+        var = getattr(self, "client_direct_auto_enter_var", None)
+        if var is None:
+            return True
+        try:
+            return bool(var.get())
+        except Exception:
+            return True
+
+    def _client_direct_concurrency(self) -> int:
+        var = getattr(self, "client_direct_concurrency_var", None)
+        if var is None:
+            return CLIENT_DIRECT_CONCURRENCY_MIN
+        try:
+            value = int(var.get())
+        except Exception:
+            value = CLIENT_DIRECT_CONCURRENCY_MIN
+        value = max(CLIENT_DIRECT_CONCURRENCY_MIN, min(CLIENT_DIRECT_CONCURRENCY_MAX, value))
+        try:
+            var.set(value)
+        except Exception:
+            pass
+        return value
+
+    def _client_direct_base_port(self) -> int:
+        try:
+            value = int(self.client_direct_base_port_var.get())
+        except Exception:
+            value = CLIENT_DIRECT_CDP_PORT
+        value = max(1024, min(65500, value))
+        try:
+            self.client_direct_base_port_var.set(value)
+        except Exception:
+            pass
+        return value
+
+    def _client_speed_panel_options(self) -> dict[str, object]:
+        try:
+            default_rate = float(self.default_speed_rate_var.get())
+        except Exception:
+            default_rate = 1.0
+        if default_rate <= 0:
+            default_rate = 1.0
+        try:
+            self.default_speed_rate_var.set(str(default_rate))
+        except Exception:
+            pass
+        return {
+            "auto_replace_speed_panel": _safe_bool_var(self, "auto_replace_speed_panel_var", True),
+            "custom_speed_panel_enabled": _safe_bool_var(self, "custom_speed_panel_enabled_var", True),
+            "speed_engine": _safe_string_var(self, "speed_engine_var", "timer_hook"),
+            "default_speed_rate": default_rate,
+            "speed_hook_stage": _safe_string_var(self, "speed_hook_stage_var", "after_game_ready"),
+            "speed_panel_position": "left_top",
+            "speed_panel_left": 12,
+            "speed_panel_top": 12,
+            "speed_panel_debug": _safe_bool_var(self, "speed_panel_debug_var", False),
+            "speed_panel_remove_original_toggle": _safe_bool_var(self, "speed_panel_remove_original_toggle_var", True),
+        }
+
+    def _sync_client_direct_port_range(self) -> None:
+        var = getattr(self, "client_direct_port_range_var", None)
+        if var is None:
+            return
+        try:
+            count = len(self._filtered_accounts_for_ui()) if _run_mode_key_for_owner(self) == "client_direct" else 1
+        except Exception:
+            count = 1
+        count = max(1, int(count or 1))
+        base = LauncherApp._client_direct_base_port(self)
+        var.set(f"{base} ~ {base + count - 1}")
+        count_var = getattr(self, "client_direct_batch_count_var", None)
+        if count_var is not None:
+            count_var.set(f"本批数量：{count}")
+        try:
+            return bool(var.get())
+        except Exception:
+            return True
+
+    def _confirm_client_direct_new_batch_if_live(self, accounts: list[AccountConfig], action_name: str) -> bool:
+        if not hasattr(self, "client_batch_store") or not self.client_batch_store.batches:
+            return True
+        LauncherApp._ensure_client_direct_selected_batch_current(self)
+        try:
+            LauncherApp._refresh_client_direct_sessions_for_precheck(self)
+        except Exception:
+            pass
+        batch = self.client_batch_store.current_batch()
+        live_count = self.client_batch_store.batch_live_count(
+            batch,
+            pid_exists=lambda pid: LauncherApp._client_direct_pid_exists(self, pid),
+            process_is_x5game=lambda pid: LauncherApp._client_direct_process_is_x5game(self, pid),
+        )
+        if live_count <= 0:
+            return True
+        message = f"当前批次已有 {live_count} 个存活客户端，是否创建新批次准备本次 {len(accounts)} 个账号？"
+        confirmed = messagebox.askyesno(action_name, message)
+        if confirmed:
+            self._log(f"[客户端批次] 用户确认创建新批次：旧批次={batch.batch_name}，存活={live_count}，本次数={len(accounts)}。")
+            return True
+        self._log(f"[客户端批次] 用户取消创建新批次：保留旧批次={batch.batch_name}，未启动客户端。")
+        return False
 
     def _block_background_unsupported_action(self, action_name: str) -> bool:
         if not self._is_background_run_mode():
@@ -1045,6 +1676,16 @@ class LauncherApp(_TK_BASE):
         message = "后台模式当前支持方式一单账号、当前层串行、全部串行；方式二未接入"
         self._log(f"阻止{action_name}：{message}")
         messagebox.showwarning("后台模式限制", message)
+        return True
+
+    def _block_client_direct_unsupported_action(self, action_name: str) -> bool:
+        if _run_mode_key_for_owner(self) != "client_direct":
+            return False
+        if action_name in ("单账号运行", "当前层串行", "全部串行"):
+            return False
+        message = "客户端直登模式当前仅支持方式一单账号、当前层串行和全部串行；方式二暂未接入"
+        self._log(f"阻止{action_name}：{message}")
+        messagebox.showwarning("客户端直登限制", message)
         return True
 
     def _set_game_program_path(self, path: str) -> None:
@@ -1176,8 +1817,6 @@ class LauncherApp(_TK_BASE):
             self.wm_launch_count_var.set(self.wm_row_count_mode_settings.launch_count)
             self.wm_per_row_var.set(self.wm_row_count_mode_settings.per_row)
             for widget in self.wm_fixed_param_widgets:
-                widget.grid_remove()
-            for widget in self.wm_row_param_widgets:
                 widget.grid()
             return
 
@@ -1190,8 +1829,6 @@ class LauncherApp(_TK_BASE):
         self.wm_offset_x_var.set(fixed.offset_x)
         self.wm_offset_y_var.set(fixed.offset_y)
         self.wm_per_row_var.set(fixed.per_row)
-        for widget in self.wm_row_param_widgets:
-            widget.grid_remove()
         for widget in self.wm_fixed_param_widgets:
             widget.grid()
 
@@ -3072,6 +3709,7 @@ Write-Output $count
     def _on_level_changed(self) -> None:
         self._refresh_table()
         self._refresh_account_choices()
+        self._sync_client_direct_port_range()
         self._log(
             f"层级已切换：排列方式={self.wm_tile_mode_var.get()}，"
             f"层级={self.level_var.get()}，当前账号列表 {len(self._filtered_accounts_for_ui())} 个。"
@@ -3095,6 +3733,7 @@ Write-Output $count
             self.tree.selection_remove(item)
         self._refresh_table()
         self._refresh_account_choices()
+        self._sync_client_direct_port_range()
         if log_change:
             self._log(
                 f"排列方式已切换：{self.wm_tile_mode_var.get()}；"
@@ -3207,40 +3846,7 @@ Write-Output $count
     # ===== 方式二：CSV 导入 =====
 
     def _on_method_changed(self) -> None:
-        mode = self.method_var.get()
-        is_m1 = (mode == "method1")
-        # 方式一控件
-        for w in (
-            self._method1_row1,
-            self._method1_btn_auto_bookmark,
-            self._method1_btn_load,
-            self._method1_row2a,
-            self._method1_bookmark_candidate_combo,
-            self._method1_row3a,
-            self._method1_root_combo,
-            self._method1_advanced_toggle_btn,
-        ):
-            w.grid() if is_m1 else w.grid_remove()
-        if is_m1:
-            self._sync_advanced_config_visibility()
-        else:
-            self._method1_advanced_frame.grid_remove()
-        # 方式二控件
-        for w in (self._method2_row1, self._method2_csv_entry, self._method2_btn_pick,
-                  self._method2_btn_import):
-            w.grid() if not is_m1 else w.grid_remove()
-        # 表格
-        if is_m1:
-            self._table_frame_m2.grid_remove()
-            self._table_frame_m1.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
-        else:
-            self._table_frame_m1.grid_remove()
-            self._table_frame_m2.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
-        # 账号下拉框
-        if is_m1:
-            self._refresh_account_choices()
-        if hasattr(self, "group_settings_btn"):
-            self.group_settings_btn.configure(state=tk.NORMAL if is_m1 else tk.DISABLED)
+        self._sync_account_source_controls()
 
     def _pick_csv_file(self) -> None:
         path = filedialog.askopenfilename(
@@ -3354,6 +3960,8 @@ Write-Output $count
 
     def _run_selected_account(self) -> None:
         if self.method_var.get() == "method2":
+            if LauncherApp._block_client_direct_unsupported_action(self, "方式二"):
+                return
             if self._block_background_unsupported_action("方式二"):
                 return
             self._run_method2_single()
@@ -3366,6 +3974,11 @@ Write-Output $count
             f"单账号运行前校验：排列方式={self.wm_tile_mode_var.get()}，"
             f"层级={self.level_var.get()}，账号={account.display_name}，窗口号={account.game_window_no}"
         )
+        if _run_mode_key_from_label(self.run_mode_var.get()) == "client_direct":
+            auto_text = "自动进入游戏" if LauncherApp._client_direct_auto_enter_game(self) else "不自动进入游戏"
+            self._log(f"{RUN_MODE_CLIENT_DIRECT_LABEL}：启动方式一单账号客户端直登，{auto_text}。")
+            self._start_client_direct_single_run(account)
+            return
         if not self._precheck_serial_run([account], "单账号运行"):
             return
         if not self._validate_accounts_for_current_mode([account]):
@@ -3384,9 +3997,13 @@ Write-Output $count
 
     def _run_level_serial(self) -> None:
         if self.method_var.get() == "method2":
+            if LauncherApp._block_client_direct_unsupported_action(self, "方式二"):
+                return
             if self._block_background_unsupported_action("方式二"):
                 return
             messagebox.showinfo("提示", "方式二没有层级概念，请使用\"单账号运行\"或\"全部串行\"。")
+            return
+        if LauncherApp._block_client_direct_unsupported_action(self, "当前层串行"):
             return
         background_mode = _run_mode_key_for_owner(self) == "background"
         level = self.level_var.get()
@@ -3403,6 +4020,13 @@ Write-Output $count
             self._log("当前层串行范围确认：层级=全部，运行当前列表中已勾选参与全部串行的账号。")
         else:
             self._log(f"当前层串行范围确认：只运行当前层级【{level}】，不读取全部串行勾选状态。")
+        if _run_mode_key_for_owner(self) == "client_direct":
+            self._log(
+                f"客户端当前层串行: {level}，共 {len(accounts)} 个账号，并发=1，"
+                f"从 CDP 端口 {CLIENT_DIRECT_CDP_PORT} 开始逐个分配。"
+            )
+            self._start_client_direct_serial_run(accounts, run_label="客户端当前层串行")
+            return
         if not self._precheck_serial_run(accounts, "当前层串行"):
             return
         if not self._validate_accounts_for_current_mode(accounts):
@@ -3416,11 +4040,17 @@ Write-Output $count
 
     def _run_all_serial(self) -> None:
         if self.method_var.get() == "method2":
+            if LauncherApp._block_client_direct_unsupported_action(self, "方式二"):
+                return
             if self._block_background_unsupported_action("方式二"):
                 return
             self._run_method2_all()
             return
-        background_mode = _run_mode_key_for_owner(self) == "background"
+        if LauncherApp._block_client_direct_unsupported_action(self, "全部串行"):
+            return
+        run_mode_key = _run_mode_key_for_owner(self)
+        background_mode = run_mode_key == "background"
+        client_direct_mode = run_mode_key == "client_direct"
         selected_level = self.level_var.get()
         if not background_mode and selected_level != "全部":
             message = (
@@ -3443,6 +4073,8 @@ Write-Output $count
         skipped_accounts = [account for account in all_accounts if not account.include_in_all]
         if background_mode:
             self._log("后台全部串行范围确认：使用层级=全部的 include_in_all=true 过滤逻辑。")
+        if client_direct_mode:
+            self._log("客户端全部串行范围确认：使用层级=全部的 include_in_all=true 过滤逻辑。")
         if accounts:
             self._log("本次全部串行将执行：")
             for group_name, count in self._account_group_counts(accounts):
@@ -3463,6 +4095,13 @@ Write-Output $count
             self._log(f"阻止全部串行：{message}{invalid_summary}")
             messagebox.showwarning("全部串行分组异常", message)
             return
+        if client_direct_mode:
+            self._log(
+                f"客户端全部串行: 共 {len(accounts)} 个账号，并发=1，"
+                f"从 CDP 端口 {CLIENT_DIRECT_CDP_PORT} 开始逐个分配。{self._account_count_summary(accounts)}"
+            )
+            self._start_client_direct_serial_run(accounts, run_label="客户端全部串行")
+            return
         if not self._precheck_serial_run(accounts, "全部串行"):
             return
         if not self._validate_accounts_for_current_mode(accounts):
@@ -3476,6 +4115,1061 @@ Write-Output $count
             return
         self._log(f"全部串行: 共 {len(accounts)} 个账号，批量快速登录 + 统一校验。{self._account_count_summary(accounts)}")
         self._start_serial_run(accounts, batch_fast=True)
+
+    def _client_direct_current_scope_accounts(self, action_name: str) -> list[AccountConfig] | None:
+        if _run_mode_key_for_owner(self) != "client_direct":
+            message = "请先切换到客户端直登模式。"
+            self._log(f"阻止{action_name}：{message}")
+            messagebox.showwarning(action_name, message)
+            return None
+        accounts = self._filtered_accounts_for_ui()
+        if not accounts:
+            level = self.level_var.get()
+            message = "当前没有可运行账号。" if level == "全部" else f"当前层 {level} 没有账号。"
+            self._log(f"阻止{action_name}：{message}")
+            messagebox.showwarning(action_name, message)
+            return None
+        return accounts
+
+    def _load_client_direct_sessions(self) -> None:
+        try:
+            self.client_batch_store.load()
+        except Exception as exc:
+            self._log(f"[客户端批次] 读取批次文件失败：{mask_sensitive_text(str(exc))}")
+            return
+        if not self.client_batch_store.batches:
+            self._sync_client_direct_batch_status()
+            return
+        kept_count = len(self.client_batch_store.batches)
+        removed_count = 0
+        try:
+            self.client_batch_store.refresh_all_batch_statuses(
+                pid_exists=lambda pid: LauncherApp._client_direct_pid_exists(self, pid),
+                process_is_x5game=lambda pid: LauncherApp._client_direct_process_is_x5game(self, pid),
+                cdp_available=lambda port: LauncherApp._client_direct_cdp_available(self, port),
+                hwnd_valid=lambda hwnd: LauncherApp._client_direct_is_window_alive(self, hwnd),
+            )
+            removed = self.client_batch_store.cleanup_dead_batches(
+                pid_exists=lambda pid: LauncherApp._client_direct_pid_exists(self, pid),
+                process_is_x5game=lambda pid: LauncherApp._client_direct_process_is_x5game(self, pid),
+            )
+            removed_count = len(removed)
+            kept_count = len(self.client_batch_store.batches)
+            if removed_count:
+                self.client_batch_store.save()
+        except Exception as exc:
+            self._log(f"[批次恢复] 刷新或清理失效批次失败：{mask_sensitive_text(str(exc))}")
+        LauncherApp._restore_client_direct_bindings_from_active_batch(self)
+        self._sync_client_direct_batch_status()
+        self._log(f"[批次恢复] 保留存活批次 {kept_count} 个，自动清理失效批次 {removed_count} 个。")
+        if not self.client_batch_store.batches:
+            return
+        batch = self.client_batch_store.current_batch()
+        self._log(
+            f"[客户端批次] 已恢复当前批次：{batch.batch_name}，"
+            f"绑定数={len(batch.bindings)}，base_port={batch.base_port}"
+        )
+
+    def _client_direct_batch_short_id(self, batch_id: str) -> str:
+        text = str(batch_id or "")
+        return text[-10:] if len(text) > 10 else text
+
+    def _client_direct_batch_display(self, batch) -> str:
+        counts = LauncherApp._client_direct_batch_counts(self, batch)
+        return (
+            f"{batch.batch_name} | 绑定{counts['bound']} | 存活{counts['alive']} | "
+            f"端口{LauncherApp._client_direct_batch_port_range_text(self, batch)}"
+        )
+
+    def _client_direct_selected_batch_id(self) -> str:
+        var = getattr(self, "client_direct_batch_select_var", None)
+        if var is None:
+            return ""
+        try:
+            text = str(var.get() or "")
+        except Exception:
+            return ""
+        display_map = getattr(self, "client_direct_batch_display_id_map", {})
+        if text in display_map:
+            return str(display_map[text] or "")
+        if "|" not in text:
+            return ""
+        return text.rsplit("|", 1)[-1].strip()
+
+    def _ensure_client_direct_selected_batch_current(self) -> None:
+        if not hasattr(self, "client_batch_store") or not self.client_batch_store.batches:
+            return
+        selected_batch_id = LauncherApp._client_direct_selected_batch_id(self)
+        if selected_batch_id and selected_batch_id != self.client_batch_store.active_batch_id:
+            self.client_batch_store.switch_batch(selected_batch_id)
+            LauncherApp._restore_client_direct_bindings_from_active_batch(self)
+
+    def _sync_client_direct_batch_options(self) -> None:
+        box = getattr(self, "client_direct_batch_box", None)
+        var = getattr(self, "client_direct_batch_select_var", None)
+        if box is None or var is None or not hasattr(self, "client_batch_store"):
+            return
+        displays = [LauncherApp._client_direct_batch_display(self, batch) for batch in self.client_batch_store.batches]
+        self.client_direct_batch_display_id_map = {
+            display: batch.batch_id
+            for display, batch in zip(displays, self.client_batch_store.batches)
+        }
+        try:
+            box.configure(values=displays if displays else ("无可用批次",))
+        except Exception:
+            pass
+        if not displays:
+            try:
+                var.set("无可用批次")
+            except Exception:
+                pass
+            return
+        current = self.client_batch_store.current_batch()
+        current_display = LauncherApp._client_direct_batch_display(self, current)
+        try:
+            if var.get() != current_display:
+                var.set(current_display)
+        except Exception:
+            pass
+
+    def _on_client_direct_batch_selected(self) -> None:
+        if not hasattr(self, "client_batch_store") or not self.client_batch_store.batches:
+            return
+        selected_batch_id = LauncherApp._client_direct_selected_batch_id(self)
+        if selected_batch_id:
+            self.client_batch_store.switch_batch(selected_batch_id)
+            LauncherApp._restore_client_direct_bindings_from_active_batch(self)
+        LauncherApp._sync_client_direct_batch_status(self)
+
+    def _client_direct_batch_port_range_text(self, batch) -> str:
+        ports = sorted(int(binding.cdp_port or 0) for binding in batch.bindings if int(binding.cdp_port or 0) > 0)
+        if ports:
+            return f"{ports[0]}~{ports[-1]}"
+        base = int(batch.base_port or CLIENT_DIRECT_CDP_PORT)
+        count = len(batch.bindings)
+        if count > 0:
+            return f"{base}~{base + count - 1}"
+        return f"{base}~{base}"
+
+    def _client_direct_batch_counts(self, batch) -> dict[str, int]:
+        closed_statuses = {"pid_missing", "客户端已关闭", "closed", "已关闭"}
+        cdp_statuses = {"cdp_unavailable", "CDP不可用"}
+        hwnd_statuses = {"hwnd_invalid", "窗口已失效"}
+        counts = {
+            "bound": len(batch.bindings),
+            "closed": 0,
+            "cdp_unavailable": 0,
+            "hwnd_invalid": 0,
+            "alive": 0,
+        }
+        for binding in batch.bindings:
+            status = str(binding.status or "")
+            if status in closed_statuses:
+                counts["closed"] += 1
+            elif status in cdp_statuses:
+                counts["cdp_unavailable"] += 1
+            elif status in hwnd_statuses:
+                counts["hwnd_invalid"] += 1
+            else:
+                counts["alive"] += 1
+        return counts
+
+    def _client_direct_batch_status_text(self, batch) -> str:
+        counts = LauncherApp._client_direct_batch_counts(self, batch)
+        return (
+            f"当前批次：{batch.batch_name} "
+            f"id={LauncherApp._client_direct_batch_short_id(self, batch.batch_id)} "
+            f"绑定={counts['bound']} 存活={counts['alive']} 已关闭={counts['closed']} "
+            f"CDP不可用={counts['cdp_unavailable']} 窗口失效={counts['hwnd_invalid']} "
+            f"端口={LauncherApp._client_direct_batch_port_range_text(self, batch)}"
+        )
+
+    def _client_direct_batch_stats_text(self, batch=None) -> str:
+        if batch is None:
+            counts = {"bound": 0, "alive": 0, "closed": 0, "cdp_unavailable": 0, "hwnd_invalid": 0}
+        else:
+            counts = LauncherApp._client_direct_batch_counts(self, batch)
+        return (
+            f"绑定={counts['bound']} | 存活={counts['alive']} | 已关闭={counts['closed']} | "
+            f"CDP不可用={counts['cdp_unavailable']} | 窗口失效={counts['hwnd_invalid']}"
+        )
+
+    def _sync_client_direct_batch_status(self) -> None:
+        var = getattr(self, "client_direct_batch_status_var", None)
+        if var is None:
+            return
+        try:
+            if not self.client_batch_store.batches:
+                var.set(LauncherApp._client_direct_batch_stats_text(self))
+                if hasattr(self, "_status_right"):
+                    self._status_right.set("当前批次：无")
+                delete_btn = getattr(self, "client_direct_delete_batch_btn", None)
+                if delete_btn is not None:
+                    delete_btn.configure(state=tk.DISABLED)
+                LauncherApp._sync_client_direct_batch_options(self)
+                return
+            batch = self.client_batch_store.current_batch()
+            status_text = LauncherApp._client_direct_batch_status_text(self, batch)
+            var.set(LauncherApp._client_direct_batch_stats_text(self, batch))
+            if hasattr(self, "_status_right"):
+                self._status_right.set(status_text)
+            delete_btn = getattr(self, "client_direct_delete_batch_btn", None)
+            if delete_btn is not None:
+                delete_btn.configure(state=tk.NORMAL)
+            self.client_direct_base_port_var.set(int(batch.base_port or CLIENT_DIRECT_CDP_PORT))
+            LauncherApp._sync_client_direct_batch_options(self)
+        except Exception:
+            var.set(LauncherApp._client_direct_batch_stats_text(self))
+            if hasattr(self, "_status_right"):
+                self._status_right.set("当前批次：无")
+            delete_btn = getattr(self, "client_direct_delete_batch_btn", None)
+            if delete_btn is not None:
+                delete_btn.configure(state=tk.DISABLED)
+
+    def _record_from_batch_binding(self, binding: ClientBatchBinding) -> ClientDirectRunRecord:
+        return ClientDirectRunRecord(
+            account_id=binding.account_id,
+            account_name=binding.account_name,
+            pid=int(binding.pid or 0),
+            hwnd=int(binding.hwnd or 0),
+            cdp_port=int(binding.cdp_port or 0),
+            login_url=binding.login_url,
+            status=binding.status,
+            error_message=binding.error_message,
+        )
+
+    def _batch_binding_from_record(self, record: ClientDirectRunRecord) -> ClientBatchBinding:
+        return ClientBatchBinding(
+            account_id=record.account_id,
+            account_name=record.account_name,
+            pid=int(record.pid or 0),
+            hwnd=int(record.hwnd or 0),
+            cdp_port=int(record.cdp_port or 0),
+            login_url=record.login_url,
+            status=record.status,
+            error_message=record.error_message,
+        )
+
+    def _restore_client_direct_bindings_from_active_batch(self) -> None:
+        if not hasattr(self, "client_batch_store") or not self.client_batch_store.batches:
+            self.client_direct_bindings = {}
+            return
+        try:
+            batch = self.client_batch_store.current_batch()
+        except Exception:
+            self.client_direct_bindings = {}
+            return
+        self.client_direct_bindings = {
+            binding.account_id: LauncherApp._record_from_batch_binding(self, binding)
+            for binding in batch.bindings
+        }
+
+    def _save_client_direct_bindings_to_active_batch(self, *, sync_ui: bool = True) -> None:
+        if not hasattr(self, "client_batch_store"):
+            return
+        batch_bindings = [
+            LauncherApp._batch_binding_from_record(self, record)
+            for record in self.client_direct_bindings.values()
+        ]
+        self.client_batch_store.replace_current_bindings(batch_bindings)
+        self.client_batch_store.save()
+        if sync_ui:
+            self._sync_client_direct_batch_status()
+
+    def _save_client_direct_bindings_to_active_batch_threadsafe(self, *, sync_ui: bool = True) -> None:
+        lock = getattr(self, "client_direct_bindings_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            try:
+                self.client_direct_bindings_lock = lock
+            except Exception:
+                lock = None
+        if lock is None:
+            LauncherApp._save_client_direct_bindings_to_active_batch(self, sync_ui=sync_ui)
+            return
+        with lock:
+            LauncherApp._save_client_direct_bindings_to_active_batch(self, sync_ui=sync_ui)
+
+    def _account_for_client_direct_record(self, record: ClientDirectRunRecord) -> AccountConfig:
+        for account in getattr(self, "accounts", []):
+            if account.key == record.account_id:
+                return account
+        return ClientDirectAccountRef(
+            key=record.account_id,
+            display_name=record.account_name or record.account_id,
+            url=record.login_url,
+        )
+
+    def _client_direct_accounts_from_active_batch(self) -> list[AccountConfig]:
+        if not hasattr(self, "client_batch_store") or not self.client_batch_store.batches:
+            if getattr(self, "client_direct_bindings", None):
+                return [
+                    LauncherApp._account_for_client_direct_record(self, record)
+                    for record in self.client_direct_bindings.values()
+                ]
+            try:
+                accounts = LauncherApp._client_direct_current_scope_accounts(self, "客户端批次")
+                return accounts or []
+            except Exception:
+                return []
+        LauncherApp._ensure_client_direct_selected_batch_current(self)
+        LauncherApp._restore_client_direct_bindings_from_active_batch(self)
+        return [
+            LauncherApp._account_for_client_direct_record(self, record)
+            for record in self.client_direct_bindings.values()
+        ]
+
+    def _client_direct_scope_label(self) -> str:
+        level = self.level_var.get()
+        return "全部串行" if level == "全部" else f"当前层:{level}"
+
+    def _client_direct_auto_batch_name(self, accounts: list[AccountConfig]) -> str:
+        level = self.level_var.get()
+        scope_name = "全部" if level == "全部" else (level or "当前层")
+        base_name = f"{scope_name}-{len(accounts)}号"
+        existing_names = {
+            str(batch.batch_name or "")
+            for batch in getattr(self.client_batch_store, "batches", [])
+        }
+        if base_name not in existing_names:
+            return base_name
+        suffix = 2
+        while f"{base_name}-{suffix}" in existing_names:
+            suffix += 1
+        return f"{base_name}-{suffix}"
+
+    def _create_client_direct_batch_for_accounts(self, accounts: list[AccountConfig], *, append: bool) -> None:
+        base_port = LauncherApp._client_direct_base_port(self)
+        if append and self.client_batch_store.batches:
+            batch = self.client_batch_store.current_batch()
+            batch.base_port = base_port
+            batch.auto_enter_game = LauncherApp._client_direct_auto_enter_game(self)
+            batch.scope = self._client_direct_scope_label()
+        else:
+            name = LauncherApp._client_direct_auto_batch_name(self, accounts)
+            batch = self.client_batch_store.create_batch(
+                name,
+                scope=self._client_direct_scope_label(),
+                base_port=base_port,
+                auto_enter_game=LauncherApp._client_direct_auto_enter_game(self),
+            )
+            log = getattr(self, "_log", None)
+            if callable(log):
+                log(f"[批次] 自动创建批次：{name}，batch_id={batch.batch_id}")
+            if not append:
+                self.client_direct_bindings = {}
+        self.client_batch_store.save()
+        self._sync_client_direct_batch_status()
+
+    def _precheck_client_direct_prepare_ports(self, accounts: list[AccountConfig], *, append: bool) -> bool:
+        LauncherApp._ensure_client_direct_selected_batch_current(self)
+        base_port = LauncherApp._client_direct_base_port(self)
+        count = len(accounts)
+        live_binding_ports = LauncherApp._refresh_client_direct_sessions_for_precheck(self)
+        system_ports = check_port_range_available(base_port, count)
+        range_ports = {base_port + index for index in range(count)}
+        live_conflicts = sorted(range_ports & live_binding_ports)
+        if system_ports or live_conflicts:
+            blocked_ports = set(live_binding_ports)
+            recommended = find_next_available_port_range(
+                base_port,
+                count,
+                blocked_ports=blocked_ports,
+            )
+            parts = [f"当前端口范围不可用：{base_port}~{base_port + count - 1}"]
+            if system_ports:
+                parts.append("系统真实占用端口：" + "、".join(str(port) for port in system_ports))
+            if live_conflicts:
+                parts.append("存活批次绑定端口：" + "、".join(str(port) for port in live_conflicts))
+            if recommended is not None:
+                self.client_direct_base_port_var.set(int(recommended))
+                LauncherApp._sync_client_direct_port_range(self)
+                system_text = "、".join(str(port) for port in system_ports) if system_ports else "无"
+                live_text = "、".join(str(port) for port in live_conflicts) if live_conflicts else "无"
+                self._log(
+                    f"[端口预检] 原端口 {base_port}~{base_port + count - 1} 不可用，"
+                    f"系统占用={system_text}，存活批次绑定={live_text}，"
+                    f"自动改用推荐端口 {recommended}~{recommended + count - 1}。"
+                )
+                return True
+            message = "端口范围不可用，请更换起始端口。\n" + "\n".join(parts)
+            self._log(f"[客户端批次] 阻止准备：{message.replace(chr(10), ' ')}")
+            messagebox.showwarning("客户端直登端口占用", message)
+            return False
+        return True
+
+    def _prepare_client_direct_current_scope(self) -> None:
+        accounts = LauncherApp._client_direct_current_scope_accounts(self, "准备客户端")
+        if not accounts:
+            return
+        level = self.level_var.get()
+        concurrency = LauncherApp._client_direct_concurrency(self)
+        self._log(f"准备客户端：层级={level}，账号数={len(accounts)}，并发={concurrency}。")
+        self._start_client_direct_prepare_run(accounts, run_label="客户端准备当前层", append=False)
+
+    def _append_client_direct_current_scope(self) -> None:
+        accounts = LauncherApp._client_direct_current_scope_accounts(self, "追加准备")
+        if not accounts:
+            return
+        if not self.client_batch_store.batches:
+            message = "当前没有可追加的客户端批次，请先点击“准备客户端”。"
+            self._log(f"阻止追加准备：{message}")
+            messagebox.showwarning("追加准备", message)
+            return
+        existing = self.client_batch_store.binding_account_ids()
+        new_accounts = [account for account in accounts if account.key not in existing]
+        skipped = [account for account in accounts if account.key in existing]
+        if skipped:
+            self._log("追加准备跳过已在当前批次的账号：" + "、".join(account.display_name for account in skipped))
+        if not new_accounts:
+            message = "当前层账号都已经在当前批次中。"
+            self._log(f"阻止追加准备：{message}")
+            messagebox.showwarning("追加准备", message)
+            return
+        concurrency = LauncherApp._client_direct_concurrency(self)
+        self._log(f"追加准备：新增账号数={len(new_accounts)}，并发={concurrency}。")
+        self._start_client_direct_prepare_run(new_accounts, run_label="客户端追加准备", append=True)
+
+    def _prepare_arrange_login_client_direct_current_scope(self) -> None:
+        accounts = LauncherApp._client_direct_current_scope_accounts(self, "一键准备并登录")
+        if not accounts:
+            return
+        auto_enter = LauncherApp._client_direct_auto_enter_game(self)
+        self._log(
+            f"[一键准备并登录] 开始：账号数={len(accounts)}，"
+            f"auto_enter_game={'true' if auto_enter else 'false'}。"
+        )
+        started = LauncherApp._start_client_direct_prepare_run(
+            self,
+            accounts,
+            run_label="客户端一键准备",
+            append=False,
+            skip_port_precheck=False,
+        )
+        if not started:
+            return
+        self._client_direct_one_click_accounts = list(accounts)
+        after = getattr(self, "after", None)
+        if callable(after):
+            after(500, self._continue_client_direct_one_click_after_prepare)
+
+    def _continue_client_direct_one_click_after_prepare(self) -> None:
+        worker_thread = getattr(self, "worker_thread", None)
+        if worker_thread and worker_thread.is_alive():
+            self.after(500, self._continue_client_direct_one_click_after_prepare)
+            return
+        accounts = list(getattr(self, "_client_direct_one_click_accounts", []) or [])
+        if not accounts:
+            return
+        successful = [
+            account for account in accounts
+            if account.key in self.client_direct_bindings
+            and self.client_direct_bindings[account.key].status == "客户端已启动/待登录"
+        ]
+        if not successful:
+            messagebox.showwarning("一键准备并登录", "准备阶段没有成功启动的客户端，已停止后续排列和登录。")
+            return
+        if len(successful) < len(accounts):
+            failed_accounts = [account for account in accounts if account not in successful]
+            failed_lines = []
+            for account in failed_accounts:
+                record = self.client_direct_bindings.get(account.key)
+                reason = ""
+                if record is not None:
+                    reason = str(record.error_message or record.status or "")
+                if not reason:
+                    reason = str(getattr(self, "status_by_key", {}).get(account.key, "") or "准备失败")
+                failed_lines.append(f"- {account.display_name}：{reason}")
+            detail = "\n".join(failed_lines)
+            if not messagebox.askyesno(
+                "一键准备并登录",
+                f"成功：{len(successful)}\n失败：{len(accounts) - len(successful)}\n\n"
+                f"失败账号：\n{detail}\n\n是否继续排列并登录成功的 {len(successful)} 个？",
+            ):
+                self._log("[一键准备并登录] 准备部分失败，用户取消后续排列和登录。")
+                return
+        arranged = LauncherApp._arrange_prepared_client_direct_current_scope(self, successful)
+        if arranged is False:
+            return
+        LauncherApp._login_prepared_client_direct_current_scope(self, successful)
+
+    def _arrange_prepared_client_direct_current_scope(self, accounts_override: list[AccountConfig] | None = None) -> bool:
+        accounts = accounts_override if accounts_override is not None else LauncherApp._client_direct_accounts_from_active_batch(self)
+        if not accounts:
+            messagebox.showwarning("排列本批客户端", "当前批次没有绑定记录，请先准备客户端。")
+            return False
+        worker_thread = getattr(self, "worker_thread", None)
+        if worker_thread and worker_thread.is_alive():
+            messagebox.showwarning("任务运行中", "已有任务正在运行，请先停止或等待完成。")
+            return False
+
+        arrangement = self._wm_read_arrangement_config()
+        if arrangement is None:
+            return False
+        tile_mode, tile_config = arrangement
+        windows = LauncherApp._client_direct_collect_binding_windows(self, accounts)
+        if not windows:
+            LauncherApp._save_client_direct_bindings_to_active_batch(self)
+            message = "当前层没有可排列的已准备客户端窗口。"
+            self._log(f"排列本批客户端：{message}")
+            messagebox.showwarning("排列本批客户端", message)
+            return False
+
+        self._save_window_manager_settings()
+        self._log(
+            f"排列本批客户端：层级={self.level_var.get()}，"
+            f"绑定窗口数={len(windows)}，排列方式={tile_mode}。"
+        )
+        try:
+            results = LauncherApp._client_direct_tile_binding_windows(
+                self,
+                windows,
+                tile_mode,
+                tile_config,
+                log=lambda message: self._log(f"排列本批客户端：{message}"),
+            )
+        except Exception as exc:
+            error = str(exc)
+            self._log(f"排列本批客户端失败：{error}")
+            messagebox.showerror("排列本批客户端失败", error)
+            return False
+
+        self._wm_log_tile_results(results, lambda message: self._log(f"排列本批客户端：{message}"))
+        auto_rename_var = getattr(self, "wm_auto_rename_after_tile_var", None)
+        try:
+            auto_rename_enabled = bool(auto_rename_var.get()) if auto_rename_var is not None else False
+        except Exception:
+            auto_rename_enabled = False
+        if auto_rename_enabled:
+            LauncherApp._rename_client_direct_bound_windows_after_tile(self, accounts, results)
+        account_by_hwnd = {
+            int(record.hwnd): account
+            for account in accounts
+            for record in [self.client_direct_bindings.get(account.key)]
+            if record is not None and int(record.hwnd or 0) > 0
+        }
+        for result in results:
+            if not result.success:
+                continue
+            account = account_by_hwnd.get(int(result.window.hwnd))
+            if account is None:
+                continue
+            record = self.client_direct_bindings.get(account.key)
+            if record is None:
+                continue
+            record.status = "已排列"
+            self.client_direct_bindings[account.key] = record
+            self._set_status(account, "已排列")
+        LauncherApp._save_client_direct_bindings_to_active_batch(self)
+        success_count = sum(1 for result in results if result.success)
+        fail_count = len(results) - success_count
+        self._log(f"排列本批客户端完成：成功 {success_count}，失败 {fail_count}。")
+        return True
+
+    def _login_prepared_client_direct_current_scope(self, accounts_override: list[AccountConfig] | None = None) -> None:
+        scope_label = "本次准备账号"
+        if accounts_override is not None:
+            accounts = accounts_override
+        else:
+            scope_label = LauncherApp._client_direct_login_scope(self)
+            accounts = LauncherApp._client_direct_accounts_for_login_scope(self, scope_label)
+            if accounts is None:
+                return
+        if not accounts:
+            messagebox.showwarning("执行客户端登录", f"登录范围={scope_label} 下没有可登录账号。")
+            return
+        if hasattr(self, "client_batch_store") and self.client_batch_store.batches:
+            level = self.client_batch_store.current_batch().scope
+        else:
+            level = self.level_var.get()
+        auto_text = "自动进入游戏" if LauncherApp._client_direct_auto_enter_game(self) else "不自动进入游戏"
+        concurrency = LauncherApp._client_direct_concurrency(self)
+        self._log(f"[客户端直登] 登录范围={scope_label}，本次登录账号数={len(accounts)}。")
+        self._log("[客户端直登] 登录账号：" + "、".join(str(getattr(account, "game_window_no", "") or account.display_name) for account in accounts))
+        self._log(f"执行客户端登录：层级={level}，账号数={len(accounts)}，并发={concurrency}，{auto_text}。")
+        self._start_client_direct_prepared_login_run(accounts, run_label="客户端当前层登录")
+
+    def _client_direct_login_scope(self) -> str:
+        var = getattr(self, "client_direct_login_scope_var", None)
+        try:
+            value = str(var.get() if var is not None else "").strip()
+        except Exception:
+            value = ""
+        if value not in CLIENT_DIRECT_LOGIN_SCOPE_CHOICES:
+            value = CLIENT_DIRECT_LOGIN_SCOPE_PENDING
+            try:
+                if var is not None:
+                    var.set(value)
+            except Exception:
+                pass
+        return value
+
+    def _client_direct_accounts_for_login_scope(self, scope: str) -> list[AccountConfig] | None:
+        accounts = LauncherApp._client_direct_accounts_from_active_batch(self)
+        if not accounts:
+            return []
+        if not getattr(getattr(self, "client_batch_store", None), "batches", None):
+            return accounts
+        records = getattr(self, "client_direct_bindings", {}) or {}
+        if scope == CLIENT_DIRECT_LOGIN_SCOPE_ALL:
+            return accounts
+        if scope == CLIENT_DIRECT_LOGIN_SCOPE_SELECTED:
+            tree = getattr(self, "tree", None)
+            try:
+                selected_ids = {str(item) for item in tree.selection()} if tree is not None else set()
+            except Exception:
+                selected_ids = set()
+            if not selected_ids:
+                messagebox.showwarning("执行客户端登录", "请先在账号列表中选择要登录的账号。")
+                return None
+            current_ids = {str(key) for key in records.keys()}
+            return [account for account in accounts if str(account.key) in selected_ids and str(account.key) in current_ids]
+        if scope == CLIENT_DIRECT_LOGIN_SCOPE_FAILED:
+            return [
+                account
+                for account in accounts
+                if str(getattr(records.get(account.key), "status", "") or "").strip() in CLIENT_DIRECT_LOGIN_FAILED_STATUSES
+            ]
+        return [
+            account
+            for account in accounts
+            if str(getattr(records.get(account.key), "status", "") or "").strip() in CLIENT_DIRECT_LOGIN_PENDING_STATUSES
+        ]
+
+    def _client_direct_pid_exists(self, pid: int) -> bool:
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, int(pid or 0))
+            if not handle:
+                return False
+            ctypes.windll.kernel32.CloseHandle(wintypes.HANDLE(handle))
+            return True
+        except Exception:
+            return False
+
+    def _client_direct_process_is_x5game(self, pid: int) -> bool:
+        path = get_process_path_by_pid(int(pid or 0))
+        return Path(path).name.lower() == "x5game.exe"
+
+    def _client_direct_cdp_available(self, port: int) -> bool:
+        return not is_tcp_port_available(int(port or 0))
+
+    def _refresh_client_direct_sessions_for_precheck(self) -> set[int]:
+        if not hasattr(self, "client_batch_store") or not self.client_batch_store.batches:
+            return set()
+        try:
+            self.client_batch_store.refresh_all_batch_statuses(
+                pid_exists=lambda pid: LauncherApp._client_direct_pid_exists(self, pid),
+                process_is_x5game=lambda pid: LauncherApp._client_direct_process_is_x5game(self, pid),
+                cdp_available=lambda port: LauncherApp._client_direct_cdp_available(self, port),
+                hwnd_valid=lambda hwnd: LauncherApp._client_direct_is_window_alive(self, hwnd),
+            )
+            if self.client_batch_store.path.exists():
+                self.client_batch_store.save()
+            LauncherApp._restore_client_direct_bindings_from_active_batch(self)
+            LauncherApp._sync_client_direct_batch_status(self)
+        except Exception as exc:
+            self._log(f"[客户端批次] 刷新批次状态失败：{mask_sensitive_text(str(exc))}")
+        try:
+            return self.client_batch_store.live_binding_ports(
+                pid_exists=lambda pid: LauncherApp._client_direct_pid_exists(self, pid),
+                process_is_x5game=lambda pid: LauncherApp._client_direct_process_is_x5game(self, pid),
+            )
+        except Exception as exc:
+            self._log(f"[客户端批次] 读取存活绑定端口失败：{mask_sensitive_text(str(exc))}")
+            return set()
+
+    def _rename_client_direct_current_batch(self) -> None:
+        if not self.client_batch_store.batches:
+            messagebox.showwarning("重命名批次", "当前没有客户端批次。")
+            return
+        LauncherApp._ensure_client_direct_selected_batch_current(self)
+        batch = self.client_batch_store.current_batch()
+        new_name = simpledialog.askstring("重命名批次", "请输入新的批次名称：", initialvalue=batch.batch_name)
+        if new_name is None:
+            return
+        clean_name = new_name.strip()
+        if not clean_name:
+            messagebox.showwarning("重命名批次", "批次名称不能为空。")
+            return
+        batch.batch_name = clean_name
+        batch.updated_at = time.strftime("%Y-%m-%d %H:%M:%S")
+        self.client_batch_store.save()
+        LauncherApp._sync_client_direct_batch_status(self)
+        self._log(f"[客户端批次] 已重命名当前批次：{clean_name}")
+
+    def _delete_client_direct_current_batch(self) -> None:
+        if not self.client_batch_store.batches:
+            messagebox.showwarning("删除当前批次", "当前没有客户端批次。")
+            return
+        LauncherApp._ensure_client_direct_selected_batch_current(self)
+        LauncherApp._refresh_client_direct_sessions_for_precheck(self)
+        batch = self.client_batch_store.current_batch()
+        live_count = self.client_batch_store.batch_live_count(
+            batch,
+            pid_exists=lambda pid: LauncherApp._client_direct_pid_exists(self, pid),
+            process_is_x5game=lambda pid: LauncherApp._client_direct_process_is_x5game(self, pid),
+        )
+        if live_count > 0:
+            message = (
+                f"当前批次仍有存活客户端 {live_count} 个。\n"
+                "删除批次只会删除绑定记录，不会关闭客户端。\n"
+                "如需关闭客户端，请先点击“关闭本批客户端”。\n"
+                "是否仍然删除批次记录？"
+            )
+        else:
+            message = f"确定删除当前批次“{batch.batch_name}”的绑定记录吗？\n不会关闭任何客户端。"
+        if not messagebox.askyesno("删除当前批次", message):
+            self._log("[客户端批次] 用户取消删除当前批次。")
+            return
+        batch_id = batch.batch_id
+        batch_name = batch.batch_name
+        self.client_batch_store.delete_batch(batch_id)
+        self.client_batch_store.save()
+        LauncherApp._restore_client_direct_bindings_from_active_batch(self)
+        LauncherApp._sync_client_direct_batch_status(self)
+        self._log(f"[客户端批次] 已删除当前批次记录：{batch_name} batch_id={batch_id}")
+
+    def _cleanup_dead_client_direct_batches(self) -> None:
+        if not self.client_batch_store.batches:
+            messagebox.showinfo("清理失效批次", "当前没有客户端批次。")
+            return
+        LauncherApp._refresh_client_direct_sessions_for_precheck(self)
+        dead_batches = [
+            batch
+            for batch in self.client_batch_store.batches
+            if self.client_batch_store.batch_live_count(
+                batch,
+                pid_exists=lambda pid: LauncherApp._client_direct_pid_exists(self, pid),
+                process_is_x5game=lambda pid: LauncherApp._client_direct_process_is_x5game(self, pid),
+            ) == 0
+        ]
+        if not dead_batches:
+            messagebox.showinfo("清理失效批次", "没有存活数量为 0 的失效批次。")
+            return
+        names = "\n".join(f"- {batch.batch_name}" for batch in dead_batches)
+        if not messagebox.askyesno(
+            "清理失效批次",
+            f"将清理 {len(dead_batches)} 个失效批次记录：\n{names}\n\n不会关闭任何 X5Game.exe，也不会删除 sessions 文件。是否继续？",
+        ):
+            self._log("[客户端批次] 用户取消清理失效批次。")
+            return
+        removed = self.client_batch_store.cleanup_dead_batches(
+            pid_exists=lambda pid: LauncherApp._client_direct_pid_exists(self, pid),
+            process_is_x5game=lambda pid: LauncherApp._client_direct_process_is_x5game(self, pid),
+        )
+        self.client_batch_store.save()
+        LauncherApp._restore_client_direct_bindings_from_active_batch(self)
+        LauncherApp._sync_client_direct_batch_status(self)
+        self._log(
+            "[客户端批次] 已清理失效批次："
+            + "、".join(batch.batch_name for batch in removed)
+        )
+
+    def _repair_client_direct_current_batch(self) -> None:
+        if not self.client_batch_store.batches:
+            messagebox.showwarning("修复本批窗口", "当前没有客户端批次。")
+            return
+        LauncherApp._ensure_client_direct_selected_batch_current(self)
+        batch = self.client_batch_store.current_batch()
+        if not batch.bindings:
+            messagebox.showwarning("修复本批窗口", "当前批次没有绑定记录。")
+            return
+        counts = LauncherApp._client_direct_batch_counts(self, batch)
+        port_range = LauncherApp._client_direct_batch_port_range_text(self, batch)
+        confirm_message = (
+            "即将修复当前批次：\n"
+            f"批次名称：{batch.batch_name}\n"
+            f"绑定数量：{counts['bound']}\n"
+            f"端口范围：{port_range}\n"
+            f"存活数量：{counts['alive']}\n"
+            f"已关闭数量：{counts['closed']}\n"
+            "是否继续？"
+        )
+        if not messagebox.askyesno("修复本批窗口", confirm_message):
+            self._log("[修复本批窗口] 用户取消。")
+            return
+        self._log(
+            f"[修复本批窗口] 当前批次={batch.batch_name} batch_id={batch.batch_id} "
+            f"绑定数量={counts['bound']} 端口范围={port_range}"
+        )
+        pre_repair_state = {
+            binding.account_id: (binding.status, binding.error_message)
+            for binding in batch.bindings
+        }
+        probe = RepairProbe(
+            pid_exists=lambda pid: LauncherApp._client_direct_pid_exists(self, pid),
+            process_is_x5game=lambda pid: LauncherApp._client_direct_process_is_x5game(self, pid),
+            cdp_available=lambda port: LauncherApp._client_direct_cdp_available(self, port),
+            hwnd_for_pid=lambda pid: wait_for_client_hwnd_by_pid(pid, timeout=0.5),
+        )
+        results = self.client_batch_store.repair_current_batch_windows(probe=probe)
+        missing_bindings = [binding for binding in batch.bindings if binding.status == "pid_missing"]
+        reopened_ids: set[str] = set()
+        if missing_bindings:
+            reopened_ids = LauncherApp._repair_client_direct_missing_processes(self, batch, missing_bindings)
+        LauncherApp._client_direct_restore_repaired_business_statuses(self, batch, pre_repair_state, results, reopened_ids)
+        self.client_batch_store.save()
+        LauncherApp._restore_client_direct_bindings_from_active_batch(self)
+        LauncherApp._sync_client_direct_batch_status(self)
+        for binding in batch.bindings:
+            account = LauncherApp._account_for_client_direct_record(self, LauncherApp._record_from_batch_binding(self, binding))
+            self._set_status(account, binding.status)
+            self._log(
+                f"修复本批窗口：{binding.account_name} status={binding.status} "
+                f"pid={binding.pid} hwnd={binding.hwnd} port={binding.cdp_port}"
+            )
+        self._log(f"修复本批窗口完成：{len(results)} 个绑定。")
+
+    def _client_direct_restore_repaired_business_statuses(
+        self,
+        batch,
+        pre_repair_state: dict[str, tuple[str, str]],
+        results: dict[str, str],
+        reopened_ids: set[str],
+    ) -> None:
+        for binding in getattr(batch, "bindings", []) or []:
+            account_id = str(binding.account_id)
+            if account_id in reopened_ids:
+                continue
+            if results.get(account_id) != "repaired":
+                continue
+            old_status, old_error_message = pre_repair_state.get(account_id, ("", ""))
+            if not old_status:
+                continue
+            binding.status = old_status
+            binding.error_message = old_error_message
+
+    def _repair_client_direct_missing_processes(self, batch, missing_bindings: list[ClientBatchBinding]) -> set[str]:
+        lines = "\n".join(
+            f"- {binding.account_name or binding.account_id}：pid_missing"
+            for binding in missing_bindings
+        )
+        message = (
+            f"当前批次有 {len(missing_bindings)} 个客户端进程已不存在：\n"
+            f"{lines}\n\n"
+            "是否重新启动这些缺失客户端？"
+        )
+        if not messagebox.askyesno("修复本批窗口", message):
+            self._log(f"[修复本批窗口] 用户取消补开 {len(missing_bindings)} 个 pid_missing 客户端。")
+            return set()
+
+        game_path = self._wm_game_exe_path_filter()
+        if not game_path:
+            self._log("[修复本批窗口] 游戏程序路径为空，无法补开 pid_missing 客户端。")
+            messagebox.showwarning("修复本批窗口", "请先选择 X5Game.exe。")
+            return set()
+        if not Path(game_path).exists():
+            self._log(f"[修复本批窗口] 游戏程序路径不存在：{game_path}")
+            messagebox.showwarning("修复本批窗口", f"游戏程序路径不存在：{game_path}")
+            return set()
+
+        used_ports: set[int] = set()
+        reopened_ids: set[str] = set()
+        for binding in missing_bindings:
+            account = LauncherApp._account_for_client_direct_record(self, LauncherApp._record_from_batch_binding(self, binding))
+            port = LauncherApp._client_direct_repair_port_for_binding(self, batch, binding, used_ports)
+            if port is None:
+                binding.status = "端口占用"
+                binding.error_message = "没有可用 CDP 端口"
+                self._set_status(account, "端口占用")
+                self._log(f"[修复本批窗口] 补开失败：{binding.account_name} 没有可用 CDP 端口")
+                continue
+            used_ports.add(port)
+            self._log(f"[修复本批窗口] 补开缺失客户端：{binding.account_name} port={port}")
+            result = prepare_client_direct_client(
+                ClientDirectLoginConfig(
+                    account_id=binding.account_id,
+                    account_name=binding.account_name,
+                    full_login_url=binding.login_url,
+                    x5game_path=game_path,
+                    cdp_port=port,
+                    auto_enter_game=False,
+                    timeout=60.0,
+                ),
+                stop_event=getattr(self, "stop_event", None),
+                log=lambda text, key=binding.account_id: self._log(f"[客户端直登][{key}] {mask_sensitive_text(text)}"),
+            )
+            result_binding = getattr(result, "binding", None)
+            binding.pid = int(getattr(result_binding, "pid", 0) or 0)
+            binding.hwnd = int(getattr(result_binding, "hwnd", 0) or 0)
+            binding.cdp_port = int(getattr(result_binding, "cdp_port", port) or port)
+            if result.success:
+                binding.status = "客户端已启动/待登录"
+                binding.error_message = ""
+                self._set_status(account, "客户端已启动/待登录")
+                self._log(
+                    f"[修复本批窗口] 补开成功：{binding.account_name} "
+                    f"pid={binding.pid} hwnd={binding.hwnd} port={binding.cdp_port}"
+                )
+                reopened_ids.add(str(binding.account_id))
+                self._log(f"[修复本批窗口] {binding.account_name} pid_missing，已重新启动。")
+                LauncherApp._client_direct_move_repaired_binding_to_slot(self, batch, binding)
+            else:
+                reason = mask_sensitive_text(getattr(result, "message", "") or "未知错误")
+                binding.status = "启动失败"
+                binding.error_message = reason
+                self._set_status(account, "启动失败")
+                self._log(f"[修复本批窗口] 补开失败：{binding.account_name} reason={reason}")
+            binding.updated_at = time.strftime("%Y-%m-%d %H:%M:%S")
+        batch.updated_at = time.strftime("%Y-%m-%d %H:%M:%S")
+        return reopened_ids
+
+    def _client_direct_binding_slot_index(self, batch, binding: ClientBatchBinding) -> int:
+        for attr_name in ("slot_index", "window_index"):
+            raw_value = getattr(binding, attr_name, None)
+            if raw_value is None:
+                continue
+            try:
+                value = int(raw_value)
+            except Exception:
+                continue
+            if value > 0:
+                return value - 1
+            if value == 0:
+                return 0
+        for index, item in enumerate(getattr(batch, "bindings", []) or []):
+            if str(getattr(item, "account_id", "")) == str(binding.account_id):
+                return index
+        return 0
+
+    def _client_direct_single_slot_rect(
+        self,
+        slot_index: int,
+        window_count: int,
+        tile_mode: str,
+        tile_config: TileConfig | RowTileConfig,
+    ) -> tuple[int, int, int, int]:
+        if tile_mode == WM_TILE_MODE_ROW_COUNT:
+            plan = calculate_row_tile_plan(max(1, window_count), tile_config)
+            row = slot_index // max(1, plan.cols)
+            col = slot_index % max(1, plan.cols)
+            x = int(tile_config.start_x + col * (plan.target_width + plan.gap_x))
+            y = int(tile_config.start_y + row * (plan.target_height + plan.gap_y))
+            return x, y, int(plan.target_width), int(plan.target_height)
+        x, y = calculate_tile_position(slot_index, tile_config)
+        return int(x), int(y), int(tile_config.width), int(tile_config.height)
+
+    def _client_direct_move_repaired_binding_to_slot(self, batch, binding: ClientBatchBinding) -> bool:
+        hwnd = int(binding.hwnd or 0)
+        if hwnd <= 0:
+            return False
+        if not hasattr(self, "_wm_read_arrangement_config"):
+            return False
+        arrangement = self._wm_read_arrangement_config()
+        if arrangement is None:
+            return False
+        tile_mode, tile_config = arrangement
+        slot_index = LauncherApp._client_direct_binding_slot_index(self, batch, binding)
+        slot_no = slot_index + 1
+        try:
+            x, y, width, height = LauncherApp._client_direct_single_slot_rect(
+                self,
+                slot_index,
+                len(getattr(batch, "bindings", []) or []),
+                tile_mode,
+                tile_config,
+            )
+            ok = bool(user32.SetWindowPos(hwnd, 0, x, y, width, height, SWP_NOZORDER | SWP_NOACTIVATE))
+        except Exception as exc:
+            ok = False
+            self._log(f"[修复本批窗口] {binding.account_name} 移动到第{slot_no}槽位失败：{mask_sensitive_text(str(exc))}")
+        if not ok:
+            self._log(f"[修复本批窗口] {binding.account_name} 移动到第{slot_no}槽位失败。")
+            try:
+                if messagebox.askyesno("修复本批窗口", "单独移动补开的窗口失败，是否执行“排列本批客户端”？"):
+                    LauncherApp._arrange_prepared_client_direct_current_scope(self)
+            except Exception:
+                pass
+            return False
+
+        self._log(f"[修复本批窗口] {binding.account_name} 已移动到第{slot_no}槽位。")
+        auto_rename_var = getattr(self, "wm_auto_rename_after_tile_var", None)
+        try:
+            auto_rename_enabled = bool(auto_rename_var.get()) if auto_rename_var is not None else False
+        except Exception:
+            auto_rename_enabled = False
+        if auto_rename_enabled:
+            try:
+                record = LauncherApp._record_from_batch_binding(self, binding)
+                account = LauncherApp._account_for_client_direct_record(self, record)
+                title_template = _safe_wm_title_template(self) or "斗罗大陆H5-{account_id}号"
+                new_title = LauncherApp._client_direct_binding_title_from_template(
+                    title_template,
+                    slot_no,
+                    record,
+                    account,
+                )
+                if user32.SetWindowTextW(hwnd, new_title):
+                    self._log(f"[修复本批窗口] {binding.account_name} 已重命名为 {new_title}。")
+                else:
+                    self._log(f"[修复本批窗口] {binding.account_name} 重命名失败：SetWindowTextW failed。")
+            except Exception as exc:
+                self._log(f"[修复本批窗口] {binding.account_name} 重命名失败：{mask_sensitive_text(str(exc))}")
+        return True
+
+    def _client_direct_repair_port_for_binding(self, batch, binding: ClientBatchBinding, used_ports: set[int]) -> int | None:
+        try:
+            live_ports = self.client_batch_store.live_binding_ports(
+                pid_exists=lambda pid: LauncherApp._client_direct_pid_exists(self, pid),
+                process_is_x5game=lambda pid: LauncherApp._client_direct_process_is_x5game(self, pid),
+            )
+        except Exception:
+            live_ports = set()
+        blocked_ports = {int(port) for port in live_ports | set(used_ports) if int(port or 0) > 0}
+        original_port = int(binding.cdp_port or 0)
+        if original_port > 0 and original_port not in blocked_ports and is_tcp_port_available(original_port):
+            return original_port
+
+        current_ports = [
+            int(item.cdp_port or 0)
+            for item in getattr(batch, "bindings", [])
+            if int(item.cdp_port or 0) > 0
+        ]
+        base_port = max(current_ports or [int(getattr(batch, "base_port", CLIENT_DIRECT_CDP_PORT) or CLIENT_DIRECT_CDP_PORT)])
+        return find_next_available_port_range(
+            base_port,
+            1,
+            blocked_ports=blocked_ports,
+        )
+
+    def _clear_client_direct_current_batch(self) -> None:
+        if not self.client_batch_store.batches:
+            messagebox.showwarning("清空本批绑定", "当前没有客户端批次。")
+            return
+        LauncherApp._ensure_client_direct_selected_batch_current(self)
+        if not messagebox.askyesno("清空本批绑定", "只清空当前批次绑定记录，不关闭 X5Game.exe。确定继续？"):
+            return
+        self.client_batch_store.clear_current_batch()
+        self.client_batch_store.save()
+        self.client_direct_bindings = {}
+        LauncherApp._sync_client_direct_batch_status(self)
+        self._log("清空本批绑定完成：未关闭任何 X5Game.exe。")
+
+    def _close_client_direct_current_batch(self) -> None:
+        if not self.client_batch_store.batches:
+            messagebox.showwarning("关闭本批客户端", "当前没有客户端批次。")
+            return
+        LauncherApp._ensure_client_direct_selected_batch_current(self)
+        batch = self.client_batch_store.current_batch()
+        pids = [int(binding.pid or 0) for binding in batch.bindings if int(binding.pid or 0) > 0]
+        if not pids:
+            messagebox.showwarning("关闭本批客户端", "当前批次没有可关闭的 pid。")
+            return
+        if not messagebox.askyesno("关闭本批客户端", f"只关闭当前批次记录中的 {len(pids)} 个 X5Game.exe，确定继续？"):
+            return
+        import subprocess as _sp
+
+        for pid in pids:
+            _sp.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, text=True)
+            self._log(f"关闭本批客户端：已请求关闭 pid={pid}")
+        for binding in batch.bindings:
+            binding.status = "closed"
+        self.client_batch_store.save()
+        LauncherApp._restore_client_direct_bindings_from_active_batch(self)
+        LauncherApp._sync_client_direct_batch_status(self)
 
     # ===== 方式二运行 =====
 
@@ -3759,7 +5453,7 @@ Write-Output $count
         if self._log_file is not None:
             import time as _time
             ts = _time.strftime("%H:%M:%S")
-            self._log_file.write(f"[{ts}] {msg}\n")
+            self._log_file.write(f"[{ts}] {mask_sensitive_text(msg)}\n")
             self._log_file.flush()
 
     def _queue_log_file(self, message: str) -> None:
@@ -3880,6 +5574,337 @@ Write-Output $count
         )
         self.worker_thread.start()
 
+    def _start_client_direct_single_run(self, account: AccountConfig) -> None:
+        if self.worker_thread and self.worker_thread.is_alive():
+            messagebox.showwarning("任务运行中", "已有任务正在运行，请先停止或等待完成。")
+            return
+        if not is_complete_direct_login_url(account.url):
+            self._setup_log_file(cleanup_old=False)
+            self._set_status(account, "客户端直登失败")
+            self._log("[客户端直登] 账号收藏夹 URL 不是完整客户端直登 URL，已阻止。")
+            self._log("[客户端直登] 需要 gid、pid、token、time、sign、isPcLauncher=true，且入口为已知斗罗 H5 地址。")
+            messagebox.showwarning("客户端直登失败", "当前账号链接不是完整客户端直登 URL。")
+            return
+        game_path = self._wm_game_exe_path_filter()
+        if not game_path:
+            self._setup_log_file(cleanup_old=False)
+            self._set_status(account, "客户端直登失败")
+            self._log("[客户端直登] 游戏程序路径为空，请先选择 X5Game.exe。")
+            messagebox.showwarning("客户端直登失败", "请先选择 X5Game.exe。")
+            return
+        if not Path(game_path).exists():
+            self._setup_log_file(cleanup_old=False)
+            self._set_status(account, "客户端直登失败")
+            self._log(f"[客户端直登] 游戏程序路径不存在：{game_path}")
+            messagebox.showwarning("客户端直登失败", f"游戏程序路径不存在：{game_path}")
+            return
+        if not is_tcp_port_available(CLIENT_DIRECT_CDP_PORT):
+            self._setup_log_file(cleanup_old=False)
+            self._set_status(account, "客户端直登失败")
+            self._log(f"[客户端直登] CDP 端口 {CLIENT_DIRECT_CDP_PORT} 已被占用。")
+            messagebox.showwarning("客户端直登失败", f"CDP 端口 {CLIENT_DIRECT_CDP_PORT} 已被占用。")
+            return
+
+        self._setup_log_file(cleanup_old=False)
+        self.stop_event.clear()
+        self._preserve_background_windows = True
+        self._set_status(account, "客户端直登中")
+        self.client_direct_bindings = {
+            account.key: ClientDirectRunRecord(
+                account_id=account.key,
+                account_name=account.display_name,
+                cdp_port=CLIENT_DIRECT_CDP_PORT,
+                login_url=account.url,
+                status="客户端直登中",
+            )
+        }
+        auto_enter_game = self._client_direct_auto_enter_game()
+        self.worker_thread = threading.Thread(
+            target=self._client_direct_single_worker,
+            args=(account, game_path, auto_enter_game),
+            daemon=True,
+        )
+        self.worker_thread.start()
+
+    def _start_client_direct_serial_run(self, accounts: list[AccountConfig], *, run_label: str) -> None:
+        if self.worker_thread and self.worker_thread.is_alive():
+            messagebox.showwarning("任务运行中", "已有任务正在运行，请先停止或等待完成。")
+            return
+        if not LauncherApp._precheck_client_direct_prepare_ports(self, accounts, append=False):
+            for account in accounts:
+                self._set_status(account, "端口占用")
+            return
+        game_path = self._wm_game_exe_path_filter()
+        if not game_path:
+            self._setup_log_file(cleanup_old=False)
+            for account in accounts:
+                self._set_status(account, "客户端直登失败")
+            self._log("[客户端直登] 游戏程序路径为空，请先选择 X5Game.exe。")
+            messagebox.showwarning("客户端直登失败", "请先选择 X5Game.exe。")
+            return
+        if not Path(game_path).exists():
+            self._setup_log_file(cleanup_old=False)
+            for account in accounts:
+                self._set_status(account, "客户端直登失败")
+            self._log(f"[客户端直登] 游戏程序路径不存在：{game_path}")
+            messagebox.showwarning("客户端直登失败", f"游戏程序路径不存在：{game_path}")
+            return
+
+        self._setup_log_file(cleanup_old=False)
+        self.stop_event.clear()
+        self._preserve_background_windows = True
+        LauncherApp._create_client_direct_batch_for_accounts(self, accounts, append=False)
+        base_port = LauncherApp._client_direct_base_port(self)
+        self.client_direct_bindings = {
+            account.key: ClientDirectRunRecord(
+                account_id=account.key,
+                account_name=account.display_name,
+                cdp_port=cdp_port_for_index(index, base_port=base_port),
+                login_url=account.url,
+                status="等待中",
+            )
+            for index, account in enumerate(accounts)
+        }
+        LauncherApp._save_client_direct_bindings_to_active_batch(self)
+        for account in accounts:
+            self._set_status(account, "等待中")
+        auto_enter_game = self._client_direct_auto_enter_game()
+        self.worker_thread = threading.Thread(
+            target=self._client_direct_serial_worker,
+            args=(list(accounts), game_path, auto_enter_game, run_label, base_port),
+            daemon=True,
+        )
+        self.worker_thread.start()
+
+    def _start_client_direct_prepare_run(
+        self,
+        accounts: list[AccountConfig],
+        *,
+        run_label: str,
+        append: bool = False,
+        skip_port_precheck: bool = False,
+    ) -> bool:
+        if self.worker_thread and self.worker_thread.is_alive():
+            messagebox.showwarning("任务运行中", "已有任务正在运行，请先停止或等待完成。")
+            return False
+        if not append and not LauncherApp._confirm_client_direct_new_batch_if_live(self, accounts, run_label):
+            return False
+        if not skip_port_precheck and not LauncherApp._precheck_client_direct_prepare_ports(self, accounts, append=append):
+            return False
+        game_path = self._wm_game_exe_path_filter()
+        if not game_path:
+            self._setup_log_file(cleanup_old=False)
+            for account in accounts:
+                self._set_status(account, "启动失败")
+            self._log("[客户端直登] 游戏程序路径为空，请先选择 X5Game.exe。")
+            messagebox.showwarning("准备客户端失败", "请先选择 X5Game.exe。")
+            return False
+        if not Path(game_path).exists():
+            self._setup_log_file(cleanup_old=False)
+            for account in accounts:
+                self._set_status(account, "启动失败")
+            self._log(f"[客户端直登] 游戏程序路径不存在：{game_path}")
+            messagebox.showwarning("准备客户端失败", f"游戏程序路径不存在：{game_path}")
+            return False
+
+        self._setup_log_file(cleanup_old=False)
+        self.stop_event.clear()
+        self._preserve_background_windows = True
+        LauncherApp._create_client_direct_batch_for_accounts(self, accounts, append=append)
+        base_port = LauncherApp._client_direct_base_port(self)
+        if not append:
+            self.client_direct_bindings = {}
+        for index, account in enumerate(accounts):
+            self.client_direct_bindings[account.key] = ClientDirectRunRecord(
+                account_id=account.key,
+                account_name=account.display_name,
+                cdp_port=cdp_port_for_index(index, base_port=base_port),
+                login_url=account.url,
+                status="待准备",
+            )
+        for account in accounts:
+            self._set_status(account, "待准备")
+        LauncherApp._save_client_direct_bindings_to_active_batch(self)
+        concurrency = LauncherApp._client_direct_concurrency(self)
+        self._log(f"[客户端直登] 本次并发数={concurrency}")
+        self.worker_thread = threading.Thread(
+            target=self._client_direct_prepare_worker,
+            args=(list(accounts), game_path, run_label, base_port, concurrency),
+            daemon=True,
+        )
+        self.worker_thread.start()
+        return True
+
+    def _start_client_direct_prepared_login_run(self, accounts: list[AccountConfig], *, run_label: str) -> None:
+        if self.worker_thread and self.worker_thread.is_alive():
+            messagebox.showwarning("任务运行中", "已有任务正在运行，请先停止或等待完成。")
+            return
+        missing = [account for account in accounts if account.key not in self.client_direct_bindings]
+        if missing:
+            message = "当前层存在未准备的客户端，请先点击“准备客户端”。"
+            self._log(f"阻止执行客户端登录：{message}")
+            messagebox.showwarning("执行客户端登录", message)
+            return
+
+        self._setup_log_file(cleanup_old=False)
+        self.stop_event.clear()
+        self._preserve_background_windows = True
+        auto_enter_game = self._client_direct_auto_enter_game()
+        concurrency = LauncherApp._client_direct_concurrency(self)
+        self._log(f"[客户端直登] 本次并发数={concurrency}")
+        self.worker_thread = threading.Thread(
+            target=self._client_direct_prepared_login_worker,
+            args=(list(accounts), auto_enter_game, run_label, concurrency),
+            daemon=True,
+        )
+        self.worker_thread.start()
+
+    def _client_direct_is_window_alive(self, hwnd: int) -> bool:
+        if int(hwnd or 0) <= 0:
+            return False
+        try:
+            return bool(user32.IsWindow(int(hwnd)))
+        except Exception:
+            return False
+
+    def _client_direct_mark_window_invalid(self, account: AccountConfig, record: ClientDirectRunRecord) -> None:
+        record.status = "窗口已失效"
+        self.client_direct_bindings[account.key] = record
+        self._set_status(account, "窗口已失效")
+        self._log(f"排列本批客户端：跳过 {account.display_name}，窗口已失效 hwnd={record.hwnd}")
+
+    @staticmethod
+    def _client_direct_binding_title_from_template(
+        title_template: str,
+        index: int,
+        record: ClientDirectRunRecord,
+        account: AccountConfig | None = None,
+    ) -> str:
+        account_id_value = getattr(account, "game_window_no", None) if account is not None else None
+        raw_account_id = str(record.account_id or "").strip()
+        if not account_id_value and raw_account_id:
+            match = re.search(r"(\d+)$", raw_account_id)
+            account_id_value = match.group(1) if match else raw_account_id
+        account_id = str(account_id_value or "").strip() or str(index)
+        account_name = str(record.account_name or "").strip() or account_id
+        return str(title_template or "斗罗大陆H5-{account_id}号").format(
+            index=index,
+            number=index,
+            account_id=account_id,
+            account_name=account_name,
+            old_title=record.account_name or "",
+            hwnd=record.hwnd or "",
+        )
+
+    def _rename_client_direct_bound_windows_after_tile(self, accounts: list[AccountConfig], results) -> None:
+        title_template = _safe_wm_title_template(self) or "斗罗大陆H5-{account_id}号"
+        successful_hwnds = {int(result.window.hwnd) for result in results if getattr(result, "success", False)}
+        records: list[tuple[int, AccountConfig, ClientDirectRunRecord]] = []
+        for index, account in enumerate(accounts, start=1):
+            record = self.client_direct_bindings.get(account.key)
+            if record is None:
+                continue
+            hwnd = int(record.hwnd or 0)
+            if hwnd > 0 and hwnd in successful_hwnds:
+                records.append((index, account, record))
+        if not records:
+            return
+        self._log(f"排列本批客户端：开始重命名当前批次窗口，模板={title_template}")
+        for index, account, record in records:
+            try:
+                new_title = LauncherApp._client_direct_binding_title_from_template(title_template, index, record, account)
+                ok = bool(user32.SetWindowTextW(int(record.hwnd), new_title))
+                if ok:
+                    self._log(f"排列本批客户端：重命名成功 account={account.key} hwnd={record.hwnd} title={new_title}")
+                else:
+                    self._log(f"排列本批客户端：account={account.key} hwnd={record.hwnd} rename_failed reason=SetWindowTextW failed")
+            except Exception as exc:
+                reason = mask_sensitive_text(str(exc))
+                self._log(f"排列本批客户端：account={account.key} hwnd={record.hwnd} rename_failed reason={reason}")
+
+    def _client_direct_queue_progress_log(self, account: AccountConfig, message: str) -> None:
+        masked = mask_sensitive_text(message)
+        status = ""
+        if "client window bound" in masked:
+            status = "客户端已启动/待登录"
+        elif "Page.navigate sent" in masked:
+            status = "登录中"
+        elif "importServer success" in masked:
+            status = "importServer成功"
+        elif "enterGame called" in masked:
+            status = "进入游戏中"
+        if status:
+            record = self.client_direct_bindings.get(account.key) if hasattr(self, "client_direct_bindings") else None
+            if record is not None:
+                record.status = status
+                self.client_direct_bindings[account.key] = record
+                try:
+                    LauncherApp._save_client_direct_bindings_to_active_batch_threadsafe(self, sync_ui=False)
+                except Exception:
+                    pass
+            self._queue_status(account, status)
+        self._queue_log(f"[客户端直登][{account.key}] {masked}")
+
+    def _client_direct_collect_binding_windows(self, accounts: list[AccountConfig]) -> list[GameWindow]:
+        windows: list[GameWindow] = []
+        if not hasattr(self, "client_direct_bindings"):
+            self.client_direct_bindings = {}
+
+        for index, account in enumerate(accounts, start=1):
+            record = self.client_direct_bindings.get(account.key)
+            if record is None:
+                self._log(f"排列本批客户端：跳过 {account.display_name}，缺少准备阶段绑定")
+                continue
+            if not LauncherApp._client_direct_is_window_alive(self, int(record.hwnd or 0)):
+                LauncherApp._client_direct_mark_window_invalid(self, account, record)
+                continue
+            try:
+                rect = get_window_rect(int(record.hwnd))
+            except Exception:
+                rect = WindowRect(0, 0, 0, 0)
+            windows.append(
+                GameWindow(
+                    hwnd=int(record.hwnd),
+                    title=record.account_name or account.display_name,
+                    number=index,
+                    rect=rect,
+                )
+            )
+        return windows
+
+    def _client_direct_tile_binding_windows(
+        self,
+        windows: list[GameWindow],
+        tile_mode: str,
+        tile_config: TileConfig | RowTileConfig,
+        log,
+    ):
+        if tile_mode == WM_TILE_MODE_ROW_COUNT:
+            plan = calculate_row_tile_plan(len(windows), tile_config)
+            work = plan.work_area
+            log(
+                "按行数排列诊断："
+                f"screen_width={plan.screen_width}，screen_height={plan.screen_height}，"
+                f"work_area_left={work.left}，work_area_top={work.top}，"
+                f"work_area_right={work.right}，work_area_bottom={work.bottom}，"
+                f"work_area_width={plan.work_area_width}，work_area_height={plan.work_area_height}"
+            )
+            log(
+                "按行数排列诊断："
+                f"cols={plan.cols}，rows={plan.rows}，窗口数量={plan.window_count}，"
+                f"target_width={plan.target_width}，target_height={plan.target_height}"
+            )
+            return tile_game_windows_by_row_count(
+                tile_config,
+                windows=windows,
+                title_template=_safe_wm_title_template(self),
+            )
+        return tile_game_windows(
+            tile_config,
+            windows=windows,
+            title_template=_safe_wm_title_template(self),
+        )
+
     def _start_background_serial_run(self, accounts: list[AccountConfig], *, run_label: str) -> None:
         if self.worker_thread and self.worker_thread.is_alive():
             messagebox.showwarning("任务运行中", "已有任务正在运行，请先停止或等待完成。")
@@ -3917,6 +5942,472 @@ Write-Output $count
             daemon=True,
         )
         self.worker_thread.start()
+
+    def _update_client_direct_binding_from_result(
+        self,
+        account: AccountConfig,
+        result,
+        *,
+        port: int,
+        status: str,
+        error_message: str = "",
+    ) -> None:
+        binding = getattr(result, "binding", None)
+        if not hasattr(self, "client_direct_bindings"):
+            self.client_direct_bindings = {}
+        reason = error_message
+        if not reason and not getattr(result, "success", False):
+            reason = mask_sensitive_text(getattr(result, "message", "") or "")
+        self.client_direct_bindings[account.key] = ClientDirectRunRecord(
+            account_id=account.key,
+            account_name=account.display_name,
+            pid=int(getattr(binding, "pid", 0) or 0),
+            hwnd=int(getattr(binding, "hwnd", 0) or 0),
+            cdp_port=int(getattr(binding, "cdp_port", port) or port),
+            login_url=account.url,
+            status=status,
+            error_message=reason,
+        )
+
+    def _client_direct_record_to_binding(self, record: ClientDirectRunRecord) -> ClientBinding:
+        return ClientBinding(
+            account_id=record.account_id,
+            account_name=record.account_name,
+            pid=int(record.pid or 0),
+            hwnd=int(record.hwnd or 0),
+            cdp_port=int(record.cdp_port or 0),
+            login_url=record.login_url,
+            status=record.status,
+        )
+
+    def _client_direct_prepare_worker(
+        self,
+        accounts: list[AccountConfig],
+        game_path: str,
+        run_label: str,
+        base_port: int = CLIENT_DIRECT_CDP_PORT,
+        concurrency: int = CLIENT_DIRECT_CONCURRENCY_MIN,
+    ) -> None:
+        import time as _time
+
+        total = len(accounts)
+        success_count = 0
+        fail_count = 0
+        stopped_count = 0
+        start_time = _time.time()
+        concurrency = max(CLIENT_DIRECT_CONCURRENCY_MIN, min(CLIENT_DIRECT_CONCURRENCY_MAX, int(concurrency or 1)))
+        self._queue_log(f"[客户端直登] {run_label}开始：总{total}，并发={concurrency}，只启动客户端，不执行登录。")
+        self._queue_log(f"[客户端直登] 本次并发数={concurrency}")
+        self._update_status_bar(f"{run_label}运行中：0/{total}")
+
+        def run_prepare(item):
+            index, account = item
+            if self.stop_event.is_set():
+                if account.key in self.client_direct_bindings:
+                    self.client_direct_bindings[account.key].status = "已停止"
+                self._queue_status(account, "已停止")
+                return "stopped"
+
+            port = cdp_port_for_index(index, base_port=base_port)
+            record = self.client_direct_bindings.get(account.key) or ClientDirectRunRecord(
+                account_id=account.key,
+                account_name=account.display_name,
+                cdp_port=port,
+                login_url=account.url,
+            )
+            record.cdp_port = port
+            record.login_url = account.url
+            record.status = "客户端启动中"
+            record.error_message = ""
+            self.client_direct_bindings[account.key] = record
+            self._queue_status(account, "客户端启动中")
+            self._update_status_bar(f"{run_label}运行中：{index + 1}/{total}")
+            entry = _direct_login_entry_label(account.url)
+            self._queue_log(f"[客户端直登][{index + 1}/{total}] 准备客户端：{account.display_name}，入口={entry}，端口={port}")
+
+            if not is_complete_direct_login_url(account.url):
+                record.status = "URL无效"
+                record.error_message = "URL 不是完整客户端直登 URL"
+                self._queue_status(account, "URL无效")
+                self._queue_log(f"[客户端直登][{index + 1}/{total}] URL无效：入口={entry} 不是完整客户端直登 URL")
+                LauncherApp._save_client_direct_bindings_to_active_batch_threadsafe(self, sync_ui=False)
+                return "failed"
+            if not is_tcp_port_available(port):
+                record.status = "端口占用"
+                record.error_message = f"CDP 端口 {port} 已被占用"
+                self._queue_status(account, "端口占用")
+                self._queue_log(f"[客户端直登][{index + 1}/{total}] 端口占用：CDP 端口 {port} 已被占用")
+                LauncherApp._save_client_direct_bindings_to_active_batch_threadsafe(self, sync_ui=False)
+                return "failed"
+
+            result = prepare_client_direct_client(
+                ClientDirectLoginConfig(
+                    account_id=account.key,
+                    account_name=account.display_name,
+                    full_login_url=account.url,
+                    x5game_path=game_path,
+                    cdp_port=port,
+                    auto_enter_game=False,
+                    timeout=60.0,
+                ),
+                stop_event=self.stop_event,
+                log=lambda message, key=account.key: self._queue_log(f"[客户端直登][{key}] {mask_sensitive_text(message)}"),
+            )
+
+            if self.stop_event.is_set() or str(getattr(result, "message", "")) == "用户停止":
+                LauncherApp._update_client_direct_binding_from_result(self, account, result, port=port, status="已停止")
+                self._queue_status(account, "已停止")
+                LauncherApp._save_client_direct_bindings_to_active_batch_threadsafe(self, sync_ui=False)
+                return "stopped"
+
+            if result.success:
+                LauncherApp._update_client_direct_binding_from_result(self, account, result, port=port, status="客户端已启动/待登录")
+                binding = self.client_direct_bindings[account.key]
+                self._queue_status(account, "客户端已启动/待登录")
+                self._queue_log(
+                    f"[客户端直登][{index + 1}/{total}] 客户端已启动/待登录："
+                    f"pid={binding.pid} hwnd={binding.hwnd} port={binding.cdp_port}"
+                )
+                LauncherApp._save_client_direct_bindings_to_active_batch_threadsafe(self, sync_ui=False)
+                return "success"
+            reason = mask_sensitive_text(getattr(result, "message", "") or "未知错误")
+            LauncherApp._update_client_direct_binding_from_result(self, account, result, port=port, status="启动失败", error_message=reason)
+            self._queue_status(account, "启动失败")
+            self._queue_log(f"[客户端直登][{index + 1}/{total}] 启动失败：{reason}")
+            LauncherApp._save_client_direct_bindings_to_active_batch_threadsafe(self, sync_ui=False)
+            return "failed"
+
+        for outcome in _run_bounded_client_direct_tasks(list(enumerate(accounts)), concurrency, run_prepare):
+            if outcome == "success":
+                success_count += 1
+            elif outcome == "stopped":
+                stopped_count += 1
+            else:
+                fail_count += 1
+
+        elapsed_total = _time.time() - start_time
+        if self.stop_event.is_set() or stopped_count:
+            summary = f"{run_label}已停止：成功{success_count}，失败{fail_count}，已停止{stopped_count}，总耗时{elapsed_total:.0f}秒"
+            self._update_status_bar("已停止")
+        else:
+            summary = f"{run_label}完成：成功{success_count}，失败{fail_count}，已停止{stopped_count}，总耗时{elapsed_total:.0f}秒"
+            self._update_status_bar(f"{run_label}完成：成功{success_count}，失败{fail_count}")
+        self._queue_log(summary)
+        self._write_file_log(summary)
+        if self._log_file is not None:
+            self._log_file.close()
+            self._log_file = None
+        if hasattr(self, "worker_thread"):
+            self.worker_thread = None
+
+    def _client_direct_prepared_login_worker(
+        self,
+        accounts: list[AccountConfig],
+        auto_enter_game: bool,
+        run_label: str,
+        concurrency: int = CLIENT_DIRECT_CONCURRENCY_MIN,
+    ) -> None:
+        import time as _time
+
+        total = len(accounts)
+        success_count = 0
+        fail_count = 0
+        stopped_count = 0
+        start_time = _time.time()
+        mode_text = "自动进入游戏" if auto_enter_game else "不自动进入游戏"
+        concurrency = max(CLIENT_DIRECT_CONCURRENCY_MIN, min(CLIENT_DIRECT_CONCURRENCY_MAX, int(concurrency or 1)))
+        self._queue_log(f"[客户端直登] {run_label}开始：总{total}，并发={concurrency}，使用已准备客户端，{mode_text}。")
+        self._queue_log(f"[客户端直登] 本次并发数={concurrency}")
+        self._update_status_bar(f"{run_label}运行中：0/{total}")
+
+        def run_login(item):
+            index, account = item
+            if self.stop_event.is_set():
+                if account.key in self.client_direct_bindings:
+                    self.client_direct_bindings[account.key].status = "已停止"
+                self._queue_status(account, "已停止")
+                return "stopped"
+
+            record = self.client_direct_bindings.get(account.key)
+            if record is None or not record.pid or not record.hwnd or not record.cdp_port:
+                self._queue_status(account, "客户端直登失败")
+                self._queue_log(f"[客户端直登][{index + 1}/{total}] 客户端直登失败：缺少准备阶段绑定")
+                return "failed"
+            if not LauncherApp._client_direct_is_window_alive(self, int(record.hwnd or 0)):
+                record.status = "客户端已关闭"
+                record.error_message = "客户端窗口已关闭"
+                self.client_direct_bindings[account.key] = record
+                self._queue_status(account, "客户端已关闭")
+                self._queue_log(f"[客户端直登][{index + 1}/{total}] 客户端已关闭：{account.display_name} hwnd={record.hwnd}")
+                LauncherApp._save_client_direct_bindings_to_active_batch_threadsafe(self, sync_ui=False)
+                return "failed"
+
+            port = int(record.cdp_port)
+            record.status = "登录中"
+            record.error_message = ""
+            self.client_direct_bindings[account.key] = record
+            self._queue_status(account, "登录中")
+            self._update_status_bar(f"{run_label}运行中：{index + 1}/{total}")
+            entry = _direct_login_entry_label(record.login_url)
+            self._queue_log(
+                f"[客户端直登][{index + 1}/{total}] 执行登录："
+                f"{account.display_name}，入口={entry}，pid={record.pid} hwnd={record.hwnd} port={port}"
+            )
+
+            if not is_complete_direct_login_url(record.login_url):
+                record.status = "客户端直登失败"
+                record.error_message = "URL 不是完整客户端直登 URL"
+                self._queue_status(account, "客户端直登失败")
+                self._queue_log(f"[客户端直登][{index + 1}/{total}] 客户端直登失败：URL 不是完整客户端直登 URL")
+                LauncherApp._save_client_direct_bindings_to_active_batch_threadsafe(self, sync_ui=False)
+                return "failed"
+
+            result = execute_prepared_client_direct_login(
+                PreparedClientDirectLoginConfig(
+                    account_id=record.account_id,
+                    account_name=record.account_name,
+                    full_login_url=record.login_url,
+                    cdp_port=port,
+                    auto_enter_game=bool(auto_enter_game),
+                    timeout=60.0,
+                    **LauncherApp._client_speed_panel_options(self),
+                ),
+                LauncherApp._client_direct_record_to_binding(self, record),
+                stop_event=self.stop_event,
+                log=lambda message, current=account: LauncherApp._client_direct_queue_progress_log(self, current, message),
+            )
+
+            if self.stop_event.is_set() or str(getattr(result, "message", "")) == "用户停止":
+                LauncherApp._update_client_direct_binding_from_result(self, account, result, port=port, status="已停止")
+                self._queue_status(account, "已停止")
+                LauncherApp._save_client_direct_bindings_to_active_batch_threadsafe(self, sync_ui=False)
+                return "stopped"
+
+            if result.success:
+                status = "客户端登录成功" if auto_enter_game else "客户端已就绪"
+                LauncherApp._update_client_direct_binding_from_result(self, account, result, port=port, status=status)
+                self._queue_status(account, status)
+                self._queue_log(f"[客户端直登][{index + 1}/{total}] {status}：pid={record.pid} hwnd={record.hwnd} port={port}")
+                LauncherApp._save_client_direct_bindings_to_active_batch_threadsafe(self, sync_ui=False)
+                return "success"
+            reason = mask_sensitive_text(getattr(result, "message", "") or "未知错误")
+            LauncherApp._update_client_direct_binding_from_result(self, account, result, port=port, status="客户端直登失败", error_message=reason)
+            self._queue_status(account, "客户端直登失败")
+            self._queue_log(f"[客户端直登][{index + 1}/{total}] 客户端直登失败：{reason}")
+            LauncherApp._save_client_direct_bindings_to_active_batch_threadsafe(self, sync_ui=False)
+            return "failed"
+
+        for outcome in _run_bounded_client_direct_tasks(list(enumerate(accounts)), concurrency, run_login):
+            if outcome == "success":
+                success_count += 1
+            elif outcome == "stopped":
+                stopped_count += 1
+            else:
+                fail_count += 1
+
+        elapsed_total = _time.time() - start_time
+        if self.stop_event.is_set() or stopped_count:
+            summary = f"{run_label}已停止：成功{success_count}，失败{fail_count}，已停止{stopped_count}，总耗时{elapsed_total:.0f}秒"
+            self._update_status_bar("已停止")
+        else:
+            summary = f"{run_label}完成：成功{success_count}，失败{fail_count}，已停止{stopped_count}，总耗时{elapsed_total:.0f}秒"
+            self._update_status_bar(f"{run_label}完成：成功{success_count}，失败{fail_count}")
+        self._queue_log(summary)
+        self._write_file_log(summary)
+        if self._log_file is not None:
+            self._log_file.close()
+            self._log_file = None
+        if hasattr(self, "worker_thread"):
+            self.worker_thread = None
+
+    def _client_direct_single_worker(self, account: AccountConfig, game_path: str, auto_enter_game: bool) -> None:
+        import time as _time
+
+        start_time = _time.time()
+        mode_text = "自动进入游戏" if auto_enter_game else "不自动进入游戏"
+        self._queue_log(f"[客户端直登] 方式一单账号开始：{account.display_name}，{mode_text}。")
+        self._queue_log(f"[客户端直登] 使用 X5Game.exe + CDP 端口 {CLIENT_DIRECT_CDP_PORT}。")
+        self._update_status_bar("客户端直登运行中：1/1")
+        result = execute_client_direct_login(
+            ClientDirectLoginConfig(
+                account_id=account.key,
+                account_name=account.display_name,
+                full_login_url=account.url,
+                x5game_path=game_path,
+                cdp_port=CLIENT_DIRECT_CDP_PORT,
+                auto_enter_game=bool(auto_enter_game),
+                timeout=60.0,
+                **LauncherApp._client_speed_panel_options(self),
+            ),
+            stop_event=self.stop_event,
+            log=lambda message: LauncherApp._client_direct_queue_progress_log(self, account, message),
+        )
+        elapsed = _time.time() - start_time
+        self._queue_timing(account, elapsed)
+
+        if self.stop_event.is_set():
+            self._queue_status(account, "已停止")
+            self._queue_log("[客户端直登] 已停止。")
+            self._update_status_bar("已停止")
+            return
+
+        if result.success:
+            status = "客户端登录成功" if auto_enter_game else "客户端已就绪"
+            LauncherApp._update_client_direct_binding_from_result(
+                self,
+                account,
+                result,
+                port=CLIENT_DIRECT_CDP_PORT,
+                status=status,
+            )
+            self._queue_status(account, status)
+            self._queue_log(f"[客户端直登] {status}: {account.display_name}")
+            self._update_status_bar(f"客户端直登完成：{status}")
+        else:
+            reason = mask_sensitive_text(result.message or "未知错误")
+            LauncherApp._update_client_direct_binding_from_result(
+                self,
+                account,
+                result,
+                port=CLIENT_DIRECT_CDP_PORT,
+                status="客户端直登失败",
+            )
+            self._queue_status(account, "客户端直登失败")
+            self._queue_log(f"[客户端直登] 客户端直登失败: {account.display_name}，原因={reason}")
+            self._update_status_bar("客户端直登完成：失败1")
+
+        if self._log_file is not None:
+            self._log_file.close()
+            self._log_file = None
+        if hasattr(self, "worker_thread"):
+            self.worker_thread = None
+
+    def _client_direct_serial_worker(
+        self,
+        accounts: list[AccountConfig],
+        game_path: str,
+        auto_enter_game: bool,
+        run_label: str,
+        base_port: int = CLIENT_DIRECT_CDP_PORT,
+    ) -> None:
+        import time as _time
+
+        total = len(accounts)
+        success_count = 0
+        fail_count = 0
+        stopped_count = 0
+        start_time = _time.time()
+        mode_text = "自动进入游戏" if auto_enter_game else "不自动进入游戏"
+        self._queue_log(f"[客户端直登] {run_label}开始：总{total}，并发=1，{mode_text}。")
+        self._update_status_bar(f"{run_label}运行中：0/{total}")
+
+        for index, account in enumerate(accounts):
+            if self.stop_event.is_set():
+                for remaining in accounts[index:]:
+                    self.client_direct_bindings[remaining.key].status = "已停止"
+                    self._queue_status(remaining, "已停止")
+                    stopped_count += 1
+                break
+
+            port = cdp_port_for_index(index, base_port=base_port)
+            record = self.client_direct_bindings.get(account.key) or ClientDirectRunRecord(
+                account_id=account.key,
+                account_name=account.display_name,
+                cdp_port=port,
+                login_url=account.url,
+            )
+            record.cdp_port = port
+            record.login_url = account.url
+            record.status = "客户端启动中"
+            self.client_direct_bindings[account.key] = record
+            self._queue_status(account, "客户端启动中")
+            self._update_status_bar(f"{run_label}运行中：{index + 1}/{total}")
+            entry = _direct_login_entry_label(account.url)
+            self._queue_log(f"[客户端直登][{index + 1}/{total}] {account.display_name}：入口={entry}，端口={port}")
+
+            if not is_complete_direct_login_url(account.url):
+                fail_count += 1
+                record.status = "URL无效"
+                self._queue_status(account, "URL无效")
+                self._queue_log(f"[客户端直登][{index + 1}/{total}] URL无效：入口={entry} 不是完整客户端直登 URL")
+                LauncherApp._save_client_direct_bindings_to_active_batch_threadsafe(self, sync_ui=False)
+                continue
+            if not is_tcp_port_available(port):
+                fail_count += 1
+                record.status = "端口占用"
+                self._queue_status(account, "端口占用")
+                self._queue_log(f"[客户端直登][{index + 1}/{total}] 端口占用：CDP 端口 {port} 已被占用")
+                LauncherApp._save_client_direct_bindings_to_active_batch_threadsafe(self, sync_ui=False)
+                continue
+
+            account_started = _time.time()
+            result = execute_client_direct_login(
+                ClientDirectLoginConfig(
+                    account_id=account.key,
+                    account_name=account.display_name,
+                    full_login_url=account.url,
+                    x5game_path=game_path,
+                    cdp_port=port,
+                    auto_enter_game=bool(auto_enter_game),
+                    timeout=60.0,
+                    **LauncherApp._client_speed_panel_options(self),
+                ),
+                stop_event=self.stop_event,
+                log=lambda message, current=account: LauncherApp._client_direct_queue_progress_log(self, current, message),
+            )
+            self._queue_timing(account, _time.time() - account_started)
+
+            if self.stop_event.is_set() or str(getattr(result, "message", "")) == "用户停止":
+                record.status = "已停止"
+                self._update_client_direct_binding_from_result(account, result, port=port, status="已停止")
+                self._queue_status(account, "已停止")
+                self._queue_log(f"[客户端直登][{index + 1}/{total}] 已停止。")
+                stopped_count += 1
+                for remaining in accounts[index + 1:]:
+                    self.client_direct_bindings[remaining.key].status = "已停止"
+                    self._queue_status(remaining, "已停止")
+                    stopped_count += 1
+                break
+
+            if result.success:
+                success_count += 1
+                status = "客户端登录成功" if auto_enter_game else "客户端已就绪"
+                self._update_client_direct_binding_from_result(account, result, port=port, status=status)
+                binding = self.client_direct_bindings[account.key]
+                self._queue_status(account, status)
+                self._queue_log(
+                    f"[客户端直登][{index + 1}/{total}] {status}："
+                    f"pid={binding.pid} hwnd={binding.hwnd} port={binding.cdp_port}"
+                )
+                LauncherApp._save_client_direct_bindings_to_active_batch_threadsafe(self, sync_ui=False)
+            else:
+                fail_count += 1
+                reason = mask_sensitive_text(getattr(result, "message", "") or "未知错误")
+                self._update_client_direct_binding_from_result(account, result, port=port, status="客户端直登失败")
+                self._queue_status(account, "客户端直登失败")
+                self._queue_log(f"[客户端直登][{index + 1}/{total}] 客户端直登失败：{reason}")
+                LauncherApp._save_client_direct_bindings_to_active_batch_threadsafe(self, sync_ui=False)
+
+        elapsed_total = _time.time() - start_time
+        if self.stop_event.is_set() or stopped_count:
+            summary = (
+                f"{run_label}已停止：成功{success_count}，失败{fail_count}，"
+                f"已停止{stopped_count}，总耗时{elapsed_total:.0f}秒"
+            )
+            self._update_status_bar("已停止")
+        else:
+            summary = (
+                f"{run_label}完成：成功{success_count}，失败{fail_count}，"
+                f"已停止{stopped_count}，总耗时{elapsed_total:.0f}秒"
+            )
+            self._update_status_bar(f"{run_label}完成：成功{success_count}，失败{fail_count}")
+        self._queue_log(summary)
+        self._write_file_log(summary)
+        if self._log_file is not None:
+            self._log_file.close()
+            self._log_file = None
+        if hasattr(self, "worker_thread"):
+            self.worker_thread = None
 
     def _background_single_worker(self, account: AccountConfig, settings) -> None:
         import time as _time
@@ -4741,7 +7232,7 @@ else:
             values = _replace_account_table_value(self.tree.item(account.key, "values"), "status", status)
             # 颜色标签
             tag = ""
-            if "成功" in status:
+            if "成功" in status or "就绪" in status:
                 tag = "success"
             elif "已登录" in status or "跳过" in status:
                 tag = "skip"
@@ -4766,6 +7257,7 @@ else:
             self.tree.item(account.key, values=values)
 
     def _log(self, message: str) -> None:
+        message = mask_sensitive_text(message)
         self.log_text.insert(tk.END, f"{message}\n")
         self.log_text.see(tk.END)
         self._write_file_log(message)
@@ -4796,3 +7288,4 @@ else:
             self._log(f"已保存公告外点击坐标: {data['notice_close_outside_ratio']}")
         except Exception as exc:
             messagebox.showerror("保存失败", str(exc))
+

@@ -329,6 +329,31 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(settings.account_group_settings["存钻"]["include_in_all"])
         self.assertFalse(settings.account_group_settings["备用"]["include_in_all"])
 
+    def test_load_settings_accepts_client_speed_panel_options(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "settings.json"
+            path.write_text(
+                '{"auto_replace_speed_panel": false, "custom_speed_panel_enabled": false, '
+                '"speed_engine": "timer_hook", "default_speed_rate": 1.5, '
+                '"speed_hook_stage": "after_game_ready", "speed_panel_position": "left_top", '
+                '"speed_panel_left": 18, "speed_panel_top": 22, "speed_panel_debug": true, '
+                '"speed_panel_remove_original_toggle": false}',
+                encoding="utf-8",
+            )
+
+            settings = load_settings(path)
+
+        self.assertFalse(settings.auto_replace_speed_panel)
+        self.assertFalse(settings.custom_speed_panel_enabled)
+        self.assertEqual(settings.speed_engine, "timer_hook")
+        self.assertEqual(settings.default_speed_rate, 1.5)
+        self.assertEqual(settings.speed_hook_stage, "after_game_ready")
+        self.assertEqual(settings.speed_panel_position, "left_top")
+        self.assertEqual(settings.speed_panel_left, 18)
+        self.assertEqual(settings.speed_panel_top, 22)
+        self.assertTrue(settings.speed_panel_debug)
+        self.assertFalse(settings.speed_panel_remove_original_toggle)
+
     def test_bookmark_candidates_are_metadata_only(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             local_app_data = Path(temp_dir)

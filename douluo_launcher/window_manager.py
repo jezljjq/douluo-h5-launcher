@@ -647,11 +647,17 @@ def get_window_process_path(hwnd: int) -> str:
     process_id = get_window_process_id(hwnd)
     if not process_id:
         return ""
+    return get_process_path_by_pid(process_id)
+
+
+def get_process_path_by_pid(process_id: int) -> str:
+    if int(process_id or 0) <= 0:
+        return ""
 
     process_handle = kernel32.OpenProcess(
         PROCESS_QUERY_LIMITED_INFORMATION,
         False,
-        process_id,
+        int(process_id),
     )
     if not process_handle:
         return ""
@@ -1872,6 +1878,7 @@ def tile_game_windows(
     exclude_hwnds: Optional[Iterable[int]] = None,
     game_exe_path: str | Path | None = None,
     title_template: str | None = None,
+    windows: Optional[List[GameWindow]] = None,
     retries: int = 3,
     retry_delay: float = 0.5,
 ) -> List[TileResult]:
@@ -1880,15 +1887,19 @@ def tile_game_windows(
     if config.width <= 0 or config.height <= 0:
         raise ValueError("窗口宽度和高度必须大于 0")
 
-    windows = list_game_windows(
-        title_template=title_template,
-        exclude_hwnds=exclude_hwnds,
-        game_exe_path=game_exe_path,
-        expected_window_size=(config.width, config.height),
+    arranged_windows = (
+        list(windows)
+        if windows is not None
+        else list_game_windows(
+            title_template=title_template,
+            exclude_hwnds=exclude_hwnds,
+            game_exe_path=game_exe_path,
+            expected_window_size=(config.width, config.height),
+        )
     )
     results: List[TileResult] = []
-    if windows:
-        probe = windows[0]
+    if arranged_windows:
+        probe = arranged_windows[0]
         ok, error = _set_window_pos_with_retries(
             probe,
             probe.rect.left,
@@ -1912,7 +1923,7 @@ def tile_game_windows(
                 )
             ]
 
-    for index, window in enumerate(windows):
+    for index, window in enumerate(arranged_windows):
         x, y = calculate_tile_position(index, config)
 
         ok, error = _set_window_pos_with_retries(

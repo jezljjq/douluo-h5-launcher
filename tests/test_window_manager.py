@@ -223,6 +223,54 @@ class WindowManagerTests(unittest.TestCase):
         self.assertIn("上号器管理员=False", results[0].error)
         self.assertIn("目标x=10", results[0].error)
 
+    def test_tile_game_windows_still_scans_when_no_explicit_windows(self) -> None:
+        windows = [
+            GameWindow(
+                hwnd=201,
+                title="斗罗大陆H5-1号-扫码登录",
+                number=1,
+                rect=WindowRect(10, 20, 330, 560),
+            )
+        ]
+        config = TileConfig(width=320, height=540, start_x=250, start_y=0, offset_x=320, offset_y=525)
+
+        with (
+            mock.patch("douluo_launcher.window_manager.list_game_windows", return_value=windows) as list_windows,
+            mock.patch("douluo_launcher.window_manager._set_window_pos_with_retries", return_value=(True, "")),
+        ):
+            results = tile_game_windows(config)
+
+        list_windows.assert_called_once()
+        self.assertEqual([result.window.hwnd for result in results], [201])
+        self.assertTrue(results[0].success)
+
+    def test_tile_game_windows_uses_explicit_windows_without_scanning(self) -> None:
+        windows = [
+            GameWindow(
+                hwnd=301,
+                title="斗罗大陆H5-1号-扫码登录",
+                number=1,
+                rect=WindowRect(10, 20, 330, 560),
+            ),
+            GameWindow(
+                hwnd=302,
+                title="斗罗大陆H5-2号-扫码登录",
+                number=2,
+                rect=WindowRect(20, 30, 340, 570),
+            ),
+        ]
+        config = TileConfig(width=320, height=540, start_x=250, start_y=0, offset_x=320, offset_y=525, per_row=2)
+
+        with (
+            mock.patch("douluo_launcher.window_manager.list_game_windows") as list_windows,
+            mock.patch("douluo_launcher.window_manager._set_window_pos_with_retries", return_value=(True, "")),
+        ):
+            results = tile_game_windows(config, windows=windows)
+
+        list_windows.assert_not_called()
+        self.assertEqual([result.window.hwnd for result in results], [301, 302])
+        self.assertTrue(all(result.success for result in results))
+
     def test_31_scan_login_windows_plus_helper_counts_as_31_with_process_mismatch(self) -> None:
         configured = r"E:\Program Files\DLH5\X5Game.exe"
         process_paths = {index: r"E:\Tools\launcher-opened-window.exe" for index in range(1, 32)}
