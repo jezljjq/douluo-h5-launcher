@@ -7,17 +7,104 @@ from douluo_launcher.config import (
     AccountConfig,
     SINGLE_LEVEL_NAME,
     compute_game_window_no,
+    default_settings_path,
     describe_bookmark_file,
     filter_accounts,
     find_bookmark_file_candidates,
     find_preferred_bookmark_file,
+    initialize_user_data_dir,
     list_bookmark_top_level_dirs,
     load_accounts_from_bookmarks,
     load_settings,
+    user_data_dir,
 )
 
 
 class ConfigTests(unittest.TestCase):
+    def test_user_data_dir_uses_env_override_before_appdata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env_dir = root / "dev_user_data"
+            appdata_dir = root / "Roaming"
+
+            resolved = user_data_dir(
+                environ={
+                    "H5_LAUNCHER_DATA_DIR": str(env_dir),
+                    "APPDATA": str(appdata_dir),
+                }
+            )
+
+            self.assertEqual(resolved, env_dir)
+
+    def test_user_data_dir_defaults_to_appdata_launcher_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            appdata_dir = Path(tmp) / "Roaming"
+
+            resolved = user_data_dir(environ={"APPDATA": str(appdata_dir)})
+
+            self.assertEqual(resolved, appdata_dir / "DouluoH5Launcher")
+
+    def test_initialize_user_data_copies_old_settings_and_merges_template_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            app_dir = root / "app"
+            cwd = root / "cwd"
+            data_dir = root / "user_data"
+            app_dir.mkdir()
+            cwd.mkdir()
+            template = app_dir / "automation_settings.template.json"
+            template.write_text(
+                '{"bookmark_file": "", "window_width": 960, "default_speed_rate": 1.0, "block_browser_context_menu": true}',
+                encoding="utf-8",
+            )
+            old_settings = app_dir / "automation_settings.json"
+            old_settings.write_text(
+                '{"bookmark_file": "D:/private/Bookmarks", "window_width": 777}',
+                encoding="utf-8",
+            )
+
+            result = initialize_user_data_dir(
+                data_dir=data_dir,
+                app_dir=app_dir,
+                cwd=cwd,
+                template_path=template,
+            )
+
+            target = data_dir / "automation_settings.json"
+            self.assertEqual(default_settings_path(data_dir), target)
+            self.assertTrue(target.exists())
+            self.assertTrue(old_settings.exists())
+            migrated = target.read_text(encoding="utf-8")
+            self.assertIn("D:/private/Bookmarks", migrated)
+            self.assertIn('"window_width": 777', migrated)
+            self.assertIn('"default_speed_rate": 1.0', migrated)
+            self.assertIn('"block_browser_context_menu": true', migrated)
+            self.assertEqual(result.migrated_settings_from, old_settings)
+            self.assertTrue((data_dir / "backups").exists())
+            self.assertTrue(result.backup_dir.exists())
+
+    def test_initialize_user_data_creates_empty_sessions_without_clearing_existing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            app_dir = root / "app"
+            cwd = root / "cwd"
+            data_dir = root / "user_data"
+            app_dir.mkdir()
+            cwd.mkdir()
+            old_session_dir = app_dir / "debug_client_direct"
+            old_session_dir.mkdir()
+            old_sessions = old_session_dir / "client_direct_sessions.json"
+            old_sessions.write_text('{"schema_version": 1, "batches": [{"batch_id": "old"}]}', encoding="utf-8")
+            (app_dir / "automation_settings.template.json").write_text('{"bookmark_file": ""}', encoding="utf-8")
+
+            result = initialize_user_data_dir(data_dir=data_dir, app_dir=app_dir, cwd=cwd)
+
+            target = data_dir / "client_direct_sessions.json"
+            self.assertTrue(target.exists())
+            self.assertTrue(old_sessions.exists())
+            self.assertIn('"batch_id": "old"', target.read_text(encoding="utf-8"))
+            self.assertEqual(result.migrated_sessions_from, old_sessions)
+
     def test_compute_game_window_no(self) -> None:
         self.assertEqual(compute_game_window_no("第一层", 1), 1)
         self.assertEqual(compute_game_window_no("第一层", 8), 8)

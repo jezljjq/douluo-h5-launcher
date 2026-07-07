@@ -3,7 +3,9 @@ from __future__ import annotations
 import csv
 import json
 import os
+import shutil
 import sys
+import time
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Iterable
@@ -14,6 +16,216 @@ def app_root() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).parent
     return Path(__file__).resolve().parent.parent
+
+
+USER_DATA_ENV = "H5_LAUNCHER_DATA_DIR"
+USER_DATA_DIR_NAME = "DouluoH5Launcher"
+SETTINGS_FILE_NAME = "automation_settings.json"
+SETTINGS_TEMPLATE_FILE_NAME = "automation_settings.template.json"
+CLIENT_DIRECT_SESSIONS_FILE_NAME = "client_direct_sessions.json"
+
+
+@dataclass(frozen=True)
+class UserDataInitResult:
+    user_data_dir: Path
+    settings_path: Path
+    sessions_path: Path
+    template_path: Path
+    logs_dir: Path
+    backups_dir: Path
+    backup_dir: Path
+    migrated_settings_from: Path | None = None
+    migrated_sessions_from: Path | None = None
+    settings_merged_defaults: bool = False
+
+
+def user_data_dir(environ: dict[str, str] | None = None) -> Path:
+    env = os.environ if environ is None else environ
+    override = str(env.get(USER_DATA_ENV, "") or "").strip()
+    if override:
+        return Path(override)
+    appdata = str(env.get("APPDATA", "") or "").strip()
+    if appdata:
+        return Path(appdata) / USER_DATA_DIR_NAME
+    return Path.home() / "AppData" / "Roaming" / USER_DATA_DIR_NAME
+
+
+def default_settings_path(data_dir: str | Path | None = None) -> Path:
+    return Path(data_dir) / SETTINGS_FILE_NAME if data_dir is not None else user_data_dir() / SETTINGS_FILE_NAME
+
+
+def default_client_direct_sessions_path(data_dir: str | Path | None = None) -> Path:
+    base = Path(data_dir) if data_dir is not None else user_data_dir()
+    return base / CLIENT_DIRECT_SESSIONS_FILE_NAME
+
+
+def automation_settings_template_path(root: str | Path | None = None) -> Path:
+    base = Path(root) if root is not None else app_root()
+    return base / SETTINGS_TEMPLATE_FILE_NAME
+
+
+def logs_dir(data_dir: str | Path | None = None) -> Path:
+    base = Path(data_dir) if data_dir is not None else user_data_dir()
+    return base / "logs"
+
+
+def backups_dir(data_dir: str | Path | None = None) -> Path:
+    base = Path(data_dir) if data_dir is not None else user_data_dir()
+    return base / "backups"
+
+
+def _migration_backup_dir(base: Path) -> Path:
+    backup = base / "backups" / ("migration_" + time.strftime("%Y%m%d_%H%M%S"))
+    suffix = 2
+    candidate = backup
+    while candidate.exists():
+        candidate = Path(f"{backup}_{suffix}")
+        suffix += 1
+    candidate.mkdir(parents=True, exist_ok=True)
+    return candidate
+
+
+def _json_empty_sessions() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "active_batch_id": "",
+        "settings": {
+            "default_base_port": 9222,
+            "last_base_port": 9222,
+            "restore_on_startup": True,
+        },
+        "batches": [],
+    }
+
+
+def _merge_missing_defaults(current: object, defaults: object) -> tuple[object, bool]:
+    if not isinstance(current, dict) or not isinstance(defaults, dict):
+        return current, False
+    changed = False
+    merged = dict(current)
+    for key, default_value in defaults.items():
+        if key not in merged:
+            merged[key] = default_value
+            changed = True
+            continue
+        next_value, next_changed = _merge_missing_defaults(merged[key], default_value)
+        if next_changed:
+            merged[key] = next_value
+            changed = True
+    return merged, changed
+
+
+def _load_json_object(path: Path) -> dict[str, object]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _copy_with_backup(source: Path, target: Path, backup_dir: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, target)
+    try:
+        shutil.copy2(source, backup_dir / source.name)
+    except Exception:
+        pass
+
+
+def _first_existing(paths: Iterable[Path]) -> Path | None:
+    for path in paths:
+        if path.exists() and path.is_file():
+            return path
+    return None
+
+
+def old_settings_migration_sources(app_dir: Path, cwd: Path) -> list[Path]:
+    return [
+        app_dir / SETTINGS_FILE_NAME,
+        app_dir / "_internal" / SETTINGS_FILE_NAME,
+        cwd / SETTINGS_FILE_NAME,
+        cwd / "dist" / "Launcher" / "_internal" / SETTINGS_FILE_NAME,
+    ]
+
+
+def old_sessions_migration_sources(app_dir: Path, cwd: Path) -> list[Path]:
+    return [
+        app_dir / CLIENT_DIRECT_SESSIONS_FILE_NAME,
+        app_dir / "debug_client_direct" / CLIENT_DIRECT_SESSIONS_FILE_NAME,
+        app_dir / "_internal" / "debug_client_direct" / CLIENT_DIRECT_SESSIONS_FILE_NAME,
+        cwd / "debug_client_direct" / CLIENT_DIRECT_SESSIONS_FILE_NAME,
+        cwd / "dist" / "Launcher" / "debug_client_direct" / CLIENT_DIRECT_SESSIONS_FILE_NAME,
+        cwd / "dist" / "Launcher" / "_internal" / "debug_client_direct" / CLIENT_DIRECT_SESSIONS_FILE_NAME,
+    ]
+
+
+def initialize_user_data_dir(
+    *,
+    data_dir: str | Path | None = None,
+    app_dir: str | Path | None = None,
+    cwd: str | Path | None = None,
+    template_path: str | Path | None = None,
+    logger=None,
+) -> UserDataInitResult:
+    base = Path(data_dir) if data_dir is not None else user_data_dir()
+    app_base = Path(app_dir) if app_dir is not None else app_root()
+    cwd_base = Path(cwd) if cwd is not None else Path.cwd()
+    template = Path(template_path) if template_path is not None else automation_settings_template_path(app_base)
+    settings_path = base / SETTINGS_FILE_NAME
+    sessions_path = base / CLIENT_DIRECT_SESSIONS_FILE_NAME
+    log_path = base / "logs"
+    backup_root = base / "backups"
+    base.mkdir(parents=True, exist_ok=True)
+    log_path.mkdir(parents=True, exist_ok=True)
+    backup_root.mkdir(parents=True, exist_ok=True)
+    backup_path = _migration_backup_dir(base)
+
+    migrated_settings_from: Path | None = None
+    migrated_sessions_from: Path | None = None
+    settings_merged_defaults = False
+
+    if not settings_path.exists():
+        source = _first_existing(old_settings_migration_sources(app_base, cwd_base))
+        if source is not None:
+            _copy_with_backup(source, settings_path, backup_path)
+            migrated_settings_from = source
+            if logger:
+                logger("[数据迁移] 已迁移 automation_settings.json 到用户数据目录")
+        elif template.exists():
+            _copy_with_backup(template, settings_path, backup_path)
+        else:
+            settings_path.write_text(json.dumps({}, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    if settings_path.exists() and template.exists():
+        current = _load_json_object(settings_path)
+        defaults = _load_json_object(template)
+        merged, changed = _merge_missing_defaults(current, defaults)
+        if changed and isinstance(merged, dict):
+            settings_path.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+            settings_merged_defaults = True
+
+    if not sessions_path.exists():
+        source = _first_existing(old_sessions_migration_sources(app_base, cwd_base))
+        if source is not None:
+            _copy_with_backup(source, sessions_path, backup_path)
+            migrated_sessions_from = source
+            if logger:
+                logger("[数据迁移] 已迁移 client_direct_sessions.json 到用户数据目录")
+        else:
+            sessions_path.write_text(json.dumps(_json_empty_sessions(), ensure_ascii=False, indent=2), encoding="utf-8")
+
+    return UserDataInitResult(
+        user_data_dir=base,
+        settings_path=settings_path,
+        sessions_path=sessions_path,
+        template_path=template,
+        logs_dir=log_path,
+        backups_dir=backup_root,
+        backup_dir=backup_path,
+        migrated_settings_from=migrated_settings_from,
+        migrated_sessions_from=migrated_sessions_from,
+        settings_merged_defaults=settings_merged_defaults,
+    )
 
 
 def project_root() -> Path:
@@ -193,6 +405,7 @@ class AutomationSettings:
     speed_panel_top: int = 12
     speed_panel_debug: bool = False
     speed_panel_remove_original_toggle: bool = True
+    block_browser_context_menu: bool = True
 
 
 def compute_game_window_no(

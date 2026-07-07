@@ -1,6 +1,6 @@
 # 打包发布说明
 
-**当前版本：斗罗大陆H5上号器 v1.2.0 - 客户端直登自定义变速器版**
+**当前版本：斗罗大陆H5上号器 v1.3.0 - 发布持久化 + 加速总控稳定版**
 **最后打包流程更新：2026-05-17，固定使用 `scripts\build_exe.bat`，禁止临时拼 PyInstaller 命令**
 
 ---
@@ -57,9 +57,9 @@ cd D:\Ai\codex\上号器
 ## 3. 输出位置
 
 ```
-dist/Launcher/
+dist/斗罗大陆H5上号器-v1.3.0/
 ├── 上号器.exe                ← 主程序
-├── automation_settings.json  ← 自动化配置（可修改）
+├── automation_settings.template.json  ← 自动化配置模板
 ├── dm_click_helper.exe       ← Dm 点击 helper（32 位打包产物）
 ├── dm_click_helper.py        ← Dm 点击脚本（源码回退）
 ├── ms-playwright/            ← 发布包内置 Playwright Chromium
@@ -74,10 +74,10 @@ dist/Launcher/
 当前发布文件名必须保持中文：
 
 ```text
-dist/Launcher/上号器.exe
+dist/斗罗大陆H5上号器-v1.3.0/上号器.exe
 ```
 
-内部打包目录和 PyInstaller `--name` 使用英文 `Launcher`，避免 Windows bat/cmd 对中文目录名、spec 名和中间构建路径处理不稳定。最终用户看到的 exe 文件名仍必须是 `上号器.exe`，窗口标题由 GUI 设置为“上号器 — 前台串行模式”。不要通过改最终软件名绕过中文问题。
+内部 PyInstaller `--name` 使用英文 `Launcher`，最终发布目录为 `斗罗大陆H5上号器-v1.3.0`。最终用户看到的 exe 文件名仍必须是 `上号器.exe`，窗口标题由 GUI 通过版本号显示 `v1.3.0`。
 
 ---
 
@@ -121,7 +121,7 @@ dist/Launcher/上号器.exe
 
 | 文件 | 说明 |
 |------|------|
-| `automation_settings.json` | 自动化参数（窗口大小、OCR、点击坐标等） |
+| `automation_settings.template.json` | 自动化参数模板（真实用户配置写入 `%APPDATA%\DouluoH5Launcher`） |
 | `debug_ocr/browser_pos.json` | 运行时浏览器坐标缓存（自动生成） |
 
 ---
@@ -140,7 +140,7 @@ dist/Launcher/上号器.exe
 
 ```powershell
 pyinstaller --onedir --noconsole --name "Launcher" ^
-    --add-data "automation_settings.json;." ^
+    --add-data "automation_settings.template.json;." ^
     --add-data "debug_ocr\template_passport_btn.png;debug_ocr" ^
     --collect-all tkinterdnd2 ^
     --hidden-import PIL --hidden-import pytesseract --hidden-import cv2 ^
@@ -159,15 +159,15 @@ pyinstaller --onedir --noconsole --name "Launcher" ^
 
 在 `--hidden-import` 中添加缺失的模块名，重新打包。
 
-### 打包后找不到 automation_settings.json
+### 打包后找不到 automation_settings.template.json
 
-确认 exe 运行目录与 `automation_settings.json` 在同一目录。
+确认 exe 运行目录与 `automation_settings.template.json` 在同一目录。真实 `automation_settings.json` 位于 `%APPDATA%\DouluoH5Launcher`。
 
 ### exe 模式收藏夹路径
 
-`automation_settings.json` 中的 `bookmark_file` 是用户保存的收藏夹路径。没有保存路径时，程序会扫描 Edge / Chrome 候选并让用户在界面中选择；不能因为某个浏览器 Bookmarks 文件存在就静默覆盖用户配置。
+`%APPDATA%\DouluoH5Launcher\automation_settings.json` 中的 `bookmark_file` 是用户保存的收藏夹路径。没有保存路径时，程序会扫描 Edge / Chrome 候选并让用户在界面中选择；不能因为某个浏览器 Bookmarks 文件存在就静默覆盖用户配置。
 
-打包后 exe 读取的是 `dist\Launcher\automation_settings.json`，不应回退到源码目录配置，也不应写入默认 Chrome 路径。发布包中的默认配置当前记录：
+打包后 exe 读取的是 `%APPDATA%\DouluoH5Launcher\automation_settings.json`，发布包只携带 `automation_settings.template.json`，不应携带开发机真实配置。发布包中的默认模板当前记录：
 
 ```text
 bookmark_browser=
@@ -175,7 +175,7 @@ bookmark_profile=
 bookmark_file=
 ```
 
-`automation_settings.json` 还保存 `account_group_settings`，用于控制哪些收藏夹分组参与“全部串行”。该字段只影响运行范围，不改变收藏夹读取结果：
+用户数据目录中的 `automation_settings.json` 还保存 `account_group_settings`，用于控制哪些收藏夹分组参与“全部串行”。该字段只影响运行范围，不改变收藏夹读取结果：
 
 - `层级=全部` 仍可显示全部已读取账号。
 - `全部串行` 只运行 `include_in_all=true` 的分组。
@@ -216,12 +216,12 @@ exe 发布包已内置 32 位 `dm_click_helper.exe`，目标电脑不需要安�
 当前打包策略：发布包自带 Playwright Chromium，目录为：
 
 ```text
-dist\Launcher\ms-playwright\chromium-*\chrome-win64\chrome.exe
+dist\斗罗大陆H5上号器-v1.3.0\ms-playwright\chromium-*\chrome-win64\chrome.exe
 ```
 
-打包脚本会从打包机器的 `%LOCALAPPDATA%\ms-playwright` 中选择当前 Playwright 实际需要的一个 Chromium 目录复制到 `dist\Launcher\ms-playwright`。目标机器不需要安装 Playwright 或执行 `playwright install`。
+打包脚本会从打包机器的 `%LOCALAPPDATA%\ms-playwright` 中选择当前 Playwright 实际需要的一个 Chromium 目录复制到 `dist\斗罗大陆H5上号器-v1.3.0\ms-playwright`。目标机器不需要安装 Playwright 或执行 `playwright install`。
 
-当前发布包只允许携带一个 Chromium 目录。打包脚本会读取 Playwright Python 包内的 `driver\package\browsers.json`，识别 `chromium` revision，例如 `chromium-1217`，只复制该目录到 `dist\Launcher\ms-playwright`。如果本机缓存里同时存在旧版本 Chromium，例如 `chromium-1208`，脚本必须排除旧目录；打包后 `dist\Launcher\ms-playwright\chromium-*\chrome-win64\chrome.exe` 必须且只能匹配到 1 个。
+当前发布包只允许携带一个 Chromium 目录。打包脚本会读取 Playwright Python 包内的 `driver\package\browsers.json`，识别 `chromium` revision，例如 `chromium-1217`，只复制该目录到 `dist\斗罗大陆H5上号器-v1.3.0\ms-playwright`。如果本机缓存里同时存在旧版本 Chromium，例如 `chromium-1208`，脚本必须排除旧目录；打包后 `dist\斗罗大陆H5上号器-v1.3.0\ms-playwright\chromium-*\chrome-win64\chrome.exe` 必须且只能匹配到 1 个。
 
 如果打包机器没有本地 Chromium 缓存，脚本会失败并提示先在打包机器执行：
 

@@ -1,7 +1,6 @@
 # 构建产物
 build/
 dist/
-*.spec
 *.exe
 
 # Python
@@ -19,10 +18,20 @@ logs/
 # 运行时数据
 client_direct_sessions.json
 debug_client_direct/
+debug_background/
+debug_login_chain/
 backups/
 backup_before_*/
 WIP_before_*.patch
 WIP_before_*.txt
+data/
+dev_user_data/
+user_data_keep/
+archive_cleanup_*/
+*.tmp
+*.har
+*token*
+*sign*
 
 # 调试截图 - 自动生成
 debug_ocr/*

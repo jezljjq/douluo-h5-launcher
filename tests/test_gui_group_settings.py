@@ -52,22 +52,60 @@ from douluo_launcher.window_manager import TileConfig, WindowRect
 
 
 class GuiGroupSettingsTests(unittest.TestCase):
-    def test_work_mode_choices_only_include_client_direct_and_foreground(self) -> None:
+    def test_work_mode_choices_show_account_password_and_client_direct_by_default(self) -> None:
         self.assertEqual(
             gui_module.RUN_MODE_CHOICES,
-            (RUN_MODE_CLIENT_DIRECT_LABEL, RUN_MODE_FOREGROUND_LABEL),
+            (gui_module.RUN_MODE_ACCOUNT_PASSWORD_LABEL, RUN_MODE_CLIENT_DIRECT_LABEL),
         )
         self.assertNotIn(RUN_MODE_BACKGROUND_LABEL, gui_module.RUN_MODE_CHOICES)
         source = inspect.getsource(LauncherApp._build_widgets)
         self.assertIn("text=\"工作模式\"", source)
         self.assertIn("indicatoron=False", source)
+        self.assertIn("self.run_mode_account_password_btn", source)
         self.assertIn("self.run_mode_client_btn", source)
         self.assertIn("self.run_mode_foreground_btn", source)
         self.assertNotIn("self.run_mode_box = ttk.Combobox", source)
         self.assertLess(
+            source.index("self.run_mode_account_password_btn"),
+            source.index("self.run_mode_client_btn"),
+        )
+        self.assertLess(
             source.index('text="工作模式"'),
             source.index('text="读取收藏夹 / 账号配置"'),
         )
+
+    def test_foreground_mode_entry_is_hidden_by_default_as_legacy_compat(self) -> None:
+        source = Path("douluo_launcher/gui.py").read_text(encoding="utf-8")
+
+        self.assertIn("self.run_mode_foreground_btn.pack_forget()", source)
+        self.assertIn("旧版兼容", source)
+        self.assertIn("账号密码登录模式", source)
+
+    def test_account_password_mode_does_not_show_legacy_method_labels_by_default(self) -> None:
+        source = inspect.getsource(LauncherApp._build_widgets)
+
+        self.assertNotIn("方式一：通行证上号", source)
+        self.assertNotIn("方式二：账号密码 + 通行证上号", source)
+        self.assertIn("当前模式：账号密码登录模式，使用账号密码配置，通过原方式二流程登录。", source)
+
+    def test_legacy_passport_mode_hidden_by_default(self) -> None:
+        source = inspect.getsource(LauncherApp._sync_account_source_controls)
+
+        self.assertIn("show_legacy_method_row", source)
+        self.assertIn("self.method_row.grid_remove()", source)
+        self.assertIn("旧版通行证上号（兼容）", inspect.getsource(LauncherApp._build_widgets))
+
+    def test_account_password_mode_still_uses_original_method2_value(self) -> None:
+        fake = SimpleNamespace(
+            method_var=SimpleNamespace(value="", set=lambda value: setattr(fake.method_var, "value", value), get=lambda: fake.method_var.value),
+            calls=[],
+        )
+        fake._on_run_mode_changed = lambda: fake.calls.append("changed")
+
+        LauncherApp._on_account_password_run_mode_changed(fake)
+
+        self.assertEqual(fake.method_var.value, "method2")
+        self.assertEqual(fake.calls, ["changed"])
 
     def test_window_manager_layout_uses_aligned_sections(self) -> None:
         source = inspect.getsource(LauncherApp._build_widgets)
@@ -96,8 +134,9 @@ class GuiGroupSettingsTests(unittest.TestCase):
         self.assertIn('("准备客户端", 14, self._prepare_client_direct_current_scope, 0, 0)', source)
         self.assertIn('("执行客户端登录", 16, self._login_prepared_client_direct_current_scope, 0, 4)', source)
         self.assertIn('("修复本批窗口", 14, self._repair_client_direct_current_batch, 0, 0)', source)
-        self.assertIn('("关闭本批客户端", 14, self._close_client_direct_current_batch, 0, 2)', source)
-        self.assertIn("self.client_direct_stop_btn.grid(row=0, column=3", source)
+        self.assertIn('("识别本地客户端", 16, self._identify_local_client_direct_clients, 0, 1)', source)
+        self.assertIn('("关闭本批客户端", 14, self._close_client_direct_current_batch, 0, 3)', source)
+        self.assertIn("self.client_direct_stop_btn.grid(row=0, column=4", source)
         self.assertNotIn('"重命名批次"', source)
 
     def test_client_direct_batch_area_removes_manual_name_and_main_port_inputs(self) -> None:
@@ -174,7 +213,54 @@ class GuiGroupSettingsTests(unittest.TestCase):
         self.assertEqual(options["speed_hook_stage"], "after_game_ready")
         self.assertTrue(options["speed_panel_debug"])
         self.assertFalse(options["speed_panel_remove_original_toggle"])
+        self.assertTrue(options["block_browser_context_menu"])
         self.assertEqual(fake.default_speed_rate_var.value, "1.0")
+
+    def test_speed_control_invalid_rate_logs_and_skips_apply(self) -> None:
+        fake = SimpleNamespace(
+            client_speed_control_rate_var=SimpleNamespace(get=lambda: "abc"),
+            logs=[],
+        )
+        fake._log = lambda message: fake.logs.append(message)
+
+        with mock.patch("douluo_launcher.gui.messagebox.showwarning") as warning:
+            rate = LauncherApp._client_speed_control_rate(fake)
+
+        self.assertIsNone(rate)
+        warning.assert_called_once()
+        self.assertTrue(any("倍率输入无效" in item for item in fake.logs))
+
+    def test_speed_control_current_batch_skips_invalid_bindings_and_continues(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ClientBatchStore(Path(tmp) / "client_direct_sessions.json")
+            batch = store.create_batch("当前批次", scope="当前层", base_port=9222)
+            good = ClientBatchBinding("good", "可控", pid=1, hwnd=11, cdp_port=9222, login_url="u", status="客户端登录成功")
+            missing = ClientBatchBinding("missing", "缺失", pid=0, hwnd=0, cdp_port=9223, login_url="u", status="pid_missing")
+            invalid = ClientBatchBinding("invalid", "异常", pid=2, hwnd=22, cdp_port=9224, login_url="u", status="客户端登录成功", window_status="pid_not_x5game")
+            cdp_bad = ClientBatchBinding("cdp", "CDP坏", pid=3, hwnd=33, cdp_port=9225, login_url="u", status="cdp_unavailable")
+            batch.bindings = [good, missing, invalid, cdp_bad]
+            applied: list[tuple[str, float]] = []
+            fake = SimpleNamespace(
+                client_batch_store=store,
+                client_speed_control_rate_var=SimpleNamespace(get=lambda: "50"),
+                client_speed_control_scope_var=SimpleNamespace(get=lambda: "当前批次"),
+                client_speed_control_status_var=SimpleNamespace(set=lambda _value: None),
+                logs=[],
+            )
+            fake._log = lambda message: fake.logs.append(message)
+            fake._apply_client_speed_to_binding = lambda binding, rate: applied.append((binding.account_id, rate))
+            fake._sync_client_direct_batch_status = lambda: None
+
+            with mock.patch.object(LauncherApp, "_client_direct_pid_exists", return_value=True), mock.patch.object(
+                LauncherApp,
+                "_client_direct_process_is_x5game",
+                return_value=True,
+            ), mock.patch.object(LauncherApp, "_client_direct_cdp_available", return_value=True):
+                LauncherApp._apply_client_speed_control(fake)
+
+            self.assertEqual(applied, [("good", 50.0)])
+            self.assertEqual(good.speed_rate, 50.0)
+            self.assertTrue(any("目标4，成功1，失败0，跳过3" in item for item in fake.logs))
 
     def test_client_direct_batch_dropdown_uses_summary_without_extra_status_label(self) -> None:
         store = ClientBatchStore()
@@ -201,7 +287,7 @@ class GuiGroupSettingsTests(unittest.TestCase):
 
         LauncherApp._sync_client_direct_batch_status(fake)
 
-        self.assertIn("绑定=0 | 存活=0 | 已关闭=0 | CDP不可用=0 | 窗口失效=0", states[0])
+        self.assertIn("绑定=0 | 存活=0 | 已关闭=0 | CDP不可用=0 | 窗口失效=0 | 绑定异常=0", states[0])
         self.assertIn("disabled", states)
 
     def test_client_direct_auto_batch_name_uses_scope_count_and_deduplicates(self) -> None:
@@ -256,6 +342,7 @@ class GuiGroupSettingsTests(unittest.TestCase):
 
     def test_run_mode_labels_map_to_stable_keys(self) -> None:
         self.assertEqual(_run_mode_key_from_label(RUN_MODE_FOREGROUND_LABEL), "foreground")
+        self.assertEqual(_run_mode_key_from_label(gui_module.RUN_MODE_ACCOUNT_PASSWORD_LABEL), "foreground")
         self.assertEqual(_run_mode_key_from_label(RUN_MODE_BACKGROUND_LABEL), "background")
         self.assertEqual(_run_mode_key_from_label(RUN_MODE_CLIENT_DIRECT_LABEL), "client_direct")
         self.assertEqual(_run_mode_key_from_label("未知"), "foreground")
@@ -944,6 +1031,39 @@ class GuiGroupSettingsTests(unittest.TestCase):
         self.assertEqual(fake.client_direct_bindings[account.key].cdp_port, 9231)
         self.assertEqual(fake.client_direct_bindings[account.key].login_url, account.url)
 
+    def test_load_client_direct_sessions_marks_invalid_without_auto_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "client_direct_sessions.json"
+            store = ClientBatchStore(path)
+            store.create_batch("旧批次", scope="当前层", base_port=9222)
+            store.append_binding(
+                ClientBatchBinding("old", "旧账号", pid=100, hwnd=11, cdp_port=9222, login_url="u", status="客户端登录成功")
+            )
+            store.save()
+            fake = SimpleNamespace(client_batch_store=ClientBatchStore(path), logs=[], client_direct_bindings={})
+            fake._log = lambda message: fake.logs.append(message)
+            fake._sync_client_direct_batch_status = lambda: None
+
+            with mock.patch.object(LauncherApp, "_client_direct_pid_exists", return_value=False), mock.patch.object(
+                LauncherApp,
+                "_client_direct_process_is_x5game",
+                return_value=False,
+            ), mock.patch.object(LauncherApp, "_client_direct_cdp_available", return_value=False), mock.patch.object(
+                LauncherApp,
+                "_client_direct_is_window_alive",
+                return_value=False,
+            ), mock.patch.object(LauncherApp, "_sync_client_direct_batch_status"), mock.patch.object(
+                LauncherApp,
+                "_restore_client_direct_bindings_from_active_batch",
+            ):
+                LauncherApp._load_client_direct_sessions(fake)
+
+            self.assertEqual(len(fake.client_batch_store.batches), 1)
+            restored_binding = fake.client_batch_store.batches[0].bindings[0]
+            self.assertEqual(restored_binding.status, "客户端登录成功")
+            self.assertEqual(restored_binding.window_status, "pid_missing")
+            self.assertTrue(any("不自动清理批次" in item for item in fake.logs))
+
     def test_client_direct_batch_dropdown_switch_syncs_active_batch_and_bindings(self) -> None:
         first = AccountConfig("第一层", 1, 1, "https://example.com/a1")
         second = AccountConfig("第二层", 1, 2, "https://example.com/a2")
@@ -1211,6 +1331,199 @@ class GuiGroupSettingsTests(unittest.TestCase):
         self.assertIn("绑定数量=1", fake.logs[0])
         self.assertIn("端口范围=9231~9231", fake.logs[0])
         self.assertEqual(store.current_batch().bindings[0].hwnd, 30)
+
+    def test_identify_local_client_direct_clients_merges_scan_and_masks_logs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            login_url = "https://dldl.50pk.com/login.php?gid=1&pid=1&token=secret-token&time=1&sign=secret-sign&isPcLauncher=true"
+            store = ClientBatchStore(Path(tmp) / "client_direct_sessions.json")
+            batch = store.create_batch("单层账号-1号", scope="当前层:单层账号", base_port=9222)
+            store.append_binding(
+                ClientBatchBinding("old", "旧账号", pid=100, hwnd=1000, cdp_port=9222, login_url=login_url, status="客户端登录成功")
+            )
+            fake = SimpleNamespace(
+                client_batch_store=store,
+                client_direct_bindings={},
+                logs=[],
+                client_direct_batch_status_var=SimpleNamespace(set=lambda _value: None),
+                client_direct_base_port_var=SimpleNamespace(set=lambda _value: None),
+                client_direct_port_range_var=SimpleNamespace(set=lambda _value: None),
+                client_direct_batch_select_var=SimpleNamespace(get=lambda: f"单层账号-1号 | {batch.batch_id}", set=lambda _value: None),
+                client_direct_batch_box=SimpleNamespace(configure=lambda **_kwargs: None),
+            )
+            fake._log = lambda message: fake.logs.append(message)
+            scans = [
+                gui_module.LocalClientScan(pid=100, hwnd=1000, title="斗罗大陆H5-1号", cdp_port=9222, cdp_available=True, page_url=login_url),
+                gui_module.LocalClientScan(pid=101, hwnd=1001, title="斗罗大陆H5-2号", cdp_port=9223, cdp_available=True, page_url=login_url),
+                gui_module.LocalClientScan(pid=102, hwnd=1002, title="斗罗大陆H5-3号", cdp_port=9224, cdp_available=True),
+            ]
+
+            with mock.patch.object(LauncherApp, "_scan_local_client_direct_clients", return_value=scans):
+                LauncherApp._identify_local_client_direct_clients(fake)
+
+            self.assertEqual(len(store.current_batch().bindings), 3)
+            self.assertEqual(store.current_batch().bindings[0].status, "客户端登录成功")
+            self.assertEqual(store.current_batch().bindings[1].source, "local_scan")
+            self.assertEqual(store.current_batch().bindings[1].window_status, "restored")
+            self.assertEqual(len(fake.client_direct_bindings), 3)
+            joined_logs = "\n".join(fake.logs)
+            self.assertIn("扫描到 3 个 X5Game，恢复历史批次 1 个，新建批次 0 个，未归属 0 个", joined_logs)
+            self.assertNotIn("secret-token", joined_logs)
+            self.assertNotIn("secret-sign", joined_logs)
+
+    def test_identify_local_client_direct_clients_keeps_scan_collection_when_history_ranges_exist(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ClientBatchStore(Path(tmp) / "client_direct_sessions.json")
+            first = store.create_batch("桌面1-1号", scope="当前层", base_port=9222)
+            store.append_binding(ClientBatchBinding("old-1", "旧1", pid=1001, hwnd=2001, cdp_port=9222, status="客户端登录成功"))
+            second = store.create_batch("桌面2-10号", scope="当前层", base_port=9231)
+            store.append_binding(ClientBatchBinding("old-10", "旧10", pid=1010, hwnd=2010, cdp_port=9231, status="客户端登录成功"))
+            store.switch_batch(first.batch_id)
+            displays: list[tuple[str, ...]] = []
+            selected_values: list[str] = []
+            status_values: list[str] = []
+            fake = SimpleNamespace(
+                client_batch_store=store,
+                client_direct_bindings={},
+                logs=[],
+                client_direct_batch_status_var=SimpleNamespace(set=lambda value: status_values.append(value)),
+                client_direct_base_port_var=SimpleNamespace(set=lambda _value: None),
+                client_direct_port_range_var=SimpleNamespace(set=lambda _value: None),
+                client_direct_batch_select_var=SimpleNamespace(get=lambda: "", set=lambda value: selected_values.append(value)),
+                client_direct_batch_box=SimpleNamespace(configure=lambda **kwargs: displays.append(tuple(kwargs.get("values", ())))),
+            )
+            fake._log = lambda message: fake.logs.append(message)
+            scans = [
+                gui_module.LocalClientScan(pid=1000 + index, hwnd=2000 + index, title=f"斗罗大陆H5-{index}号", cdp_port=9221 + index, cdp_available=True)
+                for index in range(1, 19)
+            ]
+
+            with mock.patch.object(LauncherApp, "_scan_local_client_direct_clients", return_value=scans):
+                LauncherApp._identify_local_client_direct_clients(fake)
+
+            self.assertEqual([len(batch.bindings) for batch in store.batches], [1, 1, 18])
+            self.assertTrue(any("桌面1-1号 | 绑定1 | 存活1 | 端口9222~9222" in display for values in displays for display in values))
+            self.assertTrue(any("桌面2-10号 | 绑定1 | 存活1 | 端口9231~9231" in display for values in displays for display in values))
+            self.assertTrue(any("当前桌面识别-18窗-端口9222~9239 | 绑定18" in display for values in displays for display in values))
+            self.assertEqual(len(fake.client_direct_bindings), 18)
+            self.assertTrue(any("恢复历史批次 0 个，新建批次 1 个，未归属 0 个" in line for line in fake.logs))
+
+    def test_identify_local_client_direct_clients_selects_new_subset_batch_for_current_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ClientBatchStore(Path(tmp) / "client_direct_sessions.json")
+            old_batch = store.create_batch("本地识别-端口9222~9252", scope="本地识别", base_port=9222)
+            for index, port in enumerate(range(9222, 9253), start=1):
+                store.append_binding(
+                    ClientBatchBinding(
+                        f"old-{index}",
+                        f"旧{index}",
+                        pid=1000 + index,
+                        hwnd=2000 + index,
+                        cdp_port=port,
+                        status="客户端登录成功",
+                    )
+                )
+            selected = SimpleNamespace(value="")
+            selected.get = lambda: selected.value
+            selected.set = lambda value: setattr(selected, "value", value)
+            displays: list[tuple[str, ...]] = []
+            fake = SimpleNamespace(
+                client_batch_store=store,
+                client_direct_bindings={},
+                logs=[],
+                client_direct_batch_status_var=SimpleNamespace(set=lambda _value: None),
+                client_direct_base_port_var=SimpleNamespace(set=lambda _value: None),
+                client_direct_port_range_var=SimpleNamespace(set=lambda _value: None),
+                client_direct_batch_select_var=selected,
+                client_direct_batch_box=SimpleNamespace(configure=lambda **kwargs: displays.append(tuple(kwargs.get("values", ())))),
+            )
+            fake._log = lambda message: fake.logs.append(message)
+            scans = [
+                gui_module.LocalClientScan(
+                    pid=3000 + index,
+                    hwnd=4000 + index,
+                    title=f"斗罗大陆H5-{index}号",
+                    cdp_port=9221 + index,
+                    cdp_available=True,
+                )
+                for index in range(1, 10)
+            ]
+
+            with mock.patch.object(LauncherApp, "_scan_local_client_direct_clients", return_value=scans):
+                LauncherApp._identify_local_client_direct_clients(fake)
+
+            self.assertEqual([len(batch.bindings) for batch in store.batches], [31, 9])
+            self.assertEqual(store.batches[0].batch_id, old_batch.batch_id)
+            self.assertIn("本地识别-端口9222~9252 | 绑定31", displays[-1][0])
+            self.assertTrue(any("当前桌面识别-9窗-端口9222~9230 | 绑定9" in item for item in displays[-1]))
+            self.assertIn("当前桌面识别-9窗-端口9222~9230 | 绑定9", selected.value)
+            self.assertEqual(len(fake.client_direct_bindings), 9)
+            self.assertEqual(
+                [binding.cdp_port for binding in LauncherApp._client_speed_control_scope_bindings(fake, "当前批次")],
+                list(range(9222, 9231)),
+            )
+            self.assertEqual(len(LauncherApp._client_speed_control_scope_bindings(fake, "全部存活批次")), 40)
+            self.assertTrue(any("数量差距较大" in line for line in fake.logs))
+            self.assertTrue(any("新建当前桌面批次：当前桌面识别-9窗-端口9222~9230，绑定9" in line for line in fake.logs))
+            self.assertTrue(all(binding.status == "客户端登录成功" for binding in old_batch.bindings))
+
+    def test_identify_local_client_direct_clients_selects_new_large_scan_batch_without_splitting_history(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ClientBatchStore(Path(tmp) / "client_direct_sessions.json")
+            old_batch = store.create_batch("当前桌面识别-9窗-端口9222~9230", scope="本地识别", base_port=9222)
+            for index, port in enumerate(range(9222, 9231), start=1):
+                store.append_binding(
+                    ClientBatchBinding(
+                        f"old-{index}",
+                        f"旧{index}",
+                        pid=1000 + index,
+                        hwnd=2000 + index,
+                        cdp_port=port,
+                        status="客户端登录成功",
+                    )
+                )
+            selected = SimpleNamespace(value="")
+            selected.get = lambda: selected.value
+            selected.set = lambda value: setattr(selected, "value", value)
+            displays: list[tuple[str, ...]] = []
+            fake = SimpleNamespace(
+                client_batch_store=store,
+                client_direct_bindings={},
+                logs=[],
+                client_direct_batch_status_var=SimpleNamespace(set=lambda _value: None),
+                client_direct_base_port_var=SimpleNamespace(set=lambda _value: None),
+                client_direct_port_range_var=SimpleNamespace(set=lambda _value: None),
+                client_direct_batch_select_var=selected,
+                client_direct_batch_box=SimpleNamespace(configure=lambda **kwargs: displays.append(tuple(kwargs.get("values", ())))),
+            )
+            fake._log = lambda message: fake.logs.append(message)
+            scans = [
+                gui_module.LocalClientScan(
+                    pid=3000 + index,
+                    hwnd=4000 + index,
+                    title=f"斗罗大陆H5-{index}号",
+                    cdp_port=9221 + index,
+                    cdp_available=True,
+                )
+                for index in range(1, 32)
+            ]
+
+            with mock.patch.object(LauncherApp, "_scan_local_client_direct_clients", return_value=scans):
+                LauncherApp._identify_local_client_direct_clients(fake)
+
+            self.assertEqual([len(batch.bindings) for batch in store.batches], [9, 31])
+            self.assertEqual(store.batches[0].batch_id, old_batch.batch_id)
+            self.assertIn("当前桌面识别-9窗-端口9222~9230 | 绑定9", displays[-1][0])
+            self.assertTrue(any("当前桌面识别-31窗-端口9222~9252 | 绑定31" in item for item in displays[-1]))
+            self.assertIn("当前桌面识别-31窗-端口9222~9252 | 绑定31", selected.value)
+            self.assertEqual(len(fake.client_direct_bindings), 31)
+            self.assertEqual(
+                [binding.cdp_port for binding in LauncherApp._client_speed_control_scope_bindings(fake, "当前批次")],
+                list(range(9222, 9253)),
+            )
+            self.assertEqual(len(LauncherApp._client_speed_control_scope_bindings(fake, "全部存活批次")), 40)
+            self.assertTrue(any("数量差距较大" in line for line in fake.logs))
+            self.assertTrue(any("新建当前桌面批次：当前桌面识别-31窗-端口9222~9252，绑定31" in line for line in fake.logs))
+            self.assertTrue(all(binding.status == "客户端登录成功" for binding in old_batch.bindings))
 
     def test_repair_current_batch_reopens_pid_missing_binding_reusing_original_port(self) -> None:
         accounts = [

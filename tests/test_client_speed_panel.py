@@ -5,6 +5,10 @@ from douluo_launcher.client_speed_panel import (
     ClientSpeedPanelConfig,
     build_custom_speed_panel_script,
     build_hide_original_speed_overlay_script,
+    build_speed_new_document_script,
+    build_speed_navigation_guard_script,
+    apply_speed_rate_to_cdp,
+    install_speed_navigation_guard,
     process_client_speed_panel,
 )
 
@@ -78,6 +82,76 @@ class ClientSpeedPanelTests(unittest.TestCase):
         self.assertEqual(len(cdp.expressions), 3)
         self.assertIn("__H5_SPEED_HOOK_INSTALLED__", cdp.expressions[1])
 
+    def test_navigation_guard_blocks_context_menu_when_enabled(self) -> None:
+        script = build_speed_navigation_guard_script(ClientSpeedPanelConfig(block_browser_context_menu=True))
+
+        self.assertIn("__H5_SPEED_NAV_GUARD_INSTALLED__", script)
+        self.assertIn("contextmenu", script)
+        self.assertIn("preventDefault", script)
+        self.assertIn("__H5_HIDE_ORIGINAL_SPEED_PANEL_STRONG__", script)
+
+    def test_navigation_guard_does_not_block_context_menu_when_disabled(self) -> None:
+        script = build_speed_navigation_guard_script(ClientSpeedPanelConfig(block_browser_context_menu=False))
+
+        self.assertIn("__H5_SPEED_NAV_GUARD_INSTALLED__", script)
+        self.assertNotIn("preventDefault", script)
+
+    def test_install_navigation_guard_uses_new_document_script_and_current_page(self) -> None:
+        class GuardCdp(FakeCdp):
+            def __init__(self) -> None:
+                super().__init__()
+                self.sent: list[tuple[str, dict | None]] = []
+
+            def send(self, method: str, params: dict | None = None, *, timeout: float = 10.0) -> dict:
+                self.sent.append((method, params))
+                return {"identifier": "guard"}
+
+        cdp = GuardCdp()
+
+        install_speed_navigation_guard(cdp, ClientSpeedPanelConfig(block_browser_context_menu=True))
+
+        self.assertEqual(cdp.sent[0][0], "Page.addScriptToEvaluateOnNewDocument")
+        self.assertIn("__H5_SPEED_NAV_GUARD_INSTALLED__", cdp.sent[0][1]["source"])
+        self.assertIn("window.__H5_SPEED_APPLY__", cdp.sent[0][1]["source"])
+        self.assertIn("__H5_HIDE_ORIGINAL_SPEED_PANEL_STRONG__", cdp.sent[0][1]["source"])
+        self.assertIn("__H5_SPEED_NAV_GUARD_INSTALLED__", cdp.expressions[0])
+
+    def test_new_document_script_contains_hide_hook_panel_and_guard(self) -> None:
+        script = build_speed_new_document_script(ClientSpeedPanelConfig(default_speed_rate=50))
+
+        self.assertIn("__H5_HIDE_ORIGINAL_SPEED_PANEL_STRONG__", script)
+        self.assertIn("window.__H5_SPEED_APPLY__", script)
+        self.assertIn("__H5_SPEED_NAV_GUARD_INSTALLED__", script)
+        self.assertIn("50", script)
+
+    def test_apply_speed_rate_uses_existing_hook_directly(self) -> None:
+        cdp = FakeCdp(results=[True, {"ok": True, "current": 50}])
+
+        result = apply_speed_rate_to_cdp(cdp, 50, ClientSpeedPanelConfig())
+
+        self.assertEqual(result["current"], 50)
+        self.assertEqual(len(cdp.expressions), 2)
+        self.assertIn("typeof window.__H5_SPEED_APPLY__", cdp.expressions[0])
+        self.assertIn("window.__H5_SPEED_APPLY__(50.0)", cdp.expressions[1])
+
+    def test_apply_speed_rate_reinjects_when_hook_missing(self) -> None:
+        cdp = FakeCdp(
+            results=[
+                False,
+                {"hidden": False},
+                {"ok": True, "engine": "timer_hook", "panel": "speed-hack-panel", "current": 1.0},
+                {"hidden": True},
+                {"ok": True, "current": 50},
+            ]
+        )
+        logs: list[str] = []
+
+        result = apply_speed_rate_to_cdp(cdp, 50, ClientSpeedPanelConfig(), log=logs.append)
+
+        self.assertEqual(result["current"], 50)
+        self.assertTrue(any("hook 缺失" in item for item in logs))
+        self.assertTrue(any("__H5_SPEED_HOOK_INSTALLED__" in expression for expression in cdp.expressions))
+
     def test_injected_js_contains_timer_hook_guard_default_rate_and_buttons(self) -> None:
         script = build_custom_speed_panel_script(ClientSpeedPanelConfig())
 
@@ -89,6 +163,16 @@ class ClientSpeedPanelTests(unittest.TestCase):
         self.assertIn('data-speed="50"', script)
         self.assertIn('data-speed="500"', script)
         self.assertIn("1.0", script)
+
+    def test_speed_panel_buttons_use_scoped_grid_gap_layout(self) -> None:
+        script = build_custom_speed_panel_script(ClientSpeedPanelConfig())
+
+        self.assertIn('class="speed-panel-input"', script)
+        self.assertIn('class="speed-panel-actions"', script)
+        self.assertIn("#speed-hack-panel .speed-panel-actions", script)
+        self.assertIn("display: grid", script)
+        self.assertIn("grid-template-columns: repeat(2, minmax(64px, 1fr))", script)
+        self.assertIn("gap: 8px 10px", script)
 
     def test_injected_js_hooks_time_functions_once_and_exposes_api(self) -> None:
         script = build_custom_speed_panel_script(ClientSpeedPanelConfig())

@@ -1,19 +1,34 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
+from urllib.parse import parse_qsl, urlparse
 
 from .client_cdp import is_tcp_port_available
-from .config import app_root
+from .config import default_client_direct_sessions_path
 
 
 SCHEMA_VERSION = 1
 DEFAULT_BASE_PORT = 9222
 SESSION_DIR_NAME = "debug_client_direct"
 SESSION_FILE_NAME = "client_direct_sessions.json"
+BUSINESS_STATUS_VALUES = {
+    "客户端登录成功",
+    "已进入游戏",
+    "客户端已就绪",
+    "登录失败",
+    "进入游戏失败",
+    "login_success",
+    "game_entered",
+    "ready",
+    "running",
+    "login_failed",
+    "enter_game_failed",
+}
 
 
 def now_text() -> str:
@@ -21,8 +36,9 @@ def now_text() -> str:
 
 
 def default_sessions_path(root: str | Path | None = None) -> Path:
-    base = Path(root) if root is not None else app_root()
-    return base / SESSION_DIR_NAME / SESSION_FILE_NAME
+    if root is not None:
+        return Path(root) / SESSION_FILE_NAME
+    return default_client_direct_sessions_path()
 
 
 def make_batch_id() -> str:
@@ -77,6 +93,20 @@ class ClientBatchBinding:
     cdp_port: int = 0
     login_url: str = ""
     status: str = "pending"
+    display_status: str = ""
+    login_status: str = ""
+    window_status: str = ""
+    repair_status: str = ""
+    source: str = ""
+    title: str = ""
+    process_path: str = ""
+    window_left: int = 0
+    window_top: int = 0
+    window_width: int = 0
+    window_height: int = 0
+    page_url: str = ""
+    page_title: str = ""
+    speed_rate: float = 1.0
     error_message: str = ""
     created_at: str = ""
     updated_at: str = ""
@@ -90,6 +120,11 @@ class ClientBatchBinding:
         self.pid = int(self.pid or 0)
         self.hwnd = int(self.hwnd or 0)
         self.cdp_port = int(self.cdp_port or 0)
+        self.window_left = int(self.window_left or 0)
+        self.window_top = int(self.window_top or 0)
+        self.window_width = int(self.window_width or 0)
+        self.window_height = int(self.window_height or 0)
+        self.speed_rate = float(self.speed_rate or 1.0)
 
     def to_dict(self) -> dict:
         return {
@@ -100,6 +135,20 @@ class ClientBatchBinding:
             "cdp_port": self.cdp_port,
             "login_url": self.login_url,
             "status": self.status,
+            "display_status": self.display_status,
+            "login_status": self.login_status,
+            "window_status": self.window_status,
+            "repair_status": self.repair_status,
+            "source": self.source,
+            "title": self.title,
+            "process_path": self.process_path,
+            "window_left": self.window_left,
+            "window_top": self.window_top,
+            "window_width": self.window_width,
+            "window_height": self.window_height,
+            "page_url": self.page_url,
+            "page_title": self.page_title,
+            "speed_rate": self.speed_rate,
             "error_message": self.error_message,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -115,10 +164,42 @@ class ClientBatchBinding:
             cdp_port=int(data.get("cdp_port") or 0),
             login_url=str(data.get("login_url") or ""),
             status=str(data.get("status") or "pending"),
+            display_status=str(data.get("display_status") or ""),
+            login_status=str(data.get("login_status") or ""),
+            window_status=str(data.get("window_status") or ""),
+            repair_status=str(data.get("repair_status") or ""),
+            source=str(data.get("source") or ""),
+            title=str(data.get("title") or ""),
+            process_path=str(data.get("process_path") or ""),
+            window_left=int(data.get("window_left") or 0),
+            window_top=int(data.get("window_top") or 0),
+            window_width=int(data.get("window_width") or 0),
+            window_height=int(data.get("window_height") or 0),
+            page_url=str(data.get("page_url") or ""),
+            page_title=str(data.get("page_title") or ""),
+            speed_rate=float(data.get("speed_rate") or 1.0),
             error_message=str(data.get("error_message") or ""),
             created_at=str(data.get("created_at") or ""),
             updated_at=str(data.get("updated_at") or ""),
         )
+
+
+@dataclass(frozen=True)
+class LocalClientScan:
+    pid: int = 0
+    hwnd: int = 0
+    title: str = ""
+    window_left: int = 0
+    window_top: int = 0
+    window_width: int = 0
+    window_height: int = 0
+    process_path: str = ""
+    cdp_port: int = 0
+    cdp_available: bool = False
+    cdp_port_inferred: bool = False
+    page_url: str = ""
+    page_title: str = ""
+    is_x5game: bool = True
 
 
 @dataclass
@@ -371,6 +452,446 @@ class ClientBatchStore:
             return "hwnd_invalid"
         return "restored"
 
+    def _has_business_status(self, binding: ClientBatchBinding) -> bool:
+        values = {
+            str(binding.status or ""),
+            str(binding.display_status or ""),
+            str(binding.login_status or ""),
+        }
+        return any(value in BUSINESS_STATUS_VALUES for value in values)
+
+    def _apply_window_status(self, binding: ClientBatchBinding, status: str, *, update_status: str | None = None) -> None:
+        binding.window_status = "restored" if status in {"restored", "repaired"} else status
+        if not self._has_business_status(binding):
+            binding.status = update_status or status
+        binding.updated_at = now_text()
+
+    def _url_signature(self, value: str) -> tuple[str, str, tuple[tuple[str, str], ...]]:
+        try:
+            parsed = urlparse(str(value or "").strip())
+        except Exception:
+            return ("", "", ())
+        safe_params = []
+        for key, param_value in parse_qsl(parsed.query, keep_blank_values=False):
+            lower_key = key.lower()
+            if lower_key in {"token", "sign", "cookie", "session", "openid", "openkey"}:
+                continue
+            safe_params.append((lower_key, str(param_value or "")))
+        return (str(parsed.hostname or "").lower(), str(parsed.path or ""), tuple(sorted(safe_params)))
+
+    def _local_scan_status(self, scan: LocalClientScan) -> str:
+        if not bool(scan.is_x5game):
+            return "pid_not_x5game"
+        if int(scan.hwnd or 0) <= 0:
+            return "hwnd_invalid"
+        if int(scan.cdp_port or 0) > 0 and not bool(scan.cdp_available):
+            return "cdp_unavailable"
+        return "restored"
+
+    def _binding_matches_local_scan(self, binding: ClientBatchBinding, scan: LocalClientScan, batch: ClientBatch) -> bool:
+        scan_port = int(scan.cdp_port or 0)
+        if scan_port > 0 and int(binding.cdp_port or 0) == scan_port:
+            return True
+        scan_pid = int(scan.pid or 0)
+        if scan_pid > 0 and int(binding.pid or 0) == scan_pid:
+            return True
+        scan_hwnd = int(scan.hwnd or 0)
+        if scan_hwnd > 0 and int(binding.hwnd or 0) == scan_hwnd:
+            return True
+        scan_signature = self._url_signature(scan.page_url)
+        if scan_signature[0] and scan_signature == self._url_signature(binding.login_url or binding.page_url):
+            return True
+        if scan.title and str(binding.title or binding.account_name or "") == str(scan.title):
+            return True
+        base_port = int(batch.base_port or DEFAULT_BASE_PORT)
+        if scan_port > 0:
+            inferred_index = scan_port - base_port
+            if inferred_index >= 0:
+                bindings = list(batch.bindings)
+                if inferred_index < len(bindings) and bindings[inferred_index] is binding:
+                    return True
+        return False
+
+    def _find_local_scan_match(
+        self,
+        scan: LocalClientScan,
+        batch: ClientBatch,
+        used_binding_ids: set[int],
+    ) -> ClientBatchBinding | None:
+        for binding in batch.bindings:
+            if id(binding) in used_binding_ids:
+                continue
+            if self._binding_matches_local_scan(binding, scan, batch):
+                return binding
+        return None
+
+    def _local_scan_value_sets(self, scans: list[LocalClientScan]) -> tuple[set[int], set[int], set[int]]:
+        ports = {int(scan.cdp_port or 0) for scan in scans if int(scan.cdp_port or 0) > 0}
+        pids = {int(scan.pid or 0) for scan in scans if int(scan.pid or 0) > 0}
+        hwnds = {int(scan.hwnd or 0) for scan in scans if int(scan.hwnd or 0) > 0}
+        return ports, pids, hwnds
+
+    def _batch_value_sets(self, batch: ClientBatch) -> tuple[set[int], set[int], set[int]]:
+        ports = {int(binding.cdp_port or 0) for binding in batch.bindings if int(binding.cdp_port or 0) > 0}
+        pids = {int(binding.pid or 0) for binding in batch.bindings if int(binding.pid or 0) > 0}
+        hwnds = {int(binding.hwnd or 0) for binding in batch.bindings if int(binding.hwnd or 0) > 0}
+        return ports, pids, hwnds
+
+    def _large_collection_gap(self, scan_count: int, batch_count: int) -> bool:
+        smaller = min(scan_count, batch_count)
+        if smaller <= 0:
+            return False
+        allowed_gap = max(2, (smaller + 3) // 4)
+        return abs(batch_count - scan_count) > allowed_gap
+
+    def _scan_is_large_subset_of_batch(self, scans: list[LocalClientScan], batch: ClientBatch) -> bool:
+        scan_count = len(scans)
+        batch_count = len(batch.bindings)
+        if scan_count <= 0 or batch_count <= scan_count:
+            return False
+        if not self._large_collection_gap(scan_count, batch_count):
+            return False
+        for scan_values, batch_values in zip(self._local_scan_value_sets(scans), self._batch_value_sets(batch)):
+            if not scan_values or not batch_values:
+                continue
+            overlap = scan_values & batch_values
+            if scan_values <= batch_values:
+                return True
+            if len(overlap) / max(1, len(scan_values)) >= 0.8:
+                return True
+        return False
+
+    def _real_scan_ports(self, scans: list[LocalClientScan]) -> set[int]:
+        return {
+            int(scan.cdp_port or 0)
+            for scan in scans
+            if int(scan.cdp_port or 0) > 0 and not bool(getattr(scan, "cdp_port_inferred", False))
+        }
+
+    def _complete_positive_set(self, values: set[int], expected_count: int) -> bool:
+        return expected_count > 0 and len(values) == expected_count
+
+    def _port_range_text_for_ports(self, ports: set[int]) -> str:
+        if not ports:
+            return ""
+        ordered = sorted(ports)
+        return f"{ordered[0]}~{ordered[-1]}"
+
+    def _history_batch_matches_scan_collection(
+        self,
+        batch: ClientBatch,
+        scans: list[LocalClientScan],
+        result: dict[str, Any],
+    ) -> bool:
+        scan_count = len(scans)
+        batch_count = len(batch.bindings)
+        if scan_count <= 0 or batch_count <= 0:
+            return False
+
+        scan_ports, scan_pids, scan_hwnds = self._local_scan_value_sets(scans)
+        batch_ports, batch_pids, batch_hwnds = self._batch_value_sets(batch)
+        real_scan_ports = self._real_scan_ports(scans)
+        port_range_same = bool(scan_ports and batch_ports and self._port_range_text_for_ports(scan_ports) == self._port_range_text_for_ports(batch_ports))
+        real_ports_same = bool(real_scan_ports and batch_ports and real_scan_ports == batch_ports)
+        hwnd_complete = self._complete_positive_set(scan_hwnds, scan_count) and self._complete_positive_set(batch_hwnds, batch_count)
+        pid_complete = self._complete_positive_set(scan_pids, scan_count) and self._complete_positive_set(batch_pids, batch_count)
+        hwnd_conflict = hwnd_complete and scan_count == batch_count and scan_hwnds != batch_hwnds
+        pid_conflict = pid_complete and scan_count == batch_count and scan_pids != batch_pids
+
+        if self._large_collection_gap(scan_count, batch_count):
+            result["notes"].append(
+                f"当前扫描 {scan_count} 个，历史批次“{batch.batch_name}”{batch_count} 个，数量差距较大，不拆分当前扫描集合。"
+            )
+            return False
+
+        if hwnd_complete and scan_hwnds == batch_hwnds:
+            return True
+        if pid_complete and scan_pids == batch_pids:
+            return True
+
+        if any(bool(getattr(scan, "cdp_port_inferred", False)) for scan in scans) and port_range_same:
+            result["notes"].append(
+                f"历史批次“{batch.batch_name}”端口范围相同，但本次端口包含推断端口，不作为强匹配依据。"
+            )
+
+        if (port_range_same or real_ports_same) and (hwnd_conflict or pid_conflict):
+            result["notes"].append(
+                f"历史批次“{batch.batch_name}”端口范围相同，但 pid/hwnd 集合不同，不合并。"
+            )
+            return False
+
+        if any(bool(getattr(scan, "cdp_port_inferred", False)) for scan in scans) and port_range_same:
+            return False
+
+        if real_ports_same and scan_count == batch_count:
+            return True
+
+        pid_overlap = len(scan_pids & batch_pids) if scan_pids and batch_pids else 0
+        hwnd_overlap = len(scan_hwnds & batch_hwnds) if scan_hwnds and batch_hwnds else 0
+        identity_overlap = max(pid_overlap, hwnd_overlap)
+        if identity_overlap > 0 and not (hwnd_conflict or pid_conflict):
+            return True
+
+        scan_numbers = {self._scan_title_number(scan) for scan in scans}
+        scan_numbers.discard(None)
+        batch_numbers = {self._scan_title_number(LocalClientScan(title=str(binding.title or binding.account_name or ""))) for binding in batch.bindings}
+        batch_numbers.discard(None)
+        if (
+            scan_count == batch_count
+            and scan_numbers
+            and scan_numbers == batch_numbers
+            and not (hwnd_conflict or pid_conflict)
+            and (real_ports_same or not port_range_same)
+        ):
+            return True
+
+        return False
+
+    def _matching_history_batch_for_scan_collection(
+        self,
+        scans: list[LocalClientScan],
+        result: dict[str, Any],
+    ) -> ClientBatch | None:
+        for batch in self.batches:
+            if self._history_batch_matches_scan_collection(batch, scans, result):
+                return batch
+        return None
+
+    def _copy_local_scan_to_binding(self, binding: ClientBatchBinding, scan: LocalClientScan, status: str) -> None:
+        if int(scan.pid or 0) > 0:
+            binding.pid = int(scan.pid)
+        if int(scan.hwnd or 0) > 0:
+            binding.hwnd = int(scan.hwnd)
+        if int(scan.cdp_port or 0) > 0:
+            binding.cdp_port = int(scan.cdp_port)
+        binding.title = str(scan.title or binding.title or "")
+        binding.process_path = str(scan.process_path or binding.process_path or "")
+        binding.window_left = int(scan.window_left or binding.window_left or 0)
+        binding.window_top = int(scan.window_top or binding.window_top or 0)
+        binding.window_width = int(scan.window_width or binding.window_width or 0)
+        binding.window_height = int(scan.window_height or binding.window_height or 0)
+        binding.page_url = str(scan.page_url or binding.page_url or "")
+        binding.page_title = str(scan.page_title or binding.page_title or "")
+        binding.repair_status = "restored" if status == "restored" else status
+        binding.window_status = "restored" if status == "restored" else status
+        binding.updated_at = now_text()
+
+    def _local_scan_binding_id(self, scan: LocalClientScan, batch: ClientBatch) -> str:
+        base = f"local_scan:{int(scan.cdp_port or 0)}:{int(scan.pid or 0)}:{int(scan.hwnd or 0)}"
+        existing = {str(binding.account_id) for binding in batch.bindings}
+        if base not in existing:
+            return base
+        suffix = 2
+        while f"{base}:{suffix}" in existing:
+            suffix += 1
+        return f"{base}:{suffix}"
+
+    def _binding_from_local_scan(self, scan: LocalClientScan, batch: ClientBatch) -> ClientBatchBinding:
+        status = self._local_scan_status(scan)
+        binding = ClientBatchBinding(
+            account_id=self._local_scan_binding_id(scan, batch),
+            account_name=str(scan.title or f"本地客户端 {int(scan.hwnd or 0)}").strip(),
+            pid=int(scan.pid or 0),
+            hwnd=int(scan.hwnd or 0),
+            cdp_port=int(scan.cdp_port or 0),
+            login_url="",
+            status="pending",
+            source="local_scan",
+            title=str(scan.title or ""),
+            process_path=str(scan.process_path or ""),
+            window_left=int(scan.window_left or 0),
+            window_top=int(scan.window_top or 0),
+            window_width=int(scan.window_width or 0),
+            window_height=int(scan.window_height or 0),
+            page_url=str(scan.page_url or ""),
+            page_title=str(scan.page_title or ""),
+        )
+        binding.window_status = "restored" if status == "restored" else status
+        binding.repair_status = "restored" if status == "restored" else status
+        binding.updated_at = now_text()
+        return binding
+
+    def _batch_port_ranges(self, scans: list[LocalClientScan]) -> dict[str, tuple[int, int]]:
+        ranges: dict[str, tuple[int, int]] = {}
+        ordered = sorted(self.batches, key=lambda batch: int(batch.base_port or DEFAULT_BASE_PORT))
+        positive_scan_ports = sorted(int(scan.cdp_port or 0) for scan in scans if int(scan.cdp_port or 0) > 0)
+        for index, batch in enumerate(ordered):
+            ports = sorted(int(binding.cdp_port or 0) for binding in batch.bindings if int(binding.cdp_port or 0) > 0)
+            base = int(batch.base_port or (ports[0] if ports else DEFAULT_BASE_PORT))
+            if index + 1 < len(ordered):
+                next_base = int(ordered[index + 1].base_port or DEFAULT_BASE_PORT)
+                end = max(base, next_base - 1)
+            elif index > 0:
+                previous_base = int(ordered[index - 1].base_port or DEFAULT_BASE_PORT)
+                end = base + max(1, base - previous_base) - 1
+            elif positive_scan_ports:
+                nearby = [port for port in positive_scan_ports if base <= port < base + max(9, len(positive_scan_ports))]
+                end = max(nearby) if nearby else max(ports or [base])
+            else:
+                end = max(ports or [base])
+            if ports:
+                end = max(end, max(ports))
+            ranges[batch.batch_id] = (base, end)
+        return ranges
+
+    def _batch_for_scan_by_history_range(
+        self,
+        scan: LocalClientScan,
+        ranges: dict[str, tuple[int, int]],
+        excluded_batch_ids: set[str] | None = None,
+    ) -> ClientBatch | None:
+        port = int(scan.cdp_port or 0)
+        if port <= 0:
+            return None
+        excluded = excluded_batch_ids or set()
+        for batch in self.batches:
+            if batch.batch_id in excluded:
+                continue
+            start, end = ranges.get(batch.batch_id, (0, -1))
+            if start <= port <= end:
+                return batch
+        return None
+
+    def _scan_title_number(self, scan: LocalClientScan) -> int | None:
+        match = re.search(r"(\d+)\s*号", str(scan.title or ""))
+        if match:
+            return int(match.group(1))
+        return None
+
+    def _contiguous_scan_groups(self, scans: list[LocalClientScan]) -> tuple[list[list[LocalClientScan]], list[LocalClientScan]]:
+        numbered = [(self._scan_title_number(scan), scan) for scan in scans]
+        if all(number is not None for number, _scan in numbered) and len(numbered) >= 2:
+            groups: list[list[LocalClientScan]] = []
+            current: list[LocalClientScan] = []
+            previous: int | None = None
+            for number, scan in sorted(numbered, key=lambda item: int(item[0] or 0)):
+                if previous is None or int(number or 0) == previous + 1:
+                    current.append(scan)
+                else:
+                    groups.append(current)
+                    current = [scan]
+                previous = int(number or 0)
+            if current:
+                groups.append(current)
+            return groups, []
+
+        ported = sorted([scan for scan in scans if int(scan.cdp_port or 0) > 0], key=lambda scan: int(scan.cdp_port or 0))
+        no_port = [scan for scan in scans if int(scan.cdp_port or 0) <= 0]
+        groups = []
+        current = []
+        previous_port: int | None = None
+        for scan in ported:
+            port = int(scan.cdp_port or 0)
+            if previous_port is None or port == previous_port + 1:
+                current.append(scan)
+            else:
+                if len(current) >= 2:
+                    groups.append(current)
+                else:
+                    no_port.extend(current)
+                current = [scan]
+            previous_port = port
+        if len(current) >= 2:
+            groups.append(current)
+        else:
+            no_port.extend(current)
+        return groups, no_port
+
+    def _create_local_scan_batch(self, scans: list[LocalClientScan], index: int) -> ClientBatch:
+        ports = sorted(int(scan.cdp_port or 0) for scan in scans if int(scan.cdp_port or 0) > 0)
+        if ports:
+            name = f"当前桌面识别-{len(scans)}窗-端口{ports[0]}~{ports[-1]}"
+            base_port = ports[0]
+        else:
+            name = f"当前桌面识别-{len(scans)}窗-批次{index}"
+            base_port = DEFAULT_BASE_PORT
+        existing_names = {batch.batch_name for batch in self.batches}
+        clean_name = name
+        suffix = 2
+        while clean_name in existing_names:
+            clean_name = f"{name}-{suffix}"
+            suffix += 1
+        return self.create_batch(clean_name, scope="本地识别", base_port=base_port)
+
+    def _unassigned_local_batch(self) -> ClientBatch:
+        for batch in self.batches:
+            if batch.batch_name == "未归属本地客户端":
+                return batch
+        return self.create_batch("未归属本地客户端", scope="本地识别", base_port=DEFAULT_BASE_PORT)
+
+    def _empty_current_batch_for_local_scan(self) -> ClientBatch | None:
+        if not self.batches:
+            return None
+        try:
+            batch = self.current_batch()
+        except Exception:
+            return None
+        return batch if not batch.bindings else None
+
+    def _add_scan_to_batch(self, scan: LocalClientScan, batch: ClientBatch, result: dict[str, Any]) -> None:
+        batch.bindings.append(self._binding_from_local_scan(scan, batch))
+        batch.updated_at = now_text()
+        result["added"] += 1
+
+    def identify_local_clients(self, scans: list[LocalClientScan]) -> dict[str, Any]:
+        active_batch_id = self.active_batch_id
+        existing_count = sum(len(batch.bindings) for batch in self.batches)
+        result = {
+            "scanned": len(scans),
+            "existing": existing_count,
+            "added": 0,
+            "cdp_unavailable": 0,
+            "binding_invalid": 0,
+            "restored_batches": 0,
+            "created_batches": 0,
+            "unassigned": 0,
+            "notes": [],
+        }
+        for scan in scans:
+            status = self._local_scan_status(scan)
+            if status == "cdp_unavailable":
+                result["cdp_unavailable"] += 1
+            elif status in {"pid_not_x5game", "hwnd_invalid"}:
+                result["binding_invalid"] += 1
+
+        if not scans:
+            if active_batch_id and any(batch.batch_id == active_batch_id for batch in self.batches):
+                self.active_batch_id = active_batch_id
+            return result
+
+        matched_batch = self._matching_history_batch_for_scan_collection(scans, result)
+        if matched_batch is None:
+            if len(scans) >= 2:
+                batch = self._empty_current_batch_for_local_scan()
+                if batch is None:
+                    batch = self._create_local_scan_batch(scans, 1)
+                    result["created_batches"] += 1
+                    result["notes"].append(f"新建当前桌面批次：{batch.batch_name}，绑定{len(scans)}。")
+                for scan in scans:
+                    self._add_scan_to_batch(scan, batch, result)
+                self.active_batch_id = batch.batch_id
+                return result
+            batch = self._unassigned_local_batch()
+            result["unassigned"] = len(scans)
+            for scan in scans:
+                self._add_scan_to_batch(scan, batch, result)
+            self.active_batch_id = batch.batch_id
+            return result
+
+        used_binding_ids: set[int] = set()
+        for scan in scans:
+            status = self._local_scan_status(scan)
+            binding = self._find_local_scan_match(scan, matched_batch, used_binding_ids)
+            if binding is None:
+                self._add_scan_to_batch(scan, matched_batch, result)
+                continue
+            used_binding_ids.add(id(binding))
+            self._copy_local_scan_to_binding(binding, scan, status)
+        matched_batch.updated_at = now_text()
+        result["restored_batches"] = 1
+        self.active_batch_id = matched_batch.batch_id
+        return result
+
     def refresh_current_batch_status(
         self,
         *,
@@ -387,8 +908,7 @@ class ClientBatchStore:
                 cdp_available=cdp_available,
                 hwnd_valid=hwnd_valid,
             )
-            binding.status = status
-            binding.updated_at = now_text()
+            self._apply_window_status(binding, status)
             statuses[binding.account_id] = status
         batch.updated_at = now_text()
         return statuses
@@ -412,8 +932,7 @@ class ClientBatchStore:
                     cdp_available=cdp_available,
                     hwnd_valid=hwnd_valid,
                 )
-                binding.status = status
-                binding.updated_at = now_text()
+                self._apply_window_status(binding, status)
                 statuses[binding.account_id] = status
             batch.updated_at = now_text()
             all_statuses[batch.batch_id] = statuses
@@ -436,8 +955,8 @@ class ClientBatchStore:
                 else:
                     binding.hwnd = hwnd
                     status = "repaired"
-            binding.status = status
-            binding.updated_at = now_text()
+            binding.repair_status = status
+            self._apply_window_status(binding, status, update_status=status)
             results[binding.account_id] = status
         batch.updated_at = now_text()
         return results

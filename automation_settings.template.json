@@ -126,5 +126,6 @@
   "speed_panel_top": 12,
   "speed_panel_debug": false,
   "speed_panel_remove_original_toggle": true,
+  "block_browser_context_menu": true,
   "account_group_settings": {}
 }

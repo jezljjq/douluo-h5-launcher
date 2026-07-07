@@ -90,7 +90,8 @@ Set-Location $ProjectRoot
 
 $AppName = "上号器"
 $InternalBuildName = "Launcher"
-$DistDir = Join-Path $ProjectRoot "dist\$InternalBuildName"
+$ReleaseDirName = "斗罗大陆H5上号器-v1.3.0"
+$DistDir = Join-Path $ProjectRoot "dist\$ReleaseDirName"
 $InternalExePath = Join-Path $DistDir "$InternalBuildName.exe"
 $ExePath = Join-Path $DistDir "$AppName.exe"
 $PlaywrightBrowsers = Join-Path $env:LOCALAPPDATA "ms-playwright"
@@ -106,8 +107,8 @@ Step "[0/7] Validate build context"
 if (-not (Test-Path -LiteralPath "main.py")) {
     Fail "main.py not found. Please run from project root or scripts directory."
 }
-if (-not (Test-Path -LiteralPath "automation_settings.json")) {
-    Fail "Missing required file: automation_settings.json"
+if (-not (Test-Path -LiteralPath "automation_settings.template.json")) {
+    Fail "Missing required file: automation_settings.template.json"
 }
 if (-not (Test-Path -LiteralPath "debug_ocr\template_passport_btn.png")) {
     Fail "Missing required file: debug_ocr\template_passport_btn.png"
@@ -196,7 +197,8 @@ $PyInstallerArgs = @(
     "-y",
     "--noconsole",
     "--name", $InternalBuildName,
-    "--add-data", "automation_settings.json;.",
+    "--distpath", (Join-Path $ProjectRoot "dist"),
+    "--add-data", "automation_settings.template.json;.",
     "--add-data", "debug_ocr\template_passport_btn.png;debug_ocr",
     "--collect-all", "tkinterdnd2",
     "--hidden-import", "PIL",
@@ -218,6 +220,14 @@ $PyInstallerArgs = @(
 if ($LASTEXITCODE -ne 0) {
     Fail "PyInstaller build failed."
 }
+$GeneratedDir = Join-Path $ProjectRoot "dist\$InternalBuildName"
+if (-not (Test-Path -LiteralPath $GeneratedDir)) {
+    Fail "PyInstaller output directory was not generated: $GeneratedDir"
+}
+if (Test-Path -LiteralPath $DistDir) {
+    Remove-Item -LiteralPath $DistDir -Recurse -Force
+}
+Rename-Item -LiteralPath $GeneratedDir -NewName $ReleaseDirName
 
 Step "[6/7] Copy runtime resources"
 if (-not (Test-Path -LiteralPath $DistDir)) {
@@ -232,8 +242,8 @@ if (Test-Path -LiteralPath $ExePath) {
 Rename-Item -LiteralPath $InternalExePath -NewName "$AppName.exe"
 Write-Host "  renamed: $InternalBuildName.exe -> $AppName.exe"
 
-Copy-Item -LiteralPath "automation_settings.json" -Destination $DistDir -Force
-Write-Host "  copied: automation_settings.json"
+Copy-Item -LiteralPath "automation_settings.template.json" -Destination $DistDir -Force
+Write-Host "  copied: automation_settings.template.json"
 
 Copy-Item -LiteralPath "dm_click_helper.py" -Destination $DistDir -Force
 Write-Host "  copied: dm_click_helper.py"

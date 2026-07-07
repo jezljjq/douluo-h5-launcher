@@ -83,8 +83,9 @@ Set-Location $ProjectRoot
 
 $AppName = -join @([char]0x4E0A, [char]0x53F7, [char]0x5668)
 $InternalBuildName = "Launcher"
+$ReleaseDirName = "斗罗大陆H5上号器-v1.3.0"
 $DistParent = Join-Path $ProjectRoot "dist"
-$DistDir = Join-Path $DistParent $InternalBuildName
+$DistDir = Join-Path $DistParent $ReleaseDirName
 $InternalExePath = Join-Path $DistDir "$InternalBuildName.exe"
 $ExePath = Join-Path $DistDir "$AppName.exe"
 $PlaywrightBrowsers = Join-Path $env:LOCALAPPDATA "ms-playwright"
@@ -92,7 +93,7 @@ $BundledPlaywrightBrowsers = Join-Path $DistDir "ms-playwright"
 $Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $BackupDir = Join-Path $DistParent ("Launcher_backup_" + $Timestamp)
 $MainPy = Join-Path $ProjectRoot "main.py"
-$AutomationSettingsPath = Join-Path $ProjectRoot "automation_settings.json"
+$AutomationSettingsPath = Join-Path $ProjectRoot "automation_settings.template.json"
 $TemplatePassportPath = Join-Path $ProjectRoot "debug_ocr\template_passport_btn.png"
 $DmClickHelperPath = Join-Path $ProjectRoot "dm_click_helper.py"
 
@@ -107,7 +108,7 @@ if (-not (Test-Path -LiteralPath $MainPy)) {
     Fail "Missing required file: main.py"
 }
 if (-not (Test-Path -LiteralPath $AutomationSettingsPath)) {
-    Fail "Missing required file: automation_settings.json"
+    Fail "Missing required file: automation_settings.template.json"
 }
 if (-not (Test-Path -LiteralPath $TemplatePassportPath)) {
     Fail "Missing required file: debug_ocr\template_passport_btn.png"
@@ -209,6 +210,14 @@ $PyInstallerArgs = @(
 if ($LASTEXITCODE -ne 0) {
     Fail "32-bit PyInstaller main build failed."
 }
+$GeneratedDir = Join-Path $DistParent $InternalBuildName
+if (-not (Test-Path -LiteralPath $GeneratedDir)) {
+    Fail "PyInstaller output directory was not generated: $GeneratedDir"
+}
+if (Test-Path -LiteralPath $DistDir) {
+    Remove-Item -LiteralPath $DistDir -Recurse -Force
+}
+Rename-Item -LiteralPath $GeneratedDir -NewName $ReleaseDirName
 if (-not (Test-Path -LiteralPath $InternalExePath)) {
     Fail "Internal exe was not generated: $InternalExePath"
 }
@@ -219,17 +228,8 @@ Rename-Item -LiteralPath $InternalExePath -NewName "$AppName.exe"
 Write-Host "  renamed: $InternalBuildName.exe -> $AppName.exe"
 
 Step "[7/8] Copy official runtime resources"
-$ConfigTemplate = @(
-    "automation_settings.template.json",
-    "automation_settings.example.json"
-) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
-if ($ConfigTemplate) {
-    Copy-Item -LiteralPath $ConfigTemplate -Destination (Join-Path $DistDir "automation_settings.json") -Force
-    Write-Host "  copied config template as automation_settings.json: $ConfigTemplate"
-} else {
-    Copy-Item -LiteralPath "automation_settings.json" -Destination $DistDir -Force
-    Write-Host "  warning: no automation_settings template found; copied current automation_settings.json"
-}
+Copy-Item -LiteralPath "automation_settings.template.json" -Destination $DistDir -Force
+Write-Host "  copied: automation_settings.template.json"
 
 Copy-Item -LiteralPath "dm_click_helper.py" -Destination $DistDir -Force
 Write-Host "  copied: dm_click_helper.py"

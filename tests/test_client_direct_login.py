@@ -207,10 +207,11 @@ class ClientDirectLoginTests(unittest.TestCase):
             side_effect=mark_ready,
         ), mock.patch("douluo_launcher.client_direct_login._binding_alive", return_value=True), mock.patch(
             "douluo_launcher.client_direct_login.process_client_speed_panel"
-        ) as process_panel:
+        ) as process_panel, mock.patch("douluo_launcher.client_direct_login.install_speed_navigation_guard") as install_guard:
             result = execute_prepared_client_direct_login(config, binding)
 
         self.assertTrue(result.success)
+        install_guard.assert_called_once()
         self.assertEqual(process_panel.call_count, 3)
         self.assertEqual(
             [call.kwargs["trigger_stage"] for call in process_panel.call_args_list],

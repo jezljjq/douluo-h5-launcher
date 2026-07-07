@@ -18,7 +18,7 @@ from .client_cdp import (
     start_x5game_with_cdp,
     wait_for_cdp_targets,
 )
-from .client_speed_panel import ClientSpeedPanelConfig, process_client_speed_panel
+from .client_speed_panel import ClientSpeedPanelConfig, install_speed_navigation_guard, process_client_speed_panel
 
 
 LogFunc = Callable[[str], None]
@@ -96,6 +96,7 @@ class ClientDirectLoginConfig:
     speed_panel_top: int = 12
     speed_panel_debug: bool = False
     speed_panel_remove_original_toggle: bool = True
+    block_browser_context_menu: bool = True
 
 
 @dataclass(frozen=True)
@@ -116,6 +117,7 @@ class PreparedClientDirectLoginConfig:
     speed_panel_top: int = 12
     speed_panel_debug: bool = False
     speed_panel_remove_original_toggle: bool = True
+    block_browser_context_menu: bool = True
 
 
 @dataclass
@@ -357,6 +359,7 @@ def execute_prepared_client_direct_login(
         cdp = RawCdpClient(str(target["webSocketDebuggerUrl"]), event_tracker=tracker)
         cdp.connect()
         cdp.enable_default_domains()
+        _safe_install_speed_navigation_guard(cdp, config, logger)
 
         _raise_if_stopped(stop_event)
         cdp.navigate(config.full_login_url)
@@ -504,12 +507,40 @@ def _safe_process_speed_panel(
                 speed_panel_top=int(config.speed_panel_top),
                 speed_panel_debug=bool(config.speed_panel_debug),
                 speed_panel_remove_original_toggle=bool(config.speed_panel_remove_original_toggle),
+                block_browser_context_menu=bool(getattr(config, "block_browser_context_menu", True)),
             ),
             trigger_stage=trigger_stage,
             log=logger,
         )
     except Exception as exc:
         logger(f"[客户端直登] 加速面板处理失败，已跳过：{mask_sensitive_text(exc)}")
+
+
+def _safe_install_speed_navigation_guard(
+    cdp: RawCdpClient,
+    config: PreparedClientDirectLoginConfig,
+    logger: LogFunc,
+) -> None:
+    try:
+        install_speed_navigation_guard(
+            cdp,
+            ClientSpeedPanelConfig(
+                auto_replace_speed_panel=bool(config.auto_replace_speed_panel),
+                custom_speed_panel_enabled=bool(config.custom_speed_panel_enabled),
+                speed_engine=str(config.speed_engine or "timer_hook"),
+                default_speed_rate=float(config.default_speed_rate or 1.0),
+                speed_hook_stage=str(config.speed_hook_stage or "after_game_ready"),
+                speed_panel_position=str(config.speed_panel_position or "left_top"),
+                speed_panel_left=int(config.speed_panel_left),
+                speed_panel_top=int(config.speed_panel_top),
+                speed_panel_debug=bool(config.speed_panel_debug),
+                speed_panel_remove_original_toggle=bool(config.speed_panel_remove_original_toggle),
+                block_browser_context_menu=bool(getattr(config, "block_browser_context_menu", True)),
+            ),
+            log=logger,
+        )
+    except Exception as exc:
+        logger(f"[加速器守护] 安装失败，已跳过：{mask_sensitive_text(exc)}")
 
 
 def _process_alive(process: subprocess.Popen | None) -> bool:

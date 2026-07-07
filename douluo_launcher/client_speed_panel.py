@@ -27,6 +27,119 @@ class ClientSpeedPanelConfig:
     speed_panel_top: int = 12
     speed_panel_debug: bool = False
     speed_panel_remove_original_toggle: bool = True
+    block_browser_context_menu: bool = True
+
+
+def build_speed_navigation_guard_script(config: ClientSpeedPanelConfig | None = None) -> str:
+    panel_config = config or ClientSpeedPanelConfig()
+    context_menu_block = ""
+    if panel_config.block_browser_context_menu:
+        context_menu_block = r"""
+    document.addEventListener('contextmenu', function(e) {
+        e.preventDefault();
+        e.stopPropagation();
+        return false;
+    }, true);
+"""
+    return f"""(() => {{
+    if (window.__H5_SPEED_NAV_GUARD_INSTALLED__) {{
+        return {{ ok: true, existed: true, guard: 'speed_navigation' }};
+    }}
+    window.__H5_SPEED_NAV_GUARD_INSTALLED__ = true;
+
+    function runSpeedNavigationGuards() {{
+        try {{
+            if (typeof window.__H5_HIDE_ORIGINAL_SPEED_PANEL_STRONG__ === 'function') {{
+                window.__H5_HIDE_ORIGINAL_SPEED_PANEL_STRONG__();
+            }} else if (typeof window.__H5_HIDE_ORIGINAL_SPEED_PANEL__ === 'function') {{
+                window.__H5_HIDE_ORIGINAL_SPEED_PANEL__();
+            }}
+        }} catch (_hideError) {{}}
+        try {{
+            if (typeof window.__H5_SPEED_ENSURE_PANEL__ === 'function') {{
+                window.__H5_SPEED_ENSURE_PANEL__();
+            }}
+        }} catch (_panelError) {{}}
+    }}
+{context_menu_block}
+    ['DOMContentLoaded', 'pageshow', 'popstate', 'hashchange', 'load'].forEach(function(eventName) {{
+        window.addEventListener(eventName, function() {{
+            setTimeout(runSpeedNavigationGuards, 500);
+        }}, true);
+    }});
+    setInterval(runSpeedNavigationGuards, 2000);
+    setTimeout(runSpeedNavigationGuards, 300);
+    return {{ ok: true, guard: 'speed_navigation', blockContextMenu: {str(bool(panel_config.block_browser_context_menu)).lower()} }};
+}})()"""
+
+
+def build_speed_new_document_script(config: ClientSpeedPanelConfig | None = None) -> str:
+    panel_config = config or ClientSpeedPanelConfig()
+    return "\n;\n".join(
+        [
+            build_hide_original_speed_overlay_script(
+                remove_original_toggle=panel_config.speed_panel_remove_original_toggle
+            ),
+            build_custom_speed_panel_script(panel_config),
+            build_speed_navigation_guard_script(panel_config),
+        ]
+    )
+
+
+def install_speed_navigation_guard(
+    cdp,
+    config: ClientSpeedPanelConfig | None = None,
+    *,
+    log: LogFunc | None = None,
+) -> None:
+    panel_config = config or ClientSpeedPanelConfig()
+    logger = log or (lambda _message: None)
+    script = build_speed_new_document_script(panel_config)
+    send = getattr(cdp, "send", None)
+    if callable(send):
+        try:
+            send("Page.addScriptToEvaluateOnNewDocument", {"source": script}, timeout=5.0)
+        except TypeError:
+            send("Page.addScriptToEvaluateOnNewDocument", {"source": script})
+        except Exception as exc:
+            logger(f"[加速器守护] 新文档预注入失败：{exc}")
+    try:
+        cdp.evaluate(script)
+        if panel_config.block_browser_context_menu:
+            logger("[加速器守护] 已启用右键菜单拦截，避免误点 Back / Forward。")
+    except Exception as exc:
+        logger(f"[加速器守护] 当前页面守护安装失败：{exc}")
+
+
+def apply_speed_rate_to_cdp(
+    cdp,
+    rate: float,
+    config: ClientSpeedPanelConfig | None = None,
+    *,
+    log: LogFunc | None = None,
+) -> object:
+    panel_config = config or ClientSpeedPanelConfig()
+    logger = log or (lambda _message: None)
+    clean_rate = float(rate)
+    if clean_rate <= 0:
+        raise ValueError(f"speed rate must be > 0: {rate}")
+
+    hook_available = False
+    try:
+        hook_available = bool(cdp.evaluate("typeof window.__H5_SPEED_APPLY__ === 'function'"))
+    except Exception:
+        hook_available = False
+
+    if not hook_available:
+        logger(f"[加速总控] speed hook 缺失，重新注入后应用倍率={_format_rate(clean_rate)}。")
+        process_client_speed_panel(
+            cdp,
+            panel_config,
+            trigger_stage=SPEED_HOOK_STAGE_AFTER_GAME_READY,
+            log=logger,
+        )
+
+    return cdp.evaluate(f"window.__H5_SPEED_APPLY__({clean_rate!r})")
 
 
 def process_client_speed_panel(
@@ -1375,6 +1488,25 @@ try {
         `;
 
         panel.innerHTML = `
+            <style>
+                #speed-hack-panel .speed-panel-input {
+                    width: 100%;
+                    box-sizing: border-box;
+                    margin-top: 6px;
+                    margin-bottom: 10px;
+                }
+                #speed-hack-panel .speed-panel-actions {
+                    display: grid;
+                    grid-template-columns: repeat(2, minmax(64px, 1fr));
+                    gap: 8px 10px;
+                    margin-top: 8px;
+                }
+                #speed-hack-panel .speed-panel-actions button {
+                    min-height: 28px;
+                    padding: 6px 10px;
+                    box-sizing: border-box;
+                }
+            </style>
             <div id="speed-panel-header" style="
                 position: relative;
                 margin: -12px -12px 8px -12px;
@@ -1413,17 +1545,14 @@ try {
                     <span id="speed-display-val" style="color: #00ff00; font-weight: bold; font-size: 12px;">${formatSpeed(speedMultiplier)}</span>
                 </div>
 
-                <input type="number" id="speed-input-field" value="${formatSpeed(speedMultiplier)}" step="1"
-                    style="width: 100%; box-sizing: border-box; background: #222; color: #fff; border: 1px solid #555; padding: 5px; text-align: center; border-radius: 4px;">
+                <input class="speed-panel-input" type="number" id="speed-input-field" value="${formatSpeed(speedMultiplier)}" step="1"
+                    style="background: #222; color: #fff; border: 1px solid #555; text-align: center; border-radius: 4px;">
 
-                <div id="speed-main-btn-row" style="display: flex; gap: 4px;">
-                    <button id="speed-apply-btn" style="flex: 1; background: #28a745; color: white; border: none; cursor: pointer; padding: 2px 4px; border-radius: 3px; font-weight: bold; line-height: 1.1;">应用</button>
-                    <button id="speed-reset-btn" style="flex: 1; background: #6c757d; color: white; border: none; cursor: pointer; padding: 2px 4px; border-radius: 3px; font-weight: bold; line-height: 1.1;">重置</button>
-                </div>
-
-                <div id="speed-preset-row-buttons" style="display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px;">
-                    <button class="speed-preset-apply-btn" data-speed="50" style="width: 100%; min-width: 0; background: #0d6efd; color: white; border: none; cursor: pointer; padding: 2px 4px; border-radius: 3px; font-weight: bold; line-height: 1.1;">50</button>
-                    <button class="speed-preset-apply-btn" data-speed="500" style="width: 100%; min-width: 0; background: #0d6efd; color: white; border: none; cursor: pointer; padding: 2px 4px; border-radius: 3px; font-weight: bold; line-height: 1.1;">500</button>
+                <div class="speed-panel-actions">
+                    <button id="speed-apply-btn" style="background: #28a745; color: white; border: none; cursor: pointer; border-radius: 3px; font-weight: bold; line-height: 1.1;">应用</button>
+                    <button id="speed-reset-btn" style="background: #6c757d; color: white; border: none; cursor: pointer; border-radius: 3px; font-weight: bold; line-height: 1.1;">重置</button>
+                    <button class="speed-preset-apply-btn" data-speed="50" style="width: 100%; min-width: 0; background: #0d6efd; color: white; border: none; cursor: pointer; border-radius: 3px; font-weight: bold; line-height: 1.1;">50</button>
+                    <button class="speed-preset-apply-btn" data-speed="500" style="width: 100%; min-width: 0; background: #0d6efd; color: white; border: none; cursor: pointer; border-radius: 3px; font-weight: bold; line-height: 1.1;">500</button>
                 </div>
             </div>
 

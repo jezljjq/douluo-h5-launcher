@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
+import shutil
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from .config import app_root
+from .config import app_root, user_data_dir
 
 
 SETTINGS_FILE_NAME = "window_manager_settings.json"
@@ -46,13 +47,21 @@ class WindowManagerSettings:
 
 
 def window_manager_settings_path() -> Path:
-    return app_root() / SETTINGS_FILE_NAME
+    return user_data_dir() / SETTINGS_FILE_NAME
 
 
 def load_window_manager_settings(
     path: Path | None = None,
 ) -> tuple[WindowManagerSettings, str | None]:
     settings_path = path or window_manager_settings_path()
+    if path is None and not settings_path.exists():
+        legacy_path = app_root() / SETTINGS_FILE_NAME
+        if legacy_path.exists():
+            try:
+                settings_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(legacy_path, settings_path)
+            except Exception:
+                pass
     if not settings_path.exists():
         return WindowManagerSettings(), None
 
@@ -70,6 +79,7 @@ def save_window_manager_settings(
     path: Path | None = None,
 ) -> Path:
     settings_path = path or window_manager_settings_path()
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
     settings_path.write_text(
         json.dumps(asdict(settings), ensure_ascii=False, indent=2),
         encoding="utf-8",

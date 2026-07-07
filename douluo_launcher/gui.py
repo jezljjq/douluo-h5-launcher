@@ -29,11 +29,19 @@ from .background_login import (
 from .client_batch_store import (
     ClientBatchBinding,
     ClientBatchStore,
+    LocalClientScan,
     RepairProbe,
     check_port_range_available,
     find_next_available_port_range,
 )
-from .client_cdp import cdp_port_for_index, is_tcp_port_available, mask_sensitive_text
+from .client_cdp import (
+    RawCdpClient,
+    cdp_port_for_index,
+    is_tcp_port_available,
+    mask_sensitive_text,
+    select_page_target,
+    wait_for_cdp_targets,
+)
 from .client_direct_login import (
     ClientDirectLoginConfig,
     ClientBinding,
@@ -45,6 +53,7 @@ from .client_direct_login import (
     prepare_client_direct_client,
     wait_for_client_hwnd_by_pid,
 )
+from .client_speed_panel import ClientSpeedPanelConfig, apply_speed_rate_to_cdp
 from .config import (
     AccountConfig,
     BookmarkCandidate,
@@ -55,9 +64,12 @@ from .config import (
     SINGLE_LEVEL_NAME,
     STATUSES,
     app_root,
+    default_settings_path,
     describe_bookmark_file,
     find_bookmark_root_candidate_by_path,
     find_bookmark_file_candidates,
+    initialize_user_data_dir,
+    logs_dir,
     project_root,
     list_bookmark_top_level_dirs,
     load_accounts_from_bookmark_root,
@@ -85,6 +97,7 @@ from .window_manager import (
     close_game_windows,
     extract_window_number,
     get_window_rect,
+    get_window_process_id,
     get_process_path_by_pid,
     has_valid_window_slots,
     launch_game_process,
@@ -119,9 +132,10 @@ WM_FINAL_DELAY_SECONDS = 1
 WM_TILE_MODE_FIXED = "固定参数排列"
 WM_TILE_MODE_ROW_COUNT = "根据行数排列"
 RUN_MODE_FOREGROUND_LABEL = "前台辅助模式"
+RUN_MODE_ACCOUNT_PASSWORD_LABEL = "账号密码登录模式"
 RUN_MODE_BACKGROUND_LABEL = "后台登录模式（实验）"
 RUN_MODE_CLIENT_DIRECT_LABEL = "客户端直登模式"
-RUN_MODE_CHOICES = (RUN_MODE_CLIENT_DIRECT_LABEL, RUN_MODE_FOREGROUND_LABEL)
+RUN_MODE_CHOICES = (RUN_MODE_ACCOUNT_PASSWORD_LABEL, RUN_MODE_CLIENT_DIRECT_LABEL)
 BACKGROUND_SERIAL_CONCURRENCY = 1
 RUN_MODE_BACKGROUND_HINT = "实验功能，支持方式一单账号/当前层串行/全部串行，并发=1"
 RUN_MODE_CLIENT_DIRECT_HINT = "客户端直登模式，支持单账号/当前层准备、排列、登录"
@@ -137,6 +151,16 @@ CLIENT_DIRECT_LOGIN_SCOPE_CHOICES = (
     CLIENT_DIRECT_LOGIN_SCOPE_SELECTED,
     CLIENT_DIRECT_LOGIN_SCOPE_FAILED,
     CLIENT_DIRECT_LOGIN_SCOPE_ALL,
+)
+CLIENT_SPEED_SCOPE_CURRENT_BATCH = "当前批次"
+CLIENT_SPEED_SCOPE_SELECTED = "选中窗口"
+CLIENT_SPEED_SCOPE_ALL_LIVE = "全部存活批次"
+CLIENT_SPEED_SCOPE_CDP_AVAILABLE = "CDP可用窗口"
+CLIENT_SPEED_SCOPE_CHOICES = (
+    CLIENT_SPEED_SCOPE_CURRENT_BATCH,
+    CLIENT_SPEED_SCOPE_SELECTED,
+    CLIENT_SPEED_SCOPE_ALL_LIVE,
+    CLIENT_SPEED_SCOPE_CDP_AVAILABLE,
 )
 CLIENT_DIRECT_LOGIN_PENDING_STATUSES = {
     "客户端已启动/待登录",
@@ -175,6 +199,8 @@ def _run_mode_key_from_label(label: str) -> str:
         return "background"
     if clean_label == RUN_MODE_CLIENT_DIRECT_LABEL:
         return "client_direct"
+    if clean_label == RUN_MODE_ACCOUNT_PASSWORD_LABEL:
+        return "foreground"
     return "foreground"
 
 
@@ -520,12 +546,15 @@ class LauncherApp(_TK_BASE):
         self.running_processes: list[object] = []
         self.running_processes_lock = threading.Lock()
         self._preserve_background_windows = False
-        self.client_batch_store = ClientBatchStore()
+        self._user_data_startup_logs: list[str] = []
+        self.user_data_init_result = initialize_user_data_dir(logger=self._user_data_startup_logs.append)
+        self.user_data_dir = self.user_data_init_result.user_data_dir
+        self.client_batch_store = ClientBatchStore(self.user_data_init_result.sessions_path)
         self.client_direct_bindings: dict[str, ClientDirectRunRecord] = {}
         self.client_direct_bindings_lock = threading.RLock()
         self.is_closing = False
 
-        self.settings_path = tk.StringVar(value=str(app_root() / "automation_settings.json"))
+        self.settings_path = tk.StringVar(value=str(self.user_data_init_result.settings_path))
         self.bookmark_path = tk.StringVar(value="")
         self.bookmark_root_name = tk.StringVar(value="账号")
         self.bookmark_root_path = tk.StringVar(value="")
@@ -546,6 +575,9 @@ class LauncherApp(_TK_BASE):
         self.method_var = tk.StringVar(value="method1")
         self.run_mode_var = tk.StringVar(value=RUN_MODE_CLIENT_DIRECT_LABEL)
         self.run_mode_hint_var = tk.StringVar(value="")
+        self.account_source_summary_var = tk.StringVar(
+            value="当前模式：账号密码登录模式，使用账号密码配置，通过原方式二流程登录。"
+        )
         self.client_direct_auto_enter_var = tk.BooleanVar(value=True)
         self.client_direct_concurrency_var = tk.IntVar(value=CLIENT_DIRECT_CONCURRENCY_MIN)
         self.client_direct_login_scope_var = tk.StringVar(value=CLIENT_DIRECT_LOGIN_SCOPE_PENDING)
@@ -554,6 +586,7 @@ class LauncherApp(_TK_BASE):
         self.custom_speed_panel_enabled_var = tk.BooleanVar(value=True)
         self.speed_panel_debug_var = tk.BooleanVar(value=False)
         self.speed_panel_remove_original_toggle_var = tk.BooleanVar(value=True)
+        self.block_browser_context_menu_var = tk.BooleanVar(value=True)
         self.speed_engine_var = tk.StringVar(value="timer_hook")
         self.default_speed_rate_var = tk.StringVar(value="1.0")
         self.speed_hook_stage_var = tk.StringVar(value="after_game_ready")
@@ -561,10 +594,13 @@ class LauncherApp(_TK_BASE):
         self.client_direct_port_range_var = tk.StringVar(value="9222 ~ 9222")
         self.client_direct_batch_count_var = tk.StringVar(value="本批数量：1")
         self.client_direct_batch_status_var = tk.StringVar(
-            value="绑定=0 | 存活=0 | 已关闭=0 | CDP不可用=0 | 窗口失效=0"
+            value="绑定=0 | 存活=0 | 已关闭=0 | CDP不可用=0 | 窗口失效=0 | 绑定异常=0"
         )
         self.client_direct_batch_select_var = tk.StringVar(value="无可用批次")
         self.client_direct_batch_display_id_map: dict[str, str] = {}
+        self.client_speed_control_rate_var = tk.StringVar(value="1.0")
+        self.client_speed_control_scope_var = tk.StringVar(value=CLIENT_SPEED_SCOPE_CURRENT_BATCH)
+        self.client_speed_control_status_var = tk.StringVar(value="成功 0 / 失败 0 / 跳过 0")
         self.csv_path = tk.StringVar(value="")
         self.level_count_vars = {level: tk.IntVar(value=8) for level in LEVELS}
         self.wm_game_path_var = tk.StringVar(value="")
@@ -605,8 +641,21 @@ class LauncherApp(_TK_BASE):
         self._log_admin_status_warning()
         self._log_startup_dm_environment()
         self._log_background_capability_summary()
+        self._log_user_data_startup_state()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(300, self._enable_game_path_drag_drop)
+
+    def _log_user_data_startup_state(self) -> None:
+        result = getattr(self, "user_data_init_result", None)
+        if result is None:
+            return
+        self._log(f"[配置] 当前用户数据目录：{result.user_data_dir}")
+        self._log(f"[配置] automation_settings.json：{result.settings_path}")
+        self._log(f"[配置] client_direct_sessions.json：{result.sessions_path}")
+        if result.settings_merged_defaults:
+            self._log("[配置] 已补齐模板新增字段，用户已有配置未覆盖。")
+        for message in getattr(self, "_user_data_startup_logs", []) or []:
+            self._log(message)
 
     def _apply_settings_defaults(self) -> None:
         try:
@@ -629,6 +678,7 @@ class LauncherApp(_TK_BASE):
         self.custom_speed_panel_enabled_var.set(bool(settings.custom_speed_panel_enabled))
         self.speed_panel_debug_var.set(bool(getattr(settings, "speed_panel_debug", False)))
         self.speed_panel_remove_original_toggle_var.set(bool(getattr(settings, "speed_panel_remove_original_toggle", True)))
+        self.block_browser_context_menu_var.set(bool(getattr(settings, "block_browser_context_menu", True)))
         self.speed_engine_var.set(str(settings.speed_engine or "timer_hook"))
         self.default_speed_rate_var.set(str(float(settings.default_speed_rate or 1.0)))
         self.speed_hook_stage_var.set(str(settings.speed_hook_stage or "after_game_ready"))
@@ -913,6 +963,18 @@ class LauncherApp(_TK_BASE):
         work_mode_frame = ttk.LabelFrame(root, text="工作模式", padding=4)
         work_mode_frame.pack(fill=tk.X, pady=(0, 6))
         ttk.Label(work_mode_frame, text="工作模式").pack(side=tk.LEFT, padx=(4, 8))
+        self.run_mode_account_password_btn = tk.Radiobutton(
+            work_mode_frame,
+            text=RUN_MODE_ACCOUNT_PASSWORD_LABEL,
+            variable=self.run_mode_var,
+            value=RUN_MODE_ACCOUNT_PASSWORD_LABEL,
+            indicatoron=False,
+            width=18,
+            padx=10,
+            pady=4,
+            command=self._on_account_password_run_mode_changed,
+        )
+        self.run_mode_account_password_btn.pack(side=tk.LEFT, padx=(0, 8))
         self.run_mode_client_btn = tk.Radiobutton(
             work_mode_frame,
             text=RUN_MODE_CLIENT_DIRECT_LABEL,
@@ -927,16 +989,17 @@ class LauncherApp(_TK_BASE):
         self.run_mode_client_btn.pack(side=tk.LEFT, padx=(0, 8))
         self.run_mode_foreground_btn = tk.Radiobutton(
             work_mode_frame,
-            text=RUN_MODE_FOREGROUND_LABEL,
+            text="旧版兼容模式",
             variable=self.run_mode_var,
             value=RUN_MODE_FOREGROUND_LABEL,
             indicatoron=False,
             width=18,
             padx=10,
             pady=4,
-            command=self._on_run_mode_changed,
+            command=self._on_legacy_compat_run_mode_changed,
         )
         self.run_mode_foreground_btn.pack(side=tk.LEFT, padx=(0, 12))
+        self.run_mode_foreground_btn.pack_forget()
         ttk.Label(work_mode_frame, textvariable=self.run_mode_hint_var, foreground="#996600").pack(side=tk.LEFT)
 
         # ===== 3. 读取收藏夹 / 账号配置 =====
@@ -944,13 +1007,27 @@ class LauncherApp(_TK_BASE):
         config_frame.pack(fill=tk.X, pady=(0, 6))
         config_frame.columnconfigure(1, weight=1)
 
+        account_password_summary_text = "当前模式：账号密码登录模式，使用账号密码配置，通过原方式二流程登录。"
+        try:
+            self.account_source_summary_var.set(account_password_summary_text)
+        except Exception:
+            pass
+        self.account_source_summary_row = ttk.Frame(config_frame)
+        self.account_source_summary_row.grid(row=0, column=0, columnspan=5, sticky="w", pady=(0, 6))
+        ttk.Label(
+            self.account_source_summary_row,
+            textvariable=self.account_source_summary_var,
+            foreground="#666666",
+        ).pack(side=tk.LEFT, padx=(4, 8))
+
         self.method_row = ttk.Frame(config_frame)
         self.method_row.grid(row=0, column=0, columnspan=5, sticky="w", pady=(0, 6))
         ttk.Label(self.method_row, text="上号方式").pack(side=tk.LEFT, padx=(4, 8))
-        ttk.Radiobutton(self.method_row, text="方式一：通行证上号", variable=self.method_var, value="method1",
+        ttk.Radiobutton(self.method_row, text="旧版通行证上号（兼容）", variable=self.method_var, value="method1",
                         command=self._on_method_changed).pack(side=tk.LEFT, padx=(0, 24))
-        ttk.Radiobutton(self.method_row, text="方式二：账号密码 + 通行证上号", variable=self.method_var, value="method2",
+        ttk.Radiobutton(self.method_row, text="账号密码登录模式", variable=self.method_var, value="method2",
                         command=self._on_method_changed).pack(side=tk.LEFT)
+        self.method_row.grid_remove()
 
         self._method1_row1 = ttk.Label(config_frame, text="浏览器收藏夹", width=12, anchor="e")
         self._method1_row1.grid(row=1, column=0, sticky="e", padx=(4, 6), pady=3)
@@ -1094,6 +1171,11 @@ class LauncherApp(_TK_BASE):
             self._client_speed_panel_frame,
             text="删除原入口按钮",
             variable=self.speed_panel_remove_original_toggle_var,
+        ).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Checkbutton(
+            self._client_speed_panel_frame,
+            text="拦截右键菜单",
+            variable=self.block_browser_context_menu_var,
         ).pack(side=tk.LEFT, padx=(0, 10))
         ttk.Label(self._client_speed_panel_frame, text="默认倍率").pack(side=tk.LEFT, padx=(0, 4))
         ttk.Entry(self._client_speed_panel_frame, textvariable=self.default_speed_rate_var, width=6).pack(
@@ -1244,8 +1326,9 @@ class LauncherApp(_TK_BASE):
         self.client_direct_action_row_2.grid(row=3, column=0, sticky="ew")
         client_direct_repair_buttons = (
             ("修复本批窗口", 14, self._repair_client_direct_current_batch, 0, 0),
-            ("清空本批绑定", 14, self._clear_client_direct_current_batch, 0, 1),
-            ("关闭本批客户端", 14, self._close_client_direct_current_batch, 0, 2),
+            ("识别本地客户端", 16, self._identify_local_client_direct_clients, 0, 1),
+            ("清空本批绑定", 14, self._clear_client_direct_current_batch, 0, 2),
+            ("关闭本批客户端", 14, self._close_client_direct_current_batch, 0, 3),
         )
         for text, width, command, row, column in client_direct_repair_buttons:
             ttk.Button(self.client_direct_action_row_2, text=text, width=width, command=command).grid(
@@ -1259,7 +1342,47 @@ class LauncherApp(_TK_BASE):
             command=self._stop_tasks,
             font=("", 9, "bold"),
         )
-        self.client_direct_stop_btn.grid(row=0, column=3, sticky="ew", padx=2, pady=1)
+        self.client_direct_stop_btn.grid(row=0, column=4, sticky="ew", padx=2, pady=1)
+
+        self.client_speed_control_row = ttk.Frame(client_direct_frame)
+        self.client_speed_control_row.grid(row=4, column=0, sticky="ew", pady=(4, 0))
+        ttk.Label(self.client_speed_control_row, text="加速总控：").pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Label(self.client_speed_control_row, text="倍率").pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Entry(self.client_speed_control_row, textvariable=self.client_speed_control_rate_var, width=8).pack(
+            side=tk.LEFT, padx=(0, 6)
+        )
+        ttk.Button(
+            self.client_speed_control_row,
+            text="应用",
+            width=8,
+            command=self._apply_client_speed_control,
+        ).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(
+            self.client_speed_control_row,
+            text="恢复 1.0",
+            width=10,
+            command=lambda: self._apply_client_speed_control(rate_override=1.0),
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        for preset in ("2", "5", "50", "500"):
+            ttk.Button(
+                self.client_speed_control_row,
+                text=preset,
+                width=5,
+                command=lambda value=preset: self._apply_client_speed_control(rate_override=float(value)),
+            ).pack(side=tk.LEFT, padx=(0, 3))
+        ttk.Label(self.client_speed_control_row, text="作用范围").pack(side=tk.LEFT, padx=(8, 4))
+        ttk.Combobox(
+            self.client_speed_control_row,
+            textvariable=self.client_speed_control_scope_var,
+            values=CLIENT_SPEED_SCOPE_CHOICES,
+            width=12,
+            state="readonly",
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(
+            self.client_speed_control_row,
+            textvariable=self.client_speed_control_status_var,
+            foreground="#006666",
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         self.foreground_run_frame = ttk.LabelFrame(run_frame, text="前台辅助模式", padding=4)
         self.foreground_run_frame.pack(fill=tk.X, pady=(0, 4))
@@ -1438,6 +1561,31 @@ class LauncherApp(_TK_BASE):
         else:
             self._method1_advanced_frame.grid_remove()
             self._method1_advanced_toggle_btn.configure(text="显示高级配置")
+        foreground_btn = getattr(self, "run_mode_foreground_btn", None)
+        if foreground_btn is not None:
+            current_run_mode = ""
+            try:
+                current_run_mode = str(self.run_mode_var.get() or "")
+            except Exception:
+                current_run_mode = ""
+            if visible or current_run_mode == RUN_MODE_FOREGROUND_LABEL:
+                foreground_btn.pack(side=tk.LEFT, padx=(0, 12))
+            else:
+                foreground_btn.pack_forget()
+
+    def _on_account_password_run_mode_changed(self) -> None:
+        try:
+            self.method_var.set("method2")
+        except Exception:
+            pass
+        self._on_run_mode_changed()
+
+    def _on_legacy_compat_run_mode_changed(self) -> None:
+        try:
+            self.method_var.set("method1")
+        except Exception:
+            pass
+        self._on_run_mode_changed()
 
     def _on_run_mode_changed(self) -> None:
         if self._is_background_run_mode():
@@ -1451,8 +1599,9 @@ class LauncherApp(_TK_BASE):
             self._log(f"已选择{RUN_MODE_CLIENT_DIRECT_LABEL}：{RUN_MODE_CLIENT_DIRECT_HINT}，{auto_text}。")
         else:
             self.run_mode_hint_var.set("")
-            self._status_mid.set(f"当前模式：{RUN_MODE_FOREGROUND_LABEL}")
-            self._log(f"已选择{RUN_MODE_FOREGROUND_LABEL}。")
+            label = RUN_MODE_ACCOUNT_PASSWORD_LABEL if self.method_var.get() == "method2" else "旧版兼容模式"
+            self._status_mid.set(f"当前模式：{label}")
+            self._log(f"已选择{label}。")
         self._sync_work_mode_visibility()
         self._sync_account_source_controls()
         self._sync_client_direct_controls()
@@ -1511,9 +1660,12 @@ class LauncherApp(_TK_BASE):
 
     def _sync_work_mode_buttons(self) -> None:
         client_direct = self._is_client_direct_run_mode()
+        account_password = (not client_direct) and self.method_var.get() == "method2"
+        legacy_compat = (not client_direct) and not account_password
         pairs = (
+            (getattr(self, "run_mode_account_password_btn", None), account_password),
             (getattr(self, "run_mode_client_btn", None), client_direct),
-            (getattr(self, "run_mode_foreground_btn", None), not client_direct),
+            (getattr(self, "run_mode_foreground_btn", None), legacy_compat),
         )
         for button, selected in pairs:
             if button is None:
@@ -1531,13 +1683,42 @@ class LauncherApp(_TK_BASE):
         return self._is_client_direct_run_mode() or self.method_var.get() == "method1"
 
     def _sync_account_source_controls(self) -> None:
-        use_bookmarks = self._account_source_uses_bookmarks()
         client_direct = self._is_client_direct_run_mode()
-        if hasattr(self, "method_row"):
-            if client_direct:
-                self.method_row.grid_remove()
+        current_run_mode = ""
+        try:
+            current_run_mode = str(self.run_mode_var.get() or "")
+        except Exception:
+            current_run_mode = ""
+        advanced_var = getattr(self, "advanced_config_visible", None)
+        try:
+            advanced_visible = bool(advanced_var.get()) if advanced_var is not None else False
+        except Exception:
+            advanced_visible = False
+        show_legacy_method_row = (
+            not client_direct
+            and (
+                current_run_mode == RUN_MODE_FOREGROUND_LABEL
+                or advanced_visible
+            )
+        )
+        if not client_direct and not show_legacy_method_row and self.method_var.get() != "method2":
+            self.method_var.set("method2")
+        use_bookmarks = self._account_source_uses_bookmarks()
+        summary_row = getattr(self, "account_source_summary_row", None)
+        if summary_row is not None:
+            if show_legacy_method_row:
+                summary_row.grid_remove()
             else:
+                if client_direct:
+                    self.account_source_summary_var.set("当前模式：客户端直登模式，使用收藏夹完整直登链接启动 X5Game。")
+                else:
+                    self.account_source_summary_var.set("当前模式：账号密码登录模式，使用账号密码配置，通过原方式二流程登录。")
+                summary_row.grid()
+        if hasattr(self, "method_row"):
+            if show_legacy_method_row:
                 self.method_row.grid()
+            else:
+                self.method_row.grid_remove()
         for w in (
             self._method1_row1,
             self._method1_btn_auto_bookmark,
@@ -1623,7 +1804,148 @@ class LauncherApp(_TK_BASE):
             "speed_panel_top": 12,
             "speed_panel_debug": _safe_bool_var(self, "speed_panel_debug_var", False),
             "speed_panel_remove_original_toggle": _safe_bool_var(self, "speed_panel_remove_original_toggle_var", True),
+            "block_browser_context_menu": _safe_bool_var(self, "block_browser_context_menu_var", True),
         }
+
+    def _client_speed_control_rate(self, rate_override: float | None = None) -> float | None:
+        if rate_override is not None:
+            raw_value = str(rate_override)
+        else:
+            var = getattr(self, "client_speed_control_rate_var", None)
+            raw_value = str(var.get() if var is not None else "")
+        try:
+            rate = float(raw_value)
+        except Exception:
+            rate = 0.0
+        if rate <= 0:
+            self._log(f"[加速总控] 倍率输入无效：{mask_sensitive_text(raw_value)}")
+            try:
+                messagebox.showwarning("加速总控", f"倍率输入无效：{raw_value}")
+            except Exception:
+                pass
+            return None
+        if rate_override is not None:
+            var = getattr(self, "client_speed_control_rate_var", None)
+            if var is not None:
+                try:
+                    var.set(str(rate))
+                except Exception:
+                    pass
+        return rate
+
+    def _client_speed_control_scope_bindings(self, scope: str) -> list[ClientBatchBinding]:
+        if not hasattr(self, "client_batch_store") or not self.client_batch_store.batches:
+            return []
+        scope = str(scope or CLIENT_SPEED_SCOPE_CURRENT_BATCH)
+        if scope == CLIENT_SPEED_SCOPE_CURRENT_BATCH:
+            LauncherApp._ensure_client_direct_selected_batch_current(self)
+            return list(self.client_batch_store.current_batch().bindings)
+        if scope == CLIENT_SPEED_SCOPE_SELECTED:
+            LauncherApp._ensure_client_direct_selected_batch_current(self)
+            selected_ids: set[str] = set()
+            tree = getattr(self, "tree", None)
+            if tree is not None:
+                try:
+                    selected_ids = {str(item) for item in tree.selection()}
+                except Exception:
+                    selected_ids = set()
+            return [
+                binding
+                for binding in self.client_batch_store.current_batch().bindings
+                if str(binding.account_id) in selected_ids
+            ]
+        bindings = [
+            binding
+            for batch in self.client_batch_store.batches
+            for binding in batch.bindings
+        ]
+        if scope == CLIENT_SPEED_SCOPE_CDP_AVAILABLE:
+            return [binding for binding in bindings if int(binding.cdp_port or 0) > 0]
+        return bindings
+
+    def _client_speed_control_skip_reason(self, binding: ClientBatchBinding) -> str:
+        status = str(getattr(binding, "window_status", "") or binding.status or "")
+        if int(binding.cdp_port or 0) <= 0:
+            return "cdp_unavailable"
+        if status in {"pid_missing", "pid_not_x5game", "binding_invalid", "cdp_owner_mismatch", "cdp_unavailable", "hwnd_invalid"}:
+            return status
+        pid = int(binding.pid or 0)
+        if pid <= 0:
+            return "pid_missing"
+        try:
+            if not LauncherApp._client_direct_pid_exists(self, pid):
+                return "pid_missing"
+            if not LauncherApp._client_direct_process_is_x5game(self, pid):
+                return "pid_not_x5game"
+            if not LauncherApp._client_direct_cdp_available(self, int(binding.cdp_port or 0)):
+                return "cdp_unavailable"
+        except Exception:
+            return ""
+        return ""
+
+    def _apply_client_speed_control(self, *, rate_override: float | None = None) -> None:
+        rate = LauncherApp._client_speed_control_rate(self, rate_override)
+        if rate is None:
+            return
+        scope_var = getattr(self, "client_speed_control_scope_var", None)
+        scope = str(scope_var.get() if scope_var is not None else CLIENT_SPEED_SCOPE_CURRENT_BATCH)
+        bindings = LauncherApp._client_speed_control_scope_bindings(self, scope)
+        success_count = 0
+        fail_count = 0
+        skipped_count = 0
+        for binding in bindings:
+            reason = LauncherApp._client_speed_control_skip_reason(self, binding)
+            if reason:
+                skipped_count += 1
+                self._log(f"[加速总控] 跳过 {binding.account_name or binding.account_id}：{reason}")
+                continue
+            try:
+                apply_func = getattr(self, "_apply_client_speed_to_binding")
+                apply_func(binding, rate)
+                binding.speed_rate = float(rate)
+                binding.window_status = "restored"
+                success_count += 1
+            except Exception as exc:
+                fail_count += 1
+                self._log(
+                    f"[加速总控] 失败 {binding.account_name or binding.account_id}："
+                    f"{mask_sensitive_text(exc)}"
+                )
+        if hasattr(self, "client_batch_store"):
+            try:
+                self.client_batch_store.save()
+            except Exception:
+                pass
+        status_text = f"成功 {success_count} / 失败 {fail_count} / 跳过 {skipped_count}"
+        status_var = getattr(self, "client_speed_control_status_var", None)
+        if status_var is not None:
+            try:
+                status_var.set(status_text)
+            except Exception:
+                pass
+        self._log(
+            f"[加速总控] 目标{len(bindings)}，成功{success_count}，失败{fail_count}，跳过{skipped_count}。"
+        )
+        sync = getattr(self, "_sync_client_direct_batch_status", None)
+        if callable(sync):
+            sync()
+
+    def _apply_client_speed_to_binding(self, binding: ClientBatchBinding, rate: float) -> None:
+        port = int(binding.cdp_port or 0)
+        targets = wait_for_cdp_targets(port, timeout=3.0)
+        target = select_page_target(targets)
+        cdp = RawCdpClient(str(target["webSocketDebuggerUrl"]))
+        try:
+            cdp.connect()
+            cdp.enable_default_domains()
+            apply_speed_rate_to_cdp(
+                cdp,
+                float(rate),
+                ClientSpeedPanelConfig(**LauncherApp._client_speed_panel_options(self)),
+                log=self._log,
+            )
+        finally:
+            cdp.close()
 
     def _sync_client_direct_port_range(self) -> None:
         var = getattr(self, "client_direct_port_range_var", None)
@@ -1907,7 +2229,7 @@ class LauncherApp(_TK_BASE):
         return (width, height)
 
     def _wm_detection_log_path(self) -> Path:
-        return project_root() / WINDOW_DETECTION_LOG_PATH
+        return logs_dir(getattr(self, "user_data_dir", None)) / WINDOW_DETECTION_LOG_PATH.name
 
     def _wm_log_zero_detection_hint(self) -> None:
         self._log(
@@ -2502,8 +2824,8 @@ class LauncherApp(_TK_BASE):
     def _wm_slots_path(self, layout_params=None) -> Path:
         params = layout_params or self._wm_current_slot_layout_params()
         if params is None:
-            return app_root() / "slots" / "invalid_profile.json"
-        return window_slots_profile_path(app_root(), params)
+            return Path(getattr(self, "user_data_dir", app_root())) / "slots" / "invalid_profile.json"
+        return window_slots_profile_path(Path(getattr(self, "user_data_dir", app_root())), params)
 
     def _wm_has_saved_slots(self, layout_params=None) -> bool:
         return has_valid_window_slots(self._wm_slots_path(layout_params))
@@ -3847,6 +4169,7 @@ Write-Output $count
 
     def _on_method_changed(self) -> None:
         self._sync_account_source_controls()
+        self._sync_work_mode_buttons()
 
     def _pick_csv_file(self) -> None:
         path = filedialog.askopenfilename(
@@ -3878,7 +4201,8 @@ Write-Output $count
     def _save_csv_path_memory(self, path: str) -> None:
         """保存CSV路径到记忆文件，下次启动自动加载"""
         try:
-            memory_file = project_root() / "csv_last_path.txt"
+            memory_file = Path(getattr(self, "user_data_dir", project_root())) / "csv_last_path.txt"
+            memory_file.parent.mkdir(parents=True, exist_ok=True)
             memory_file.write_text(path, encoding="utf-8")
         except Exception:
             pass
@@ -3886,7 +4210,7 @@ Write-Output $count
     def _auto_load_csv(self) -> None:
         """启动时自动加载上次导入的CSV"""
         try:
-            memory_file = project_root() / "csv_last_path.txt"
+            memory_file = Path(getattr(self, "user_data_dir", project_root())) / "csv_last_path.txt"
             if not memory_file.exists():
                 return
             path = memory_file.read_text(encoding="utf-8").strip()
@@ -4141,7 +4465,6 @@ Write-Output $count
             self._sync_client_direct_batch_status()
             return
         kept_count = len(self.client_batch_store.batches)
-        removed_count = 0
         try:
             self.client_batch_store.refresh_all_batch_statuses(
                 pid_exists=lambda pid: LauncherApp._client_direct_pid_exists(self, pid),
@@ -4149,19 +4472,13 @@ Write-Output $count
                 cdp_available=lambda port: LauncherApp._client_direct_cdp_available(self, port),
                 hwnd_valid=lambda hwnd: LauncherApp._client_direct_is_window_alive(self, hwnd),
             )
-            removed = self.client_batch_store.cleanup_dead_batches(
-                pid_exists=lambda pid: LauncherApp._client_direct_pid_exists(self, pid),
-                process_is_x5game=lambda pid: LauncherApp._client_direct_process_is_x5game(self, pid),
-            )
-            removed_count = len(removed)
             kept_count = len(self.client_batch_store.batches)
-            if removed_count:
-                self.client_batch_store.save()
+            self.client_batch_store.save()
         except Exception as exc:
-            self._log(f"[批次恢复] 刷新或清理失效批次失败：{mask_sensitive_text(str(exc))}")
+            self._log(f"[批次恢复] 刷新批次状态失败：{mask_sensitive_text(str(exc))}")
         LauncherApp._restore_client_direct_bindings_from_active_batch(self)
         self._sync_client_direct_batch_status()
-        self._log(f"[批次恢复] 保留存活批次 {kept_count} 个，自动清理失效批次 {removed_count} 个。")
+        self._log(f"[批次恢复] 已刷新历史批次 {kept_count} 个；仅标记异常绑定，不自动清理批次。")
         if not self.client_batch_store.batches:
             return
         batch = self.client_batch_store.current_batch()
@@ -4255,21 +4572,25 @@ Write-Output $count
         closed_statuses = {"pid_missing", "客户端已关闭", "closed", "已关闭"}
         cdp_statuses = {"cdp_unavailable", "CDP不可用"}
         hwnd_statuses = {"hwnd_invalid", "窗口已失效"}
+        binding_invalid_statuses = {"pid_not_x5game", "binding_invalid", "cdp_owner_mismatch"}
         counts = {
             "bound": len(batch.bindings),
             "closed": 0,
             "cdp_unavailable": 0,
             "hwnd_invalid": 0,
+            "binding_invalid": 0,
             "alive": 0,
         }
         for binding in batch.bindings:
-            status = str(binding.status or "")
+            status = str(getattr(binding, "window_status", "") or binding.status or "")
             if status in closed_statuses:
                 counts["closed"] += 1
             elif status in cdp_statuses:
                 counts["cdp_unavailable"] += 1
             elif status in hwnd_statuses:
                 counts["hwnd_invalid"] += 1
+            elif status in binding_invalid_statuses:
+                counts["binding_invalid"] += 1
             else:
                 counts["alive"] += 1
         return counts
@@ -4281,17 +4602,19 @@ Write-Output $count
             f"id={LauncherApp._client_direct_batch_short_id(self, batch.batch_id)} "
             f"绑定={counts['bound']} 存活={counts['alive']} 已关闭={counts['closed']} "
             f"CDP不可用={counts['cdp_unavailable']} 窗口失效={counts['hwnd_invalid']} "
+            f"绑定异常={counts['binding_invalid']} "
             f"端口={LauncherApp._client_direct_batch_port_range_text(self, batch)}"
         )
 
     def _client_direct_batch_stats_text(self, batch=None) -> str:
         if batch is None:
-            counts = {"bound": 0, "alive": 0, "closed": 0, "cdp_unavailable": 0, "hwnd_invalid": 0}
+            counts = {"bound": 0, "alive": 0, "closed": 0, "cdp_unavailable": 0, "hwnd_invalid": 0, "binding_invalid": 0}
         else:
             counts = LauncherApp._client_direct_batch_counts(self, batch)
         return (
             f"绑定={counts['bound']} | 存活={counts['alive']} | 已关闭={counts['closed']} | "
-            f"CDP不可用={counts['cdp_unavailable']} | 窗口失效={counts['hwnd_invalid']}"
+            f"CDP不可用={counts['cdp_unavailable']} | 窗口失效={counts['hwnd_invalid']} | "
+            f"绑定异常={counts['binding_invalid']}"
         )
 
     def _sync_client_direct_batch_status(self) -> None:
@@ -4868,6 +5191,139 @@ Write-Output $count
             + "、".join(batch.batch_name for batch in removed)
         )
 
+    def _client_direct_candidate_ports_for_local_scan(self, windows: list[GameWindow]) -> list[int]:
+        ports: list[int] = []
+        try:
+            for batch in getattr(self.client_batch_store, "batches", []) or []:
+                batch_ports = [int(binding.cdp_port or 0) for binding in batch.bindings if int(binding.cdp_port or 0) > 0]
+                ports.extend(batch_ports)
+                base_port = int(batch.base_port or (min(batch_ports) if batch_ports else CLIENT_DIRECT_CDP_PORT))
+                count = max(len(getattr(batch, "bindings", []) or []), 9)
+                ports.extend(base_port + offset for offset in range(count))
+            if not ports:
+                ports.extend(CLIENT_DIRECT_CDP_PORT + offset for offset in range(max(len(windows), 1)))
+        except Exception:
+            ports.extend(CLIENT_DIRECT_CDP_PORT + offset for offset in range(max(len(windows), 1)))
+        return [port for port in dict.fromkeys(ports) if int(port or 0) > 0]
+
+    def _scan_local_client_direct_clients(self) -> list[LocalClientScan]:
+        try:
+            game_path = self._wm_game_exe_path_filter()
+        except Exception:
+            game_path = ""
+        try:
+            windows = list_game_windows(
+                GAME_TITLE_KEYWORD,
+                game_exe_path=game_path or None,
+                allow_unnumbered=True,
+            )
+        except Exception as exc:
+            self._log(f"[识别本地客户端] 扫描窗口失败：{mask_sensitive_text(str(exc))}")
+            return []
+
+        candidate_ports = LauncherApp._client_direct_candidate_ports_for_local_scan(self, windows)
+        available_targets: dict[int, dict[str, str]] = {}
+        for port in candidate_ports:
+            try:
+                targets = wait_for_cdp_targets(int(port), timeout=0.8)
+                target = select_page_target(targets)
+                available_targets[int(port)] = {
+                    "url": str(target.get("url") or ""),
+                    "title": str(target.get("title") or ""),
+                }
+            except Exception:
+                continue
+
+        used_ports: set[int] = set()
+        scans: list[LocalClientScan] = []
+        for index, window in enumerate(windows):
+            hwnd = int(window.hwnd or 0)
+            try:
+                pid = int(get_window_process_id(hwnd) or 0)
+            except Exception:
+                pid = 0
+            try:
+                process_path = get_process_path_by_pid(pid) if pid > 0 else ""
+            except Exception:
+                process_path = ""
+            try:
+                is_x5game = Path(process_path).name.lower() == "x5game.exe"
+            except Exception:
+                is_x5game = False
+            rect = getattr(window, "rect", None)
+            if rect is None:
+                try:
+                    rect = get_window_rect(hwnd)
+                except Exception:
+                    rect = WindowRect(0, 0, 0, 0)
+
+            matched_port = 0
+            cdp_port_inferred = False
+            try:
+                for batch in getattr(self.client_batch_store, "batches", []) or []:
+                    for binding in batch.bindings:
+                        port = int(binding.cdp_port or 0)
+                        if port <= 0 or port in used_ports:
+                            continue
+                        if int(binding.pid or 0) == pid or int(binding.hwnd or 0) == hwnd:
+                            matched_port = port
+                            break
+                    if matched_port > 0:
+                        break
+            except Exception:
+                matched_port = 0
+            if matched_port <= 0 and index < len(candidate_ports):
+                matched_port = int(candidate_ports[index])
+                cdp_port_inferred = True
+            if matched_port in used_ports:
+                matched_port = 0
+                cdp_port_inferred = False
+            if matched_port > 0:
+                used_ports.add(matched_port)
+
+            target_info = available_targets.get(matched_port, {})
+            scans.append(
+                LocalClientScan(
+                    pid=pid,
+                    hwnd=hwnd,
+                    title=str(window.title or ""),
+                    window_left=int(getattr(rect, "left", 0) or 0),
+                    window_top=int(getattr(rect, "top", 0) or 0),
+                    window_width=int(getattr(rect, "width", 0) or 0),
+                    window_height=int(getattr(rect, "height", 0) or 0),
+                    process_path=process_path,
+                    cdp_port=matched_port,
+                    cdp_available=matched_port in available_targets,
+                    cdp_port_inferred=cdp_port_inferred,
+                    page_url=str(target_info.get("url") or ""),
+                    page_title=str(target_info.get("title") or ""),
+                    is_x5game=is_x5game,
+                )
+            )
+        return scans
+
+    def _identify_local_client_direct_clients(self) -> None:
+        LauncherApp._ensure_client_direct_selected_batch_current(self)
+        scans = LauncherApp._scan_local_client_direct_clients(self)
+        result = self.client_batch_store.identify_local_clients(scans)
+        self.client_batch_store.save()
+        LauncherApp._restore_client_direct_bindings_from_active_batch(self)
+        LauncherApp._sync_client_direct_batch_status(self)
+        for note in result.get("notes", []) or []:
+            self._log(f"[识别本地客户端] {note}")
+        self._log(
+            f"[识别本地客户端] 扫描到 {result['scanned']} 个 X5Game，"
+            f"恢复历史批次 {result['restored_batches']} 个，"
+            f"新建批次 {result['created_batches']} 个，"
+            f"未归属 {result['unassigned']} 个。"
+        )
+        for batch in getattr(self.client_batch_store, "batches", []) or []:
+            counts = LauncherApp._client_direct_batch_counts(self, batch)
+            self._log(
+                f"[识别本地客户端] {batch.batch_name}："
+                f"绑定{counts['bound']}，端口{LauncherApp._client_direct_batch_port_range_text(self, batch)}。"
+            )
+
     def _repair_client_direct_current_batch(self) -> None:
         if not self.client_batch_store.batches:
             messagebox.showwarning("修复本批窗口", "当前没有客户端批次。")
@@ -4998,6 +5454,8 @@ Write-Output $count
             binding.cdp_port = int(getattr(result_binding, "cdp_port", port) or port)
             if result.success:
                 binding.status = "客户端已启动/待登录"
+                binding.window_status = "restored"
+                binding.repair_status = "reopened"
                 binding.error_message = ""
                 self._set_status(account, "客户端已启动/待登录")
                 self._log(
@@ -5433,16 +5891,8 @@ Write-Output $count
 
     def _setup_log_file(self, *, cleanup_old: bool = True) -> None:
         import time as _time
-        log_dir = project_root() / "logs"
+        log_dir = logs_dir(getattr(self, "user_data_dir", None))
         log_dir.mkdir(parents=True, exist_ok=True)
-        if cleanup_old:
-            # 清理旧日志，仅保留最新2份
-            existing_logs = sorted(log_dir.glob("run_*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
-            for old in existing_logs[2:]:
-                try:
-                    old.unlink()
-                except Exception:
-                    pass
         ts = _time.strftime("%Y%m%d_%H%M%S")
         self._log_file_path = log_dir / f"run_{ts}.log"
         self._log_file = open(str(self._log_file_path), "w", encoding="utf-8")
@@ -5462,7 +5912,7 @@ Write-Output $count
 
     def _open_log_dir(self) -> None:
         import os
-        log_dir = str(project_root() / "logs")
+        log_dir = str(logs_dir(getattr(self, "user_data_dir", None)))
         os.makedirs(log_dir, exist_ok=True)
         os.startfile(log_dir)
 
@@ -6593,7 +7043,7 @@ Write-Output $count
                 cfg = {
                     "level": account.level, "bookmark_no": account.bookmark_no,
                     "game_window_no": account.game_window_no, "url": account.url,
-                    "settings_path": str(app_root() / "automation_settings.json"),
+                    "settings_path": str(self.settings_path.get() or default_settings_path()),
                 }
                 cfg_file = Path(tempfile.gettempdir()) / f"douluo_acc_{account.game_window_no}.json"
                 cfg_file.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
@@ -6742,7 +7192,7 @@ print("TIMING:" + str(runner.last_timings.get("总计", 0)), flush=True)
                 "bookmark_no": account.bookmark_no,
                 "game_window_no": account.game_window_no,
                 "url": account.url,
-                "settings_path": str(app_root() / "automation_settings.json"),
+                "settings_path": str(self.settings_path.get() or default_settings_path()),
                 "action": action,
                 "event_path": str(event_file),
                 "result_path": str(result_file),
@@ -6852,7 +7302,7 @@ print("TIMING:" + str(runner.last_timings.get("总计", 0)), flush=True)
             "bookmark_no": account.bookmark_no,
             "game_window_no": account.game_window_no,
             "url": account.url,
-            "settings_path": str(app_root() / "automation_settings.json"),
+            "settings_path": str(self.settings_path.get() or default_settings_path()),
             "action": action,
         }
         cfg_file = Path(tempfile.gettempdir()) / f"douluo_acc_{account.game_window_no}_{action}.json"

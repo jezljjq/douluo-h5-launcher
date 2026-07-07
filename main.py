@@ -61,12 +61,20 @@ def _should_auto_elevate_gui_on_startup() -> bool:
 
 
 def _collect_runtime_diagnostics() -> dict[str, object]:
-    from douluo_launcher.config import app_root, project_root
+    from douluo_launcher.config import (
+        app_root,
+        default_client_direct_sessions_path,
+        default_settings_path,
+        logs_dir,
+        project_root,
+        user_data_dir,
+    )
 
     app_dir = app_root()
     project_dir = project_root()
+    data_dir = user_data_dir()
     debug_dir = app_dir / "debug_ocr"
-    logs_dir = app_dir / "logs"
+    runtime_logs_dir = logs_dir(data_dir)
     bundled_playwright_browsers = app_dir / "ms-playwright"
     if bundled_playwright_browsers.exists():
         playwright_browsers = bundled_playwright_browsers
@@ -108,14 +116,16 @@ def _collect_runtime_diagnostics() -> dict[str, object]:
         "__file__": __file__,
         "app_root": str(app_dir),
         "project_root": str(project_dir),
-        "automation_settings": item(app_dir / "automation_settings.json"),
+        "user_data_dir": str(data_dir),
+        "automation_settings": item(default_settings_path(data_dir)),
+        "client_direct_sessions": item(default_client_direct_sessions_path(data_dir)),
         "dm_click_helper_exe": item(app_dir / "dm_click_helper.exe"),
         "dm_click_helper_py": item(app_dir / "dm_click_helper.py"),
         "template_passport_btn": item(debug_dir / "template_passport_btn.png"),
         "browser_pos": item(debug_dir / "browser_pos.json"),
         "passport_dialog_pos_cache": item(debug_dir / "passport_dialog_pos_cache.json"),
         "window_manager_settings": item(app_dir / "window_manager_settings.json"),
-        "logs_dir": item(logs_dir),
+        "logs_dir": item(runtime_logs_dir),
         "debug_ocr_dir": item(debug_dir),
         "playwright_browsers_path": str(playwright_browsers),
         "playwright_browsers_source": playwright_browsers_source,
@@ -130,11 +140,12 @@ def _collect_runtime_diagnostics() -> dict[str, object]:
 
 
 def _diagnose_runtime() -> None:
+    from douluo_launcher.config import logs_dir, user_data_dir
+
     diagnostics = _collect_runtime_diagnostics()
-    app_dir = Path(str(diagnostics["app_root"]))
-    logs_dir = app_dir / "logs"
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    output_path = logs_dir / "runtime_diagnostics.json"
+    runtime_logs_dir = logs_dir(user_data_dir())
+    runtime_logs_dir.mkdir(parents=True, exist_ok=True)
+    output_path = runtime_logs_dir / "runtime_diagnostics.json"
     output_path.write_text(json.dumps(diagnostics, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(diagnostics, ensure_ascii=False, indent=2))
 
