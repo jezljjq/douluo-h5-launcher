@@ -1,9 +1,10 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
+from douluo_launcher.version import APP_VERSION
 
 datas = [('automation_settings.template.json', '.'), ('debug_ocr\\template_passport_btn.png', 'debug_ocr')]
 binaries = []
-hiddenimports = ['PIL', 'pytesseract', 'cv2', 'tkinterdnd2', 'win32com', 'win32gui', 'win32con', 'playwright.sync_api', 'douluo_launcher', 'douluo_launcher.config', 'douluo_launcher.automation', 'douluo_launcher.dm_client', 'douluo_launcher.gui']
+hiddenimports = ['PIL', 'pytesseract', 'cv2', 'tkinterdnd2', 'win32com', 'win32gui', 'win32con', 'playwright.sync_api', 'requests', 'douluo_launcher', 'douluo_launcher.config', 'douluo_launcher.automation', 'douluo_launcher.dm_client', 'douluo_launcher.gui']
 tmp_ret = collect_all('tkinterdnd2')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
@@ -47,5 +48,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='斗罗大陆H5上号器-v1.3.0',
+    name=f'斗罗大陆H5上号器-v{APP_VERSION}',
 )

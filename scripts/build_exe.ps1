@@ -13,6 +13,14 @@ function Step([string]$Message) {
     Write-Host $Message
 }
 
+function Get-AppVersion() {
+    $version = (& python -c "from douluo_launcher.version import APP_VERSION; print(APP_VERSION)")
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($version)) {
+        Fail "Unable to read APP_VERSION from douluo_launcher/version.py"
+    }
+    return ($version | Select-Object -First 1).Trim()
+}
+
 function Find-ChromiumExe([string]$BrowsersDir) {
     if (-not (Test-Path -LiteralPath $BrowsersDir)) {
         return $null
@@ -90,12 +98,15 @@ Set-Location $ProjectRoot
 
 $AppName = "上号器"
 $InternalBuildName = "Launcher"
-$ReleaseDirName = "斗罗大陆H5上号器-v1.3.0"
+$AppVersion = Get-AppVersion
+$ReleaseDirName = "斗罗大陆H5上号器-v$AppVersion"
 $DistDir = Join-Path $ProjectRoot "dist\$ReleaseDirName"
 $InternalExePath = Join-Path $DistDir "$InternalBuildName.exe"
 $ExePath = Join-Path $DistDir "$AppName.exe"
 $PlaywrightBrowsers = Join-Path $env:LOCALAPPDATA "ms-playwright"
 $BundledPlaywrightBrowsers = Join-Path $DistDir "ms-playwright"
+$AutomationSettingsPath = Join-Path $ProjectRoot "automation_settings.template.json"
+$TemplatePassportPath = Join-Path $ProjectRoot "debug_ocr\template_passport_btn.png"
 
 Write-Host "============================================"
 Write-Host " $AppName - release build"
@@ -191,6 +202,7 @@ foreach ($Path in @("build", "dist")) {
 Write-Host "  cleaned: build, dist"
 
 Step "[5/7] Run PyInstaller"
+$MainSpecDir = Join-Path $ProjectRoot "build\launcher_spec"
 $PyInstallerArgs = @(
     "--onedir",
     "--clean",
@@ -198,8 +210,9 @@ $PyInstallerArgs = @(
     "--noconsole",
     "--name", $InternalBuildName,
     "--distpath", (Join-Path $ProjectRoot "dist"),
-    "--add-data", "automation_settings.template.json;.",
-    "--add-data", "debug_ocr\template_passport_btn.png;debug_ocr",
+    "--specpath", $MainSpecDir,
+    "--add-data", "$AutomationSettingsPath;.",
+    "--add-data", "$TemplatePassportPath;debug_ocr",
     "--collect-all", "tkinterdnd2",
     "--hidden-import", "PIL",
     "--hidden-import", "pytesseract",
@@ -209,6 +222,7 @@ $PyInstallerArgs = @(
     "--hidden-import", "win32gui",
     "--hidden-import", "win32con",
     "--hidden-import", "playwright.sync_api",
+    "--hidden-import", "requests",
     "--hidden-import", "douluo_launcher",
     "--hidden-import", "douluo_launcher.config",
     "--hidden-import", "douluo_launcher.automation",

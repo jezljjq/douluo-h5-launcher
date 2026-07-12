@@ -27,20 +27,43 @@ class ClientSpeedPanelConfig:
     speed_panel_top: int = 12
     speed_panel_debug: bool = False
     speed_panel_remove_original_toggle: bool = True
-    block_browser_context_menu: bool = True
+    block_browser_context_menu: bool = False
+
+
+@dataclass(frozen=True)
+class NativeSpeedUiResult:
+    status: str
+    dom_removed_count: int = 0
+    css_hidden_count: int = 0
+    non_dom: bool = False
+    observer_installed: bool = False
+    reason: str = ""
+
+
+def native_speed_ui_result_from_payload(payload: object) -> NativeSpeedUiResult:
+    if not isinstance(payload, dict):
+        return NativeSpeedUiResult("failed", reason="invalid_result")
+    status = str(payload.get("status") or "").strip()
+    if status not in {"dom_removed", "css_hidden", "not_found", "non_dom", "failed"}:
+        if int(payload.get("domRemovedCount") or 0) > 0:
+            status = "dom_removed"
+        elif int(payload.get("cssHiddenCount") or payload.get("hiddenCount") or 0) > 0:
+            status = "css_hidden"
+        elif bool(payload.get("nonDom") or payload.get("togglePointMissedDom")):
+            status = "non_dom"
+        else:
+            status = "not_found"
+    return NativeSpeedUiResult(
+        status=status,
+        dom_removed_count=max(0, int(payload.get("domRemovedCount") or 0)),
+        css_hidden_count=max(0, int(payload.get("cssHiddenCount") or 0)),
+        non_dom=bool(payload.get("nonDom") or status == "non_dom"),
+        observer_installed=bool(payload.get("observerInstalled")),
+        reason=_sanitize_diag_text(payload.get("reason") or ""),
+    )
 
 
 def build_speed_navigation_guard_script(config: ClientSpeedPanelConfig | None = None) -> str:
-    panel_config = config or ClientSpeedPanelConfig()
-    context_menu_block = ""
-    if panel_config.block_browser_context_menu:
-        context_menu_block = r"""
-    document.addEventListener('contextmenu', function(e) {
-        e.preventDefault();
-        e.stopPropagation();
-        return false;
-    }, true);
-"""
     return f"""(() => {{
     if (window.__H5_SPEED_NAV_GUARD_INSTALLED__) {{
         return {{ ok: true, existed: true, guard: 'speed_navigation' }};
@@ -49,10 +72,8 @@ def build_speed_navigation_guard_script(config: ClientSpeedPanelConfig | None = 
 
     function runSpeedNavigationGuards() {{
         try {{
-            if (typeof window.__H5_HIDE_ORIGINAL_SPEED_PANEL_STRONG__ === 'function') {{
-                window.__H5_HIDE_ORIGINAL_SPEED_PANEL_STRONG__();
-            }} else if (typeof window.__H5_HIDE_ORIGINAL_SPEED_PANEL__ === 'function') {{
-                window.__H5_HIDE_ORIGINAL_SPEED_PANEL__();
+            if (typeof window.__H5_HANDLE_NATIVE_SPEED_UI__ === 'function') {{
+                window.__H5_HANDLE_NATIVE_SPEED_UI__();
             }}
         }} catch (_hideError) {{}}
         try {{
@@ -61,15 +82,26 @@ def build_speed_navigation_guard_script(config: ClientSpeedPanelConfig | None = 
             }}
         }} catch (_panelError) {{}}
     }}
-{context_menu_block}
+    let guardTimer = null;
+    function scheduleSpeedNavigationGuards() {{
+        if (guardTimer !== null) clearTimeout(guardTimer);
+        guardTimer = setTimeout(function() {{
+            guardTimer = null;
+            runSpeedNavigationGuards();
+        }}, 120);
+    }}
     ['DOMContentLoaded', 'pageshow', 'popstate', 'hashchange', 'load'].forEach(function(eventName) {{
         window.addEventListener(eventName, function() {{
-            setTimeout(runSpeedNavigationGuards, 500);
+            scheduleSpeedNavigationGuards();
         }}, true);
     }});
-    setInterval(runSpeedNavigationGuards, 2000);
-    setTimeout(runSpeedNavigationGuards, 300);
-    return {{ ok: true, guard: 'speed_navigation', blockContextMenu: {str(bool(panel_config.block_browser_context_menu)).lower()} }};
+    if (typeof MutationObserver === 'function' && document.documentElement) {{
+        const rootObserver = new MutationObserver(scheduleSpeedNavigationGuards);
+        rootObserver.observe(document.documentElement, {{ childList: true, subtree: false }});
+        window.__H5_SPEED_NAV_ROOT_OBSERVER__ = rootObserver;
+    }}
+    scheduleSpeedNavigationGuards();
+    return {{ ok: true, guard: 'speed_navigation', blockContextMenu: false }};
 }})()"""
 
 
@@ -105,8 +137,6 @@ def install_speed_navigation_guard(
             logger(f"[加速器守护] 新文档预注入失败：{exc}")
     try:
         cdp.evaluate(script)
-        if panel_config.block_browser_context_menu:
-            logger("[加速器守护] 已启用右键菜单拦截，避免误点 Back / Forward。")
     except Exception as exc:
         logger(f"[加速器守护] 当前页面守护安装失败：{exc}")
 
@@ -148,11 +178,12 @@ def process_client_speed_panel(
     *,
     trigger_stage: str = SPEED_HOOK_STAGE_AFTER_GAME_READY,
     log: LogFunc | None = None,
-) -> None:
+) -> NativeSpeedUiResult | None:
     panel_config = config or ClientSpeedPanelConfig()
     logger = log or (lambda _message: None)
     logger("[客户端直登] 开始处理加速浮层")
 
+    native_result: NativeSpeedUiResult | None = None
     if panel_config.auto_replace_speed_panel:
         try:
             result = cdp.evaluate(
@@ -161,25 +192,27 @@ def process_client_speed_panel(
                 )
             )
         except Exception as exc:
-            logger(f"[客户端直登] 隐藏原加速浮层失败：{exc}")
+            native_result = NativeSpeedUiResult("failed", reason=_sanitize_diag_text(exc))
+            logger(f"[客户端直登] 网页原生加速入口处理：status=failed reason={native_result.reason}")
         else:
+            native_result = native_speed_ui_result_from_payload(result)
             _log_hide_result(result, logger, debug=panel_config.speed_panel_debug)
     else:
         result = None
 
     if not panel_config.custom_speed_panel_enabled:
-        return
+        return native_result
     if str(panel_config.speed_engine or "").strip() != SPEED_ENGINE_TIMER_HOOK:
         logger(f"[客户端直登] 未支持的变速器引擎={panel_config.speed_engine}")
-        return
+        return native_result
     if not _should_inject_timer_hook(panel_config, trigger_stage):
-        return
+        return native_result
 
     try:
         result = cdp.evaluate(build_custom_speed_panel_script(panel_config))
     except Exception as exc:
         logger(f"[客户端直登] 注入自定义时间加速器失败：{exc}")
-        return
+        return native_result
 
     if isinstance(result, dict):
         if result.get("existed"):
@@ -188,7 +221,7 @@ def process_client_speed_panel(
             logger("[客户端直登] 已注入自定义时间加速器")
         else:
             logger(f"[客户端直登] 注入自定义时间加速器失败：{result.get('reason') or 'unknown'}")
-            return
+            return native_result
         logger(
             "[客户端直登] "
             f"变速器引擎={result.get('engine') or SPEED_ENGINE_TIMER_HOOK}，"
@@ -209,7 +242,8 @@ def process_client_speed_panel(
                 debug=panel_config.speed_panel_debug,
             )
         except Exception as exc:
-            logger(f"[客户端直登] 隐藏原加速浮层失败：{exc}")
+            logger(f"[客户端直登] 网页原生加速入口复检失败：{_sanitize_diag_text(exc)}")
+    return native_result
 
 
 def build_hide_original_speed_overlay_script(*, remove_original_toggle: bool = True) -> str:
@@ -482,18 +516,19 @@ def build_hide_original_speed_overlay_script(*, remove_original_toggle: bool = T
     }
 
     function hideToggleNode(node) {
-        if (isProtectedNode(node)) return false;
+        if (isProtectedNode(node)) return 'failed';
+        if (TOGGLE_REMOVE_ORIGINAL) {
+            try {
+                node.remove();
+                if (!node.isConnected) return 'dom_removed';
+            } catch (_error) {}
+        }
         node.style.setProperty('display', 'none', 'important');
         node.style.setProperty('visibility', 'hidden', 'important');
         node.style.setProperty('opacity', '0', 'important');
         node.style.setProperty('pointer-events', 'none', 'important');
         node.setAttribute('data-h5-original-speed-toggle-hidden', '1');
-        if (TOGGLE_REMOVE_ORIGINAL) {
-            try {
-                node.remove();
-            } catch (_error) {}
-        }
-        return true;
+        return 'css_hidden';
     }
 
     function processToggleNode(node, doc, result, seen, hiddenContainers, shouldHide) {
@@ -506,8 +541,10 @@ def build_hide_original_speed_overlay_script(*, remove_original_toggle: bool = T
         if (!container || hiddenContainers.has(container)) return;
         result.candidates.push(toggleSummary(container, 'toggle'));
         hiddenContainers.add(container);
-        if (shouldHide && hideToggleNode(container)) {
-            result.hiddenCount += 1;
+        if (shouldHide) {
+            const action = hideToggleNode(container);
+            if (action === 'dom_removed') result.domRemovedCount += 1;
+            if (action === 'css_hidden') result.cssHiddenCount += 1;
         }
     }
 
@@ -549,12 +586,20 @@ def build_hide_original_speed_overlay_script(*, remove_original_toggle: bool = T
     }
 
     function collectToggleInDocument(doc, shouldHide) {
-        const result = { hidden: false, hiddenCount: 0, candidates: [], pointMissedDom: false };
+        const result = {
+            hidden: false,
+            hiddenCount: 0,
+            domRemovedCount: 0,
+            cssHiddenCount: 0,
+            candidates: [],
+            pointMissedDom: false
+        };
         if (!doc || !doc.body) return result;
         const seen = new Set();
         const hiddenContainers = new Set();
         scanToggleDom(doc, result, seen, hiddenContainers, shouldHide);
         scanTogglePoints(doc, result, seen, hiddenContainers, shouldHide);
+        result.hiddenCount = result.domRemovedCount + result.cssHiddenCount;
         result.hidden = result.hiddenCount > 0;
         return result;
     }
@@ -694,7 +739,16 @@ def build_hide_original_speed_overlay_script(*, remove_original_toggle: bool = T
     }
 
     function hideNode(node, confirmedContainer) {
-        if (isProtectedNode(node)) return false;
+        if (isProtectedNode(node)) return 'failed';
+        const normalized = normalizeText(nodeText(node));
+        const highConfidence = confirmedContainer
+            && normalized.includes(normalizeText("请选择加速倍率"));
+        if (highConfidence) {
+            try {
+                node.remove();
+                if (!node.isConnected) return 'dom_removed';
+            } catch (_error) {}
+        }
         node.style.setProperty('display', 'none', 'important');
         node.style.setProperty('visibility', 'hidden', 'important');
         node.style.setProperty('opacity', '0', 'important');
@@ -704,7 +758,7 @@ def build_hide_original_speed_overlay_script(*, remove_original_toggle: bool = T
             node.style.setProperty('height', '0px', 'important');
         }
         node.setAttribute('data-h5-original-speed-hidden', '1');
-        return true;
+        return 'css_hidden';
     }
 
     function collectCandidateNodesFromRoot(root, seen, output) {
@@ -756,7 +810,14 @@ def build_hide_original_speed_overlay_script(*, remove_original_toggle: bool = T
     }
 
     function hideInDocument(doc) {
-        const result = { hiddenCount: 0, hiddenPaths: [], candidates: [], crossOriginIframe: false };
+        const result = {
+            hiddenCount: 0,
+            domRemovedCount: 0,
+            cssHiddenCount: 0,
+            hiddenPaths: [],
+            candidates: [],
+            crossOriginIframe: false
+        };
         if (!doc || !doc.body) return result;
         const hiddenContainers = new Set();
         const nodes = [];
@@ -768,9 +829,12 @@ def build_hide_original_speed_overlay_script(*, remove_original_toggle: bool = T
         for (const node of nodes) {
             const container = findContainer(node, doc);
             if (!container || hiddenContainers.has(container)) continue;
-            if (hideNode(container, true)) {
+            const action = hideNode(container, true);
+            if (action === 'dom_removed' || action === 'css_hidden') {
                 hiddenContainers.add(container);
                 result.hiddenCount += 1;
+                if (action === 'dom_removed') result.domRemovedCount += 1;
+                if (action === 'css_hidden') result.cssHiddenCount += 1;
                 result.hiddenPaths.push(cssPath(container));
             }
         }
@@ -779,6 +843,8 @@ def build_hide_original_speed_overlay_script(*, remove_original_toggle: bool = T
 
     function mergeHideResult(target, source) {
         target.hiddenCount += source.hiddenCount || 0;
+        target.domRemovedCount += source.domRemovedCount || 0;
+        target.cssHiddenCount += source.cssHiddenCount || 0;
         target.hiddenPaths.push(...(source.hiddenPaths || []));
         target.candidates.push(...(source.candidates || []));
         target.crossOriginIframe = target.crossOriginIframe || !!source.crossOriginIframe;
@@ -786,6 +852,8 @@ def build_hide_original_speed_overlay_script(*, remove_original_toggle: bool = T
 
     function mergeToggleResult(target, source) {
         target.toggleHiddenCount += source.hiddenCount || 0;
+        target.domRemovedCount += source.domRemovedCount || 0;
+        target.cssHiddenCount += source.cssHiddenCount || 0;
         target.toggleCandidates.push(...(source.candidates || []));
         target.togglePointMissedDom = target.togglePointMissedDom || !!source.pointMissedDom;
     }
@@ -852,7 +920,15 @@ def build_hide_original_speed_overlay_script(*, remove_original_toggle: bool = T
     };
 
     window.__H5_HIDE_ORIGINAL_SPEED_PANEL_STRONG__ = function() {
-        const result = { hidden: false, hiddenCount: 0, hiddenPaths: [], candidates: [], crossOriginIframe: false };
+        const result = {
+            hidden: false,
+            hiddenCount: 0,
+            domRemovedCount: 0,
+            cssHiddenCount: 0,
+            hiddenPaths: [],
+            candidates: [],
+            crossOriginIframe: false
+        };
         try {
             mergeHideResult(result, hideInDocument(document));
         } catch (_error) {}
@@ -875,7 +951,15 @@ def build_hide_original_speed_overlay_script(*, remove_original_toggle: bool = T
     };
 
     window.__H5_HIDE_ORIGINAL_SPEED_TOGGLE__ = function() {
-        const result = { toggleHidden: false, toggleHiddenCount: 0, toggleCandidates: [], togglePointMissedDom: false, crossOriginIframe: false };
+        const result = {
+            toggleHidden: false,
+            toggleHiddenCount: 0,
+            domRemovedCount: 0,
+            cssHiddenCount: 0,
+            toggleCandidates: [],
+            togglePointMissedDom: false,
+            crossOriginIframe: false
+        };
         try {
             mergeToggleResult(result, hideToggleInDocument(document));
         } catch (_error) {}
@@ -901,17 +985,44 @@ def build_hide_original_speed_overlay_script(*, remove_original_toggle: bool = T
         return window.__H5_HIDE_ORIGINAL_SPEED_PANEL_STRONG__();
     };
 
-    const runToggleSuppression = function() {
-        try {
-            window.__H5_HIDE_ORIGINAL_SPEED_TOGGLE__();
-        } catch (_error) {}
+    window.__H5_HANDLE_NATIVE_SPEED_UI__ = function() {
+        const diagnosis = window.__H5_SPEED_PANEL_DIAGNOSE__();
+        const result = window.__H5_HIDE_ORIGINAL_SPEED_PANEL_STRONG__();
+        const toggleDiagnosis = window.__H5_SPEED_TOGGLE_DIAGNOSE__();
+        const toggleResult = window.__H5_HIDE_ORIGINAL_SPEED_TOGGLE__();
+        const domRemovedCount = Number(result.domRemovedCount || 0) + Number(toggleResult.domRemovedCount || 0);
+        const cssHiddenCount = Number(result.cssHiddenCount || 0) + Number(toggleResult.cssHiddenCount || 0);
+        const nonDom = domRemovedCount === 0
+            && cssHiddenCount === 0
+            && !!(toggleDiagnosis.togglePointMissedDom || toggleResult.togglePointMissedDom);
+        const status = domRemovedCount > 0
+            ? 'dom_removed'
+            : (cssHiddenCount > 0 ? 'css_hidden' : (nonDom ? 'non_dom' : 'not_found'));
+        return {
+            status,
+            domRemovedCount,
+            cssHiddenCount,
+            nonDom,
+            hidden: domRemovedCount + cssHiddenCount > 0,
+            hiddenCount: domRemovedCount + cssHiddenCount,
+            hiddenPaths: result.hiddenPaths || [],
+            candidates: diagnosis.candidates || result.candidates || [],
+            toggleHidden: !!toggleResult.toggleHidden,
+            toggleHiddenCount: toggleResult.toggleHiddenCount || 0,
+            toggleCandidates: toggleResult.toggleCandidates || [],
+            togglePreClickCandidates: toggleDiagnosis.togglePreClickCandidates || [],
+            togglePointMissedDom: nonDom,
+            crossOriginIframe: !!(
+                diagnosis.crossOriginIframe
+                || result.crossOriginIframe
+                || toggleDiagnosis.crossOriginIframe
+                || toggleResult.crossOriginIframe
+            )
+        };
     };
 
-    const diagnosis = window.__H5_SPEED_PANEL_DIAGNOSE__();
-    const result = window.__H5_HIDE_ORIGINAL_SPEED_PANEL_STRONG__();
-    const toggleDiagnosis = window.__H5_SPEED_TOGGLE_DIAGNOSE__();
-    const toggleResult = window.__H5_HIDE_ORIGINAL_SPEED_TOGGLE__();
     let observerInstalled = false;
+    let observerError = '';
 
     if (!window.__H5_ORIGINAL_SPEED_HIDE_OBSERVER_INSTALLED__) {
         window.__H5_ORIGINAL_SPEED_HIDE_OBSERVER_INSTALLED__ = true;
@@ -921,8 +1032,7 @@ def build_hide_original_speed_overlay_script(*, remove_original_toggle: bool = T
             clearTimeout(hideTimer);
             hideTimer = setTimeout(function() {
                 try {
-                    window.__H5_HIDE_ORIGINAL_SPEED_PANEL_STRONG__();
-                    window.__H5_HIDE_ORIGINAL_SPEED_TOGGLE__();
+                    window.__H5_HANDLE_NATIVE_SPEED_UI__();
                 } catch (_error) {}
             }, 80);
         };
@@ -930,72 +1040,24 @@ def build_hide_original_speed_overlay_script(*, remove_original_toggle: bool = T
             const observer = new MutationObserver(scheduleHide);
             observer.observe(document.body || document.documentElement, { childList: true, subtree: true });
             window.__H5_ORIGINAL_SPEED_HIDE_OBSERVER__ = observer;
-        } catch (_error) {}
-
-        const startedAt = Date.now();
-        const fastTimer = setInterval(function() {
-            try {
-                window.__H5_HIDE_ORIGINAL_SPEED_PANEL_STRONG__();
-                window.__H5_HIDE_ORIGINAL_SPEED_TOGGLE__();
-            } catch (_error) {}
-            if (Date.now() - startedAt > 15000) {
-                clearInterval(fastTimer);
-            }
-        }, 500);
-        window.__H5_ORIGINAL_SPEED_HIDE_FAST_TIMER__ = fastTimer;
-
-        window.__H5_ORIGINAL_SPEED_HIDE_SLOW_TIMER__ = setInterval(function() {
-            try {
-                window.__H5_HIDE_ORIGINAL_SPEED_PANEL_STRONG__();
-                window.__H5_HIDE_ORIGINAL_SPEED_TOGGLE__();
-            } catch (_error) {}
-        }, 2000);
+        } catch (_error) {
+            observerError = String(_error && _error.message || _error);
+        }
     }
 
     if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', runToggleSuppression, { once: true });
+        document.addEventListener('DOMContentLoaded', window.__H5_HANDLE_NATIVE_SPEED_UI__, { once: true });
     } else {
-        setTimeout(runToggleSuppression, 0);
+        setTimeout(window.__H5_HANDLE_NATIVE_SPEED_UI__, 0);
     }
 
-    if (!window.__H5_ORIGINAL_SPEED_TOGGLE_SUPPRESSOR_INSTALLED__) {
-        window.__H5_ORIGINAL_SPEED_TOGGLE_SUPPRESSOR_INSTALLED__ = true;
-        let toggleTimer = 0;
-        const scheduleToggleHide = function() {
-            clearTimeout(toggleTimer);
-            toggleTimer = setTimeout(runToggleSuppression, 60);
-        };
-        try {
-            const toggleObserver = new MutationObserver(scheduleToggleHide);
-            toggleObserver.observe(document.body || document.documentElement, { childList: true, subtree: true });
-            window.__H5_ORIGINAL_SPEED_TOGGLE_SUPPRESSOR_OBSERVER__ = toggleObserver;
-        } catch (_error) {}
-
-        const toggleStartedAt = Date.now();
-        const toggleFastTimer = setInterval(function() {
-            runToggleSuppression();
-            if (Date.now() - toggleStartedAt > 30000) {
-                clearInterval(toggleFastTimer);
-            }
-        }, 300);
-        window.__H5_ORIGINAL_SPEED_TOGGLE_FAST_TIMER__ = toggleFastTimer;
-
-        window.__H5_ORIGINAL_SPEED_TOGGLE_SLOW_TIMER__ = setInterval(runToggleSuppression, 2000);
+    const initialResult = window.__H5_HANDLE_NATIVE_SPEED_UI__();
+    initialResult.observerInstalled = observerInstalled;
+    if (observerError && initialResult.status === 'not_found') {
+        initialResult.status = 'failed';
+        initialResult.reason = observerError;
     }
-
-    return {
-        hidden: !!result.hidden,
-        hiddenCount: result.hiddenCount || 0,
-        hiddenPaths: result.hiddenPaths || [],
-        candidates: diagnosis.candidates || result.candidates || [],
-        toggleHidden: !!toggleResult.toggleHidden,
-        toggleHiddenCount: toggleResult.toggleHiddenCount || 0,
-        toggleCandidates: toggleResult.toggleCandidates || [],
-        togglePreClickCandidates: toggleDiagnosis.togglePreClickCandidates || [],
-        togglePointMissedDom: !!(toggleDiagnosis.togglePointMissedDom || toggleResult.togglePointMissedDom),
-        crossOriginIframe: !!(diagnosis.crossOriginIframe || result.crossOriginIframe || toggleDiagnosis.crossOriginIframe || toggleResult.crossOriginIframe),
-        observerInstalled
-    };
+    return initialResult;
 })()""".replace("__H5_REMOVE_ORIGINAL_TOGGLE__", "true" if remove_original_toggle else "false")
 
 
@@ -1005,7 +1067,19 @@ def build_custom_speed_panel_script(config: ClientSpeedPanelConfig) -> str:
         "left": int(config.speed_panel_left),
         "top": int(config.speed_panel_top),
     }
-    return TIMER_HOOK_SCRIPT.replace("__H5_SPEED_CONFIG_JSON__", json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+    config_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    timer_script = TIMER_HOOK_SCRIPT.replace("__H5_SPEED_CONFIG_JSON__", config_json)
+    tree_script = SPEED_TREE_PANEL_SCRIPT.replace("__H5_SPEED_CONFIG_JSON__", config_json)
+    return timer_script + "\n;\n" + tree_script
+
+
+def build_speed_tree_toggle_script() -> str:
+    return r"""(() => {
+        if (typeof window.__H5_SPEED_TREE_TOGGLE__ !== 'function') {
+            return { ok: false, reason: 'tree_panel_unavailable' };
+        }
+        return window.__H5_SPEED_TREE_TOGGLE__();
+    })()"""
 
 
 def _should_inject_timer_hook(config: ClientSpeedPanelConfig, trigger_stage: str) -> bool:
@@ -1025,20 +1099,27 @@ def _format_rate(rate: object) -> str:
 
 
 def _log_hide_result(result: object, logger: LogFunc, *, debug: bool = False) -> None:
-    if isinstance(result, dict) and result.get("hidden"):
-        logger(f"[客户端直登] 原加速浮层隐藏：隐藏数量={int(result.get('hiddenCount') or 1)}")
+    native_result = native_speed_ui_result_from_payload(result)
+    if native_result.status == "dom_removed":
+        logger(
+            "[客户端直登] 网页原生加速入口处理："
+            f"status=dom_removed count={native_result.dom_removed_count} "
+            f"css_hidden={native_result.css_hidden_count}"
+        )
+    elif native_result.status == "css_hidden":
+        logger(
+            "[客户端直登] 网页原生加速入口处理："
+            f"status=css_hidden count={native_result.css_hidden_count}"
+        )
+    elif native_result.status == "non_dom":
+        logger("[客户端直登] 网页原生加速入口处理：status=non_dom")
+    elif native_result.status == "failed":
+        logger(f"[客户端直登] 网页原生加速入口处理：status=failed reason={native_result.reason or 'unknown'}")
     else:
-        logger("[客户端直登] 原加速浮层隐藏：未发现候选")
+        logger("[客户端直登] 网页原生加速入口处理：status=not_found")
 
     if isinstance(result, dict) and result.get("crossOriginIframe"):
         logger("[客户端直登] 发现跨域 iframe，无法直接隐藏 iframe 内部原加速浮层。")
-
-    if isinstance(result, dict) and result.get("toggleHidden"):
-        logger(f"[客户端直登] 已隐藏原加速器入口按钮，数量={int(result.get('toggleHiddenCount') or 1)}")
-    elif isinstance(result, dict) and result.get("togglePointMissedDom"):
-        logger("[客户端直登] 原加速器入口按钮未命中 DOM，可能是 canvas/native overlay。")
-    else:
-        logger("[客户端直登] 未发现原加速器入口按钮")
 
     if not debug or not isinstance(result, dict):
         return
@@ -1099,6 +1180,270 @@ def _sanitize_diag_text(value: object) -> str:
     text = re.sub(r"(?i)\b(token|sign|cookie|imei)\b\s*[:=]\s*[^&\s,;]+", r"\1=***", text)
     text = re.sub(r"(?i)\b(token|sign|cookie|imei)\b", "***", text)
     return " ".join(text.split())
+
+
+SPEED_TREE_PANEL_SCRIPT = r"""(() => {
+'use strict';
+try {
+    const CONFIG = __H5_SPEED_CONFIG_JSON__;
+    const PANEL_ID = 'speed-hack-panel';
+    const REOPEN_ID = 'speed-panel-reopen-btn';
+    const RATE_KEY = 'speed-hack-tree-rate';
+    const PRESETS = [1, 2, 5, 50, 500];
+    const realSetTimeout = window.__H5_SPEED_ORIGINALS__ && window.__H5_SPEED_ORIGINALS__.setTimeout
+        ? window.__H5_SPEED_ORIGINALS__.setTimeout
+        : window.setTimeout.bind(window);
+    let collapseTimer = null;
+
+    function cleanRate(value, fallback) {
+        const number = Number(value);
+        return Number.isFinite(number) && number > 0 ? number : fallback;
+    }
+
+    function roundedTenth(value) {
+        return Math.round(Number(value) * 10) / 10;
+    }
+
+    function formatRate(value) {
+        const rate = cleanRate(value, 1);
+        return rate < 1 ? roundedTenth(rate).toFixed(1) : String(Math.round(rate));
+    }
+
+    function loadSavedRate() {
+        try {
+            return cleanRate(localStorage.getItem(RATE_KEY), null);
+        } catch (_error) {
+            return null;
+        }
+    }
+
+    function saveRate(rate) {
+        try {
+            localStorage.setItem(RATE_KEY, String(rate));
+        } catch (_error) {}
+    }
+
+    function currentRate() {
+        return cleanRate(
+            typeof window.__H5_SPEED_GET__ === 'function' ? window.__H5_SPEED_GET__() : CONFIG.defaultRate,
+            1
+        );
+    }
+
+    function updateHighlight(panel, rate) {
+        const current = cleanRate(rate, currentRate());
+        panel.dataset.currentRate = String(current);
+        const root = panel.querySelector('.speed-tree-root');
+        if (root) root.textContent = `${formatRate(current)}x`;
+        panel.querySelectorAll('[data-speed-rate]').forEach((button) => {
+            const active = Number(button.dataset.speedRate) === current;
+            button.classList.toggle('is-active', active);
+            button.setAttribute('aria-pressed', active ? 'true' : 'false');
+        });
+    }
+
+    function setExpanded(panel, expanded) {
+        cancelScheduledCollapse();
+        panel.dataset.expanded = expanded ? '1' : '0';
+        const tree = panel.querySelector('.speed-tree-branches');
+        if (tree) tree.hidden = !expanded;
+        panel.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+        return { ok: true, expanded: !!expanded, current: currentRate() };
+    }
+
+    function cancelScheduledCollapse() {
+        if (collapseTimer === null) return;
+        try { clearTimeout(collapseTimer); } catch (_error) {}
+        collapseTimer = null;
+    }
+
+    function scheduleCollapse(panel) {
+        cancelScheduledCollapse();
+        collapseTimer = realSetTimeout(() => {
+            collapseTimer = null;
+            try {
+                if (panel.matches(':hover')) return;
+            } catch (_error) {}
+            setExpanded(panel, false);
+        }, 360);
+    }
+
+    function installApplyWrapper(panel) {
+        if (window.__H5_SPEED_TREE_APPLY_WRAPPED__) return;
+        const baseApply = window.__H5_SPEED_APPLY__;
+        if (typeof baseApply !== 'function') return;
+        window.__H5_SPEED_TREE_APPLY_WRAPPED__ = true;
+        window.__H5_SPEED_APPLY__ = function(rate) {
+            const result = baseApply(rate);
+            if (result && result.ok === true) {
+                const applied = cleanRate(result.current, cleanRate(rate, currentRate()));
+                saveRate(applied);
+                const activePanel = document.getElementById(PANEL_ID);
+                if (activePanel) updateHighlight(activePanel, applied);
+            }
+            return result;
+        };
+    }
+
+    function applyPreset(panel, rate) {
+        if (typeof window.__H5_SPEED_APPLY__ !== 'function') {
+            return { ok: false, reason: 'speed_apply_unavailable' };
+        }
+        const result = window.__H5_SPEED_APPLY__(rate);
+        if (!result || result.ok !== true) return result || { ok: false, reason: 'apply_failed' };
+        updateHighlight(panel, result.current);
+        return result;
+    }
+
+    function stepPreset(panel, direction) {
+        const current = roundedTenth(currentRate());
+        let next;
+        if (direction > 0) {
+            next = current < 1 ? Math.min(1, roundedTenth(current + 0.1)) : roundedTenth(current + 1);
+        } else if (current > 1) {
+            next = Math.max(1, roundedTenth(current - 1));
+        } else {
+            next = current === 1 ? 0.9 : Math.max(0.1, roundedTenth(current - 0.1));
+        }
+        if (next === current) return { ok: true, current, boundary: true };
+        return applyPreset(panel, next);
+    }
+
+    function ensureTreePanel() {
+        if (!document.body) return null;
+        const existing = document.getElementById(PANEL_ID);
+        if (existing && existing.dataset.speedTreePanel === '1') {
+            installApplyWrapper(existing);
+            updateHighlight(existing, currentRate());
+            return existing;
+        }
+        if (existing) existing.remove();
+        const reopen = document.getElementById(REOPEN_ID);
+        if (reopen) reopen.remove();
+
+        const panel = document.createElement('div');
+        panel.id = PANEL_ID;
+        panel.dataset.speedTreePanel = '1';
+        panel.dataset.expanded = '0';
+        panel.setAttribute('aria-label', '树形加速器');
+        panel.setAttribute('aria-expanded', 'false');
+        panel.style.cssText = `position:fixed;left:0;top:${Math.max(0, Number(CONFIG.top) || 12)}px;z-index:2147483647;color:#eaf7ef;font:600 13px/1.2 'Segoe UI','Microsoft YaHei',sans-serif;user-select:none;`;
+        panel.innerHTML = `
+            <style>
+                #${PANEL_ID} .speed-tree-root{width:30px;height:30px;padding:0;border:1px solid rgba(118,213,151,.85);border-left:0;border-radius:0 8px 8px 0;background:rgba(17,31,24,.92);color:#93f0b5;cursor:pointer;font:700 14px/30px 'Microsoft YaHei',sans-serif;text-align:center;box-shadow:0 4px 14px rgba(0,0,0,.28)}
+                #${PANEL_ID} .speed-tree-branches{position:absolute;left:12px;top:32px;margin:0;padding:2px 0 4px 15px;list-style:none;background:transparent}
+                #${PANEL_ID} .speed-tree-branches::before{content:"";position:absolute;left:0;top:0;bottom:17px;border-left:1px solid rgba(147,240,181,.72)}
+                #${PANEL_ID} .speed-tree-item{position:relative;height:26px;display:flex;align-items:center}
+                #${PANEL_ID} .speed-tree-item::before{content:"";position:absolute;left:-15px;top:13px;width:13px;border-top:1px solid rgba(147,240,181,.72)}
+                #${PANEL_ID} .speed-tree-btn{min-width:38px;height:23px;padding:0 8px;border:1px solid rgba(118,213,151,.55);border-radius:6px;background:rgba(17,31,24,.94);color:#dff8e8;cursor:pointer;font:600 12px/21px 'Segoe UI','Microsoft YaHei',sans-serif;text-align:center;box-shadow:0 3px 10px rgba(0,0,0,.2)}
+                #${PANEL_ID} .speed-tree-btn:hover,#${PANEL_ID} .speed-tree-btn.is-active{background:#2d8d54;border-color:#9cf2b9;color:#fff}
+            </style>
+            <button type="button" class="speed-tree-root" aria-label="展开或收起加速器">1x</button>
+            <ul class="speed-tree-branches" hidden>
+                <li class="speed-tree-item"><button type="button" class="speed-tree-btn" data-speed-step="up">＋</button></li>
+                <li class="speed-tree-item"><button type="button" class="speed-tree-btn" data-speed-step="down">－</button></li>
+                <li class="speed-tree-item"><button type="button" class="speed-tree-btn" data-speed-rate="1">1x</button></li>
+                <li class="speed-tree-item"><button type="button" class="speed-tree-btn" data-speed-rate="2">2</button></li>
+                <li class="speed-tree-item"><button type="button" class="speed-tree-btn" data-speed-rate="5">5</button></li>
+                <li class="speed-tree-item"><button type="button" class="speed-tree-btn" data-speed-rate="50">50</button></li>
+                <li class="speed-tree-item"><button type="button" class="speed-tree-btn" data-speed-rate="500">500</button></li>
+            </ul>`;
+        document.body.appendChild(panel);
+
+        const root = panel.querySelector('.speed-tree-root');
+        let dragState = null;
+        let suppressClick = false;
+        const clampPanel = (left, top) => ({
+            left: Math.max(0, Math.min(left, Math.max(0, window.innerWidth - panel.offsetWidth))),
+            top: Math.max(0, Math.min(top, Math.max(0, window.innerHeight - panel.offsetHeight)))
+        });
+        root.addEventListener('pointerdown', (event) => {
+            if (event.button !== 0) return;
+            dragState = {
+                pointerId: event.pointerId,
+                startX: event.clientX,
+                startY: event.clientY,
+                left: panel.offsetLeft,
+                top: panel.offsetTop,
+                moved: false
+            };
+            try { root.setPointerCapture(event.pointerId); } catch (_error) {}
+        });
+        root.addEventListener('pointermove', (event) => {
+            if (!dragState || event.pointerId !== dragState.pointerId) return;
+            const dx = event.clientX - dragState.startX;
+            const dy = event.clientY - dragState.startY;
+            if (!dragState.moved && Math.hypot(dx, dy) < 5) return;
+            dragState.moved = true;
+            const next = clampPanel(dragState.left + dx, dragState.top + dy);
+            panel.style.left = `${next.left}px`;
+            panel.style.top = `${next.top}px`;
+            event.preventDefault();
+        });
+        const endDrag = (event) => {
+            if (!dragState || event.pointerId !== dragState.pointerId) return;
+            suppressClick = dragState.moved;
+            dragState = null;
+            try { root.releasePointerCapture(event.pointerId); } catch (_error) {}
+        };
+        root.addEventListener('pointerup', endDrag);
+        root.addEventListener('pointercancel', endDrag);
+        root.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            if (suppressClick) {
+                suppressClick = false;
+                return;
+            }
+            setExpanded(panel, panel.dataset.expanded !== '1');
+        });
+        panel.addEventListener('mouseenter', cancelScheduledCollapse);
+        panel.addEventListener('mouseleave', () => scheduleCollapse(panel));
+        panel.querySelectorAll('[data-speed-rate]').forEach((button) => {
+            button.addEventListener('click', () => applyPreset(panel, Number(button.dataset.speedRate)));
+        });
+        panel.querySelector('[data-speed-step="up"]').addEventListener('click', () => stepPreset(panel, 1));
+        panel.querySelector('[data-speed-step="down"]').addEventListener('click', () => stepPreset(panel, -1));
+
+        installApplyWrapper(panel);
+        const savedRate = loadSavedRate();
+        if (savedRate !== null && savedRate !== currentRate()) applyPreset(panel, savedRate);
+        updateHighlight(panel, currentRate());
+        return panel;
+    }
+
+    window.__H5_SPEED_ENSURE_PANEL__ = ensureTreePanel;
+    window.__H5_SPEED_TREE_TOGGLE__ = function() {
+        const panel = ensureTreePanel();
+        if (!panel) return { ok: false, reason: 'document_body_unavailable' };
+        return setExpanded(panel, panel.dataset.expanded !== '1');
+    };
+
+    if (document.readyState === 'loading') {
+        window.addEventListener('DOMContentLoaded', ensureTreePanel, { once: true });
+    } else {
+        ensureTreePanel();
+    }
+    if (!window.__H5_SPEED_TREE_OBSERVER_INSTALLED__ && typeof MutationObserver === 'function') {
+        window.__H5_SPEED_TREE_OBSERVER_INSTALLED__ = true;
+        let ensureScheduled = false;
+        const observer = new MutationObserver(() => {
+            if (ensureScheduled) return;
+            const current = document.getElementById(PANEL_ID);
+            if (current && current.dataset.speedTreePanel === '1') return;
+            ensureScheduled = true;
+            realSetTimeout(() => {
+                ensureScheduled = false;
+                ensureTreePanel();
+            }, 80);
+        });
+        observer.observe(document.documentElement, { childList: true, subtree: true });
+    }
+    return { ok: true, engine: 'timer_hook', panel: PANEL_ID, tree: true, current: currentRate() };
+} catch (error) {
+    return { ok: false, engine: 'timer_hook', panel: 'speed-hack-panel', tree: true, reason: String(error && error.message || error) };
+}
+})()"""
 
 
 TIMER_HOOK_SCRIPT = r"""(() => {

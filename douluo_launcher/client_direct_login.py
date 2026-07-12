@@ -19,6 +19,7 @@ from .client_cdp import (
     wait_for_cdp_targets,
 )
 from .client_speed_panel import ClientSpeedPanelConfig, install_speed_navigation_guard, process_client_speed_panel
+from .client_cdp_ownership import CdpOwnershipResult, validate_window_cdp_endpoint
 
 
 LogFunc = Callable[[str], None]
@@ -45,9 +46,20 @@ class ClientBinding:
 class ClientDirectRunRecord:
     account_id: str
     account_name: str
+    account_key: str = ""
+    refresh_account_name: str = ""
+    bookmark_path: str = ""
+    slot_index: int = 0
+    identity_status: str = ""
+    link_status: str = ""
+    window_status: str = ""
     pid: int = 0
     hwnd: int = 0
+    title: str = ""
     cdp_port: int = 0
+    cdp_owner_pid: int = 0
+    cdp_ownership_status: str = ""
+    speed_rate: float = 1.0
     login_url: str = ""
     status: str = "未开始"
     error_message: str = ""
@@ -96,7 +108,8 @@ class ClientDirectLoginConfig:
     speed_panel_top: int = 12
     speed_panel_debug: bool = False
     speed_panel_remove_original_toggle: bool = True
-    block_browser_context_menu: bool = True
+    block_browser_context_menu: bool = False
+    minimize_during_login: bool = False
 
 
 @dataclass(frozen=True)
@@ -117,7 +130,8 @@ class PreparedClientDirectLoginConfig:
     speed_panel_top: int = 12
     speed_panel_debug: bool = False
     speed_panel_remove_original_toggle: bool = True
-    block_browser_context_menu: bool = True
+    block_browser_context_menu: bool = False
+    minimize_during_login: bool = False
 
 
 @dataclass
@@ -128,6 +142,7 @@ class ClientDirectLoginResult:
     binding: ClientBinding | None = None
     check: DirectLoginCheck | None = None
     process: subprocess.Popen | None = None
+    ownership: CdpOwnershipResult | None = None
 
 
 RUNTIME_STATE_EXPR = r"""(() => {
@@ -269,6 +284,7 @@ def execute_client_direct_login(
             speed_panel_top=int(config.speed_panel_top),
             speed_panel_debug=bool(config.speed_panel_debug),
             speed_panel_remove_original_toggle=bool(config.speed_panel_remove_original_toggle),
+            minimize_during_login=bool(config.minimize_during_login),
         ),
         prepared.binding,
         stop_event=stop_event,
@@ -289,32 +305,82 @@ def prepare_client_direct_client(
         return ClientDirectLoginResult(False, "失败", "URL 不是完整客户端直登 URL")
 
     process: subprocess.Popen | None = None
+    ownership: CdpOwnershipResult | None = None
     try:
         _raise_if_stopped(stop_event)
         process = start_x5game_with_cdp(config.x5game_path, config.cdp_port)
         logger(f"X5Game.exe started pid={process.pid} cdp_port={config.cdp_port}")
-        _raise_if_stopped(stop_event)
-        hwnd = wait_for_client_hwnd_by_pid(process.pid, timeout=min(10.0, config.timeout), stop_event=stop_event)
-        binding = ClientBinding(
-            account_id=config.account_id,
-            account_name=config.account_name,
-            pid=int(process.pid or 0),
-            hwnd=int(hwnd or 0),
-            cdp_port=int(config.cdp_port),
-            login_url=config.full_login_url,
-            status="待登录",
-        )
-        logger(f"client window bound pid={binding.pid} hwnd={binding.hwnd} cdp_port={binding.cdp_port}")
-        _raise_if_stopped(stop_event)
-        targets = wait_for_cdp_targets(config.cdp_port, timeout=min(30.0, config.timeout))
-        select_page_target(targets)
-        logger("CDP connected")
-        return ClientDirectLoginResult(
-            True,
-            "客户端已启动",
-            "客户端已启动，待登录",
-            binding=binding,
-            process=process,
+        pid = int(process.pid or 0)
+        if pid <= 0:
+            raise RuntimeError("客户端进程 PID 无效")
+
+        deadline = time.monotonic() + max(0.05, float(config.timeout))
+        hwnd = 0
+        last_status = "hwnd_pending"
+        while time.monotonic() < deadline:
+            _raise_if_stopped(stop_event)
+            poll = getattr(process, "poll", None)
+            if callable(poll) and poll() is not None:
+                raise RuntimeError("客户端进程已退出")
+            remaining = max(0.0, deadline - time.monotonic())
+            if hwnd <= 0:
+                hwnd = int(
+                    wait_for_client_hwnd_by_pid(
+                        pid,
+                        timeout=min(0.25, remaining),
+                        stop_event=stop_event,
+                    )
+                    or 0
+                )
+                if hwnd <= 0:
+                    last_status = "hwnd_missing"
+                    continue
+
+            binding = ClientBinding(
+                account_id=config.account_id,
+                account_name=config.account_name,
+                pid=pid,
+                hwnd=hwnd,
+                cdp_port=int(config.cdp_port),
+                login_url=config.full_login_url,
+                status="待登录",
+            )
+            if not _binding_alive(binding):
+                last_status = "hwnd_invalid"
+                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+                continue
+
+            try:
+                targets = wait_for_cdp_targets(
+                    config.cdp_port,
+                    timeout=min(0.75, max(0.05, deadline - time.monotonic())),
+                    request_timeout=min(0.25, max(0.05, deadline - time.monotonic())),
+                )
+                select_page_target(targets)
+            except Exception as exc:
+                last_status = f"cdp_target_pending:{type(exc).__name__}"
+                continue
+
+            ownership = validate_window_cdp_endpoint(hwnd, pid, int(config.cdp_port))
+            logger(f"[CDP归属] {ownership.safe_message()}")
+            if not ownership.verified:
+                last_status = ownership.status
+                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+                continue
+
+            logger(f"client window bound pid={binding.pid} hwnd={binding.hwnd} cdp_port={binding.cdp_port}")
+            logger("CDP connected")
+            return ClientDirectLoginResult(
+                True,
+                "客户端已启动",
+                "客户端已启动，待登录",
+                binding=binding,
+                process=process,
+                ownership=ownership,
+            )
+
+        raise TimeoutError(
+            f"客户端准备校验超时: status={last_status} pid={pid} hwnd={int(hwnd or 0)} cdp_port={int(config.cdp_port)}"
         )
     except Exception as exc:
         binding = None
@@ -334,6 +400,7 @@ def prepare_client_direct_client(
             mask_sensitive_text(str(exc)),
             binding=binding,
             process=process,
+            ownership=ownership,
         )
 
 
@@ -343,6 +410,7 @@ def execute_prepared_client_direct_login(
     *,
     stop_event: Event | None = None,
     log: LogFunc | None = None,
+    ownership_validator: Callable[[int, int, int], CdpOwnershipResult] | None = None,
 ) -> ClientDirectLoginResult:
     logger = log or (lambda _message: None)
     if not is_complete_direct_login_url(config.full_login_url):
@@ -361,6 +429,12 @@ def execute_prepared_client_direct_login(
         cdp.enable_default_domains()
         _safe_install_speed_navigation_guard(cdp, config, logger)
 
+        _raise_if_stopped(stop_event)
+        validator = ownership_validator or validate_window_cdp_endpoint
+        ownership = validator(int(binding.hwnd or 0), int(binding.pid or 0), int(config.cdp_port or 0))
+        logger(f"[CDP归属] {ownership.safe_message()}")
+        if not ownership.verified:
+            raise RuntimeError(f"CDP 归属校验失败: {ownership.status}")
         _raise_if_stopped(stop_event)
         cdp.navigate(config.full_login_url)
         logger("Page.navigate sent")
@@ -507,7 +581,7 @@ def _safe_process_speed_panel(
                 speed_panel_top=int(config.speed_panel_top),
                 speed_panel_debug=bool(config.speed_panel_debug),
                 speed_panel_remove_original_toggle=bool(config.speed_panel_remove_original_toggle),
-                block_browser_context_menu=bool(getattr(config, "block_browser_context_menu", True)),
+                block_browser_context_menu=bool(getattr(config, "block_browser_context_menu", False)),
             ),
             trigger_stage=trigger_stage,
             log=logger,
@@ -535,7 +609,7 @@ def _safe_install_speed_navigation_guard(
                 speed_panel_top=int(config.speed_panel_top),
                 speed_panel_debug=bool(config.speed_panel_debug),
                 speed_panel_remove_original_toggle=bool(config.speed_panel_remove_original_toggle),
-                block_browser_context_menu=bool(getattr(config, "block_browser_context_menu", True)),
+                block_browser_context_menu=bool(getattr(config, "block_browser_context_menu", False)),
             ),
             log=logger,
         )

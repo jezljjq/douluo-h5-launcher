@@ -41,7 +41,7 @@
 
 打包前必须确认当前目录：
 
-D:\Ai\codex\上号器
+<项目路径>
 
 然后执行：
 
@@ -118,7 +118,7 @@ exe 运行时优先设置：
 PLAYWRIGHT_BROWSERS_PATH=<exe所在目录>\ms-playwright
 ```
 
-禁止让 exe 依赖不存在的 `_internal\.local-browsers`，也禁止依赖固定用户目录如 `C:\Users\Administrator` 或 `C:\Users\34910`。
+禁止让 exe 依赖不存在的 `_internal\.local-browsers`，也禁止依赖任何固定用户目录。
 
 ### Dm helper 策略
 

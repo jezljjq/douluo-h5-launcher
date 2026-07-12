@@ -18,6 +18,13 @@ def app_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def source_project_root() -> Path | None:
+    """Return the source checkout root only when running from source."""
+    if getattr(sys, "frozen", False):
+        return None
+    return Path(__file__).resolve().parent.parent
+
+
 USER_DATA_ENV = "H5_LAUNCHER_DATA_DIR"
 USER_DATA_DIR_NAME = "DouluoH5Launcher"
 SETTINGS_FILE_NAME = "automation_settings.json"
@@ -139,24 +146,33 @@ def _first_existing(paths: Iterable[Path]) -> Path | None:
     return None
 
 
-def old_settings_migration_sources(app_dir: Path, cwd: Path) -> list[Path]:
-    return [
+def old_settings_migration_sources(app_dir: Path, cwd: Path, *, frozen: bool | None = None) -> list[Path]:
+    packaged = bool(getattr(sys, "frozen", False)) if frozen is None else bool(frozen)
+    sources = [
         app_dir / SETTINGS_FILE_NAME,
         app_dir / "_internal" / SETTINGS_FILE_NAME,
-        cwd / SETTINGS_FILE_NAME,
-        cwd / "dist" / "Launcher" / "_internal" / SETTINGS_FILE_NAME,
     ]
+    if not packaged:
+        sources.extend((cwd / SETTINGS_FILE_NAME, cwd / "dist" / "Launcher" / "_internal" / SETTINGS_FILE_NAME))
+    return sources
 
 
-def old_sessions_migration_sources(app_dir: Path, cwd: Path) -> list[Path]:
-    return [
+def old_sessions_migration_sources(app_dir: Path, cwd: Path, *, frozen: bool | None = None) -> list[Path]:
+    packaged = bool(getattr(sys, "frozen", False)) if frozen is None else bool(frozen)
+    sources = [
         app_dir / CLIENT_DIRECT_SESSIONS_FILE_NAME,
         app_dir / "debug_client_direct" / CLIENT_DIRECT_SESSIONS_FILE_NAME,
         app_dir / "_internal" / "debug_client_direct" / CLIENT_DIRECT_SESSIONS_FILE_NAME,
-        cwd / "debug_client_direct" / CLIENT_DIRECT_SESSIONS_FILE_NAME,
-        cwd / "dist" / "Launcher" / "debug_client_direct" / CLIENT_DIRECT_SESSIONS_FILE_NAME,
-        cwd / "dist" / "Launcher" / "_internal" / "debug_client_direct" / CLIENT_DIRECT_SESSIONS_FILE_NAME,
     ]
+    if not packaged:
+        sources.extend(
+            (
+                cwd / "debug_client_direct" / CLIENT_DIRECT_SESSIONS_FILE_NAME,
+                cwd / "dist" / "Launcher" / "debug_client_direct" / CLIENT_DIRECT_SESSIONS_FILE_NAME,
+                cwd / "dist" / "Launcher" / "_internal" / "debug_client_direct" / CLIENT_DIRECT_SESSIONS_FILE_NAME,
+            )
+        )
+    return sources
 
 
 def initialize_user_data_dir(
@@ -229,11 +245,8 @@ def initialize_user_data_dir(
 
 
 def project_root() -> Path:
-    """返回项目根目录（始终为源码项目根，与是否打包无关）。"""
-    if getattr(sys, "frozen", False):
-        # exe在 dist/斗罗大陆H5上号器/ 下，上溯3级到项目根
-        return Path(sys.executable).parent.parent.parent
-    return Path(__file__).resolve().parent.parent
+    """Compatibility root: source checkout in source mode, release root when frozen."""
+    return source_project_root() or app_root()
 
 
 LEVEL_OFFSETS = {
@@ -264,10 +277,12 @@ class AccountConfig:
     bookmark_title: str = ""
     order_index: int = 0
     include_in_all: bool = False
+    account_key: str = ""
+    bookmark_path: str = ""
 
     @property
     def key(self) -> str:
-        return f"{self.level}-{self.bookmark_no}"
+        return self.account_key or f"{self.level}-{self.bookmark_no}"
 
     @property
     def display_name(self) -> str:
@@ -283,41 +298,15 @@ class AccountConfig:
         return self.game_window_no
 
 
-@dataclass
-class CSVAccount:
-    """方式二：账号密码 + 通行证上号 的账号数据。
-
-    password 仅存在内存中，禁止打印日志、写入文件、传入子进程。
-    """
-    name: str
-    url: str
-    username: str
-    password: str
-    game_window_no: int
-    passport: str = ""
-    status: str = "未开始"
-
-    @property
-    def key(self) -> str:
-        return self.name
-
-    @property
-    def display_name(self) -> str:
-        return f"{self.name} → 窗口{self.game_window_no}"
-
-    def __repr__(self) -> str:
-        return (f"CSVAccount(name={self.name!r}, url={self.url!r}, "
-                f"username={self.username!r}, password='***', "
-                f"game_window_no={self.game_window_no})")
-
-
 @dataclass(frozen=True)
 class AutomationSettings:
     bookmark_file: str = ""
     bookmark_browser: str = ""
     bookmark_profile: str = ""
     bookmark_root_name: str = "账号"
+    bookmark_root_guid: str = ""
     bookmark_root_path: str = ""
+    bookmark_root_parent_path: str = ""
     bookmark_root_display_name: str = ""
     account_group_settings: dict[str, dict[str, bool]] = field(default_factory=lambda: {
         SINGLE_LEVEL_NAME: {"include_in_all": True},
@@ -399,13 +388,15 @@ class AutomationSettings:
     custom_speed_panel_enabled: bool = True
     speed_engine: str = "timer_hook"
     default_speed_rate: float = 1.0
+    speed_panel_hotkey: str = ""
+    speed_rate_hotkeys: list[dict[str, object]] = field(default_factory=list)
     speed_hook_stage: str = "after_game_ready"
     speed_panel_position: str = "left_top"
     speed_panel_left: int = 12
     speed_panel_top: int = 12
     speed_panel_debug: bool = False
     speed_panel_remove_original_toggle: bool = True
-    block_browser_context_menu: bool = True
+    block_browser_context_menu: bool = False
 
 
 def compute_game_window_no(
@@ -611,6 +602,8 @@ class BookmarkRootCandidate:
     child_group_count: int
     order: int
     direct_links: bool = False
+    guid: str = ""
+    parent_path: str = ""
 
     @property
     def display_label(self) -> str:
@@ -762,6 +755,8 @@ def scan_bookmark_root_candidates(
         link_count: int,
         child_group_count: int,
         direct_links: bool,
+        guid: str,
+        parent_path: str,
     ) -> None:
         nonlocal order
         if link_count <= 0:
@@ -778,6 +773,8 @@ def scan_bookmark_root_candidates(
                 child_group_count=child_group_count,
                 order=order,
                 direct_links=direct_links,
+                guid=guid,
+                parent_path=parent_path,
             )
         )
 
@@ -794,10 +791,16 @@ def scan_bookmark_root_candidates(
                 direct_count,
                 0,
                 True,
+                str(node.get("guid") or ""),
+                node_path.rsplit("/children/", 1)[0] if "/children/" in node_path else "",
             )
         if total_count:
             if not (is_root and direct_count and total_count == direct_count):
-                add_candidate(node_path, display_name, total_count, child_group_count, False)
+                add_candidate(
+                    node_path, display_name, total_count, child_group_count, False,
+                    str(node.get("guid") or ""),
+                    node_path.rsplit("/children/", 1)[0] if "/children/" in node_path else "",
+                )
         for index, child in enumerate(node.get("children", [])):
             if not isinstance(child, dict) or child.get("type") != "folder":
                 continue
@@ -1215,63 +1218,4 @@ def _parse_bookmark_no(name: str, max_no: int | None = None) -> int | None:
         return None
     if max_no is None or number <= max_no:
         return number
-    return None
-
-
-def load_csv_accounts(path: str | Path) -> tuple[list[CSVAccount], str | None]:
-    """从 CSV 文件加载方式二账号列表。
-
-    CSV 表头必须为: name,url,username,password
-    行号 = game_window_no（第1行→窗口1）。
-
-    返回 (accounts, error_message)。成功时 error_message 为 None。
-    """
-    path = Path(path)
-    if not path.exists():
-        return [], f"文件不存在: {path}"
-
-    # 尝试常见编码（Windows 中文环境常用 GBK）
-    for encoding in ("utf-8-sig", "gbk", "gb2312", "utf-8"):
-        try:
-            with path.open("r", encoding=encoding, newline="") as f:
-                reader = csv.DictReader(f)
-                fieldnames = reader.fieldnames
-                if fieldnames is None:
-                    return [], "CSV文件为空"
-                expected = ["name", "url", "username", "password"]
-                actual = [h.strip().lower() for h in fieldnames]
-                if actual != expected:
-                    return [], (
-                        "CSV格式错误，第一行必须是 name,url,username,password\n"
-                        f"当前表头: {', '.join(fieldnames)}"
-                    )
-                accounts: list[CSVAccount] = []
-                for idx, row in enumerate(reader, start=1):
-                    name = (row.get("name") or "").strip()
-                    url = (row.get("url") or "").strip()
-                    username = (row.get("username") or "").strip()
-                    password = (row.get("password") or "").strip()
-                    if not name:
-                        continue
-                    missing = []
-                    if not username:
-                        missing.append("username")
-                    if not password:
-                        missing.append("password")
-                    if missing:
-                        accounts.append(CSVAccount(
-                            name=name, url=url, username=username, password=password,
-                            game_window_no=idx, status=f"配置缺失: {', '.join(missing)}"
-                        ))
-                    else:
-                        accounts.append(CSVAccount(
-                            name=name, url=url, username=username, password=password,
-                            game_window_no=idx
-                        ))
-                return accounts, None
-        except (UnicodeDecodeError, UnicodeError):
-            continue
-        except Exception as exc:
-            return [], f"读取CSV失败: {exc}"
-    return [], "CSV编码无法识别，请保存为 UTF-8 或 GBK 编码"
     return None

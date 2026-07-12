@@ -1,7 +1,9 @@
 # 打包发布说明
 
-**当前版本：斗罗大陆H5上号器 v1.3.0 - 发布持久化 + 加速总控稳定版**
+**当前版本：斗罗大陆H5上号器 v1.4.20**
 **最后打包流程更新：2026-05-17，固定使用 `scripts\build_exe.bat`，禁止临时拼 PyInstaller 命令**
+
+发布目录名由 `douluo_launcher/version.py` 中的 `APP_VERSION` 动态生成，不在打包脚本中硬编码版本号。
 
 ---
 
@@ -31,7 +33,7 @@ pip install -r requirements.txt
 ## 2. 打包命令
 
 ```powershell
-cd D:\Ai\codex\上号器
+cd <项目路径>
 .\scripts\build_exe.bat
 ```
 
@@ -57,7 +59,7 @@ cd D:\Ai\codex\上号器
 ## 3. 输出位置
 
 ```
-dist/斗罗大陆H5上号器-v1.3.0/
+dist/斗罗大陆H5上号器-v1.4.20/
 ├── 上号器.exe                ← 主程序
 ├── automation_settings.template.json  ← 自动化配置模板
 ├── dm_click_helper.exe       ← Dm 点击 helper（32 位打包产物）
@@ -74,10 +76,10 @@ dist/斗罗大陆H5上号器-v1.3.0/
 当前发布文件名必须保持中文：
 
 ```text
-dist/斗罗大陆H5上号器-v1.3.0/上号器.exe
+dist/斗罗大陆H5上号器-v1.4.20/上号器.exe
 ```
 
-内部 PyInstaller `--name` 使用英文 `Launcher`，最终发布目录为 `斗罗大陆H5上号器-v1.3.0`。最终用户看到的 exe 文件名仍必须是 `上号器.exe`，窗口标题由 GUI 通过版本号显示 `v1.3.0`。
+内部 PyInstaller `--name` 使用英文 `Launcher`，最终发布目录由 `APP_VERSION` 动态生成为 `斗罗大陆H5上号器-v1.4.20`。最终用户看到的 exe 文件名仍必须是 `上号器.exe`，窗口标题通过同一 `APP_VERSION` 显示 `v1.4.20`。
 
 ---
 
@@ -184,7 +186,7 @@ bookmark_file=
 
 ### 串行批量模式不工作
 
-如果在源码模式下运行，请确认从项目根目录启动：`cd D:\Ai\codex\上号器 && python main.py`。
+如果在源码模式下运行，请确认从项目根目录启动：`cd <项目路径> && python main.py`。
 exe 模式下批量自动走同进程调用，无需额外 Python。
 
 ### 点"全部串行"报 `function() argument 'code' must be code, not str`
@@ -216,12 +218,12 @@ exe 发布包已内置 32 位 `dm_click_helper.exe`，目标电脑不需要安�
 当前打包策略：发布包自带 Playwright Chromium，目录为：
 
 ```text
-dist\斗罗大陆H5上号器-v1.3.0\ms-playwright\chromium-*\chrome-win64\chrome.exe
+dist\斗罗大陆H5上号器-v1.4.20\ms-playwright\chromium-*\chrome-win64\chrome.exe
 ```
 
-打包脚本会从打包机器的 `%LOCALAPPDATA%\ms-playwright` 中选择当前 Playwright 实际需要的一个 Chromium 目录复制到 `dist\斗罗大陆H5上号器-v1.3.0\ms-playwright`。目标机器不需要安装 Playwright 或执行 `playwright install`。
+打包脚本会从打包机器的 `%LOCALAPPDATA%\ms-playwright` 中选择当前 Playwright 实际需要的一个 Chromium 目录复制到 `dist\斗罗大陆H5上号器-v1.4.20\ms-playwright`。目标机器不需要安装 Playwright 或执行 `playwright install`。
 
-当前发布包只允许携带一个 Chromium 目录。打包脚本会读取 Playwright Python 包内的 `driver\package\browsers.json`，识别 `chromium` revision，例如 `chromium-1217`，只复制该目录到 `dist\斗罗大陆H5上号器-v1.3.0\ms-playwright`。如果本机缓存里同时存在旧版本 Chromium，例如 `chromium-1208`，脚本必须排除旧目录；打包后 `dist\斗罗大陆H5上号器-v1.3.0\ms-playwright\chromium-*\chrome-win64\chrome.exe` 必须且只能匹配到 1 个。
+当前发布包只允许携带一个 Chromium 目录。打包脚本会读取 Playwright Python 包内的 `driver\package\browsers.json`，识别 `chromium` revision，例如 `chromium-1217`，只复制该目录到 `dist\斗罗大陆H5上号器-v1.4.20\ms-playwright`。如果本机缓存里同时存在旧版本 Chromium，例如 `chromium-1208`，脚本必须排除旧目录；打包后 `dist\斗罗大陆H5上号器-v1.4.20\ms-playwright\chromium-*\chrome-win64\chrome.exe` 必须且只能匹配到 1 个。
 
 如果打包机器没有本地 Chromium 缓存，脚本会失败并提示先在打包机器执行：
 
@@ -234,3 +236,14 @@ exe 运行时会优先设置 `PLAYWRIGHT_BROWSERS_PATH=<exe所在目录>\ms-play
 ### build_exe.bat 内容异常
 
 已修复并加固：`scripts\build_exe.bat` 必须保持纯 bat 文件，且只作为 ASCII-only 启动器调用 `scripts\build_exe.ps1`。禁止混入 Markdown 文档、未注释说明文字、断裂的 PyInstaller 参数或单独的资源文件名命令。中文说明、中文 exe 名和 PyInstaller 参数由 UTF-8 PowerShell 脚本处理。所有路径必须加双引号或使用 PowerShell 参数数组。禁止通过改英文软件名绕过中文问题。
+
+## v1.4.20 最终正式构建记录（2026-07-12）
+
+- 唯一入口：`scripts\build_exe.bat`，退出码 0。
+- EXE：`dist\斗罗大陆H5上号器-v1.4.20\上号器.exe`
+- 大小：`9,275,918` bytes；SHA-256：`048345665E198BA9E694D5A6D29A63A9DB12327C6367990A162E3B306349B2CB`。
+- 发布目录：`1,916` 文件，`732,038,521` bytes；仅 `chromium-1217` 一份。
+- `dm_click_helper.exe` 存在，PE machine `0x014C`（32 位）。
+- 禁入文件名 0、敏感/开发路径文本命中 0；只携带允许的 `automation_settings.template.json`（发布根和 `_internal` 各一份），不携带真实用户配置。
+- 仓库内 dist/cwd=项目根与仓库外空 cwd 两组隔离启动均存活 12 秒；标题为 `斗罗大陆H5上号器 - 客户端直登批次版 v1.4.20`，临时 APPDATA 无账号、直登链接或 canary，发布目录无新增用户文件。
+- 上述为自动化和烟雾证据，不代表正式 EXE 的 9/31 窗、真实收藏夹或快捷键实机验收完成。

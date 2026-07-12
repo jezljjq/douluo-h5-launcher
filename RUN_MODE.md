@@ -123,7 +123,7 @@
 ### 从源码运行
 
 ```powershell
-cd D:\Ai\codex\上号器
+cd <项目路径>
 python main.py
 ```
 

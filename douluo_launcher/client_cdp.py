@@ -75,19 +75,36 @@ def fetch_json(url: str, *, timeout: float = 2.0) -> object:
         return json.loads(resp.read().decode("utf-8", errors="replace"))
 
 
-def wait_for_cdp_targets(cdp_port: int, *, timeout: float = 30.0) -> list[dict]:
+def wait_for_cdp_targets(
+    cdp_port: int,
+    *,
+    timeout: float = 30.0,
+    request_timeout: float = 2.0,
+) -> list[dict]:
     base = cdp_base_url(cdp_port)
-    deadline = time.time() + float(timeout)
+    deadline = time.monotonic() + max(0.0, float(timeout))
     last_error = ""
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         try:
-            fetch_json(f"{base}/json/version", timeout=2.0)
-            targets = fetch_json(f"{base}/json", timeout=2.0)
+            remaining = max(0.0, deadline - time.monotonic())
+            fetch_json(
+                f"{base}/json/version",
+                timeout=max(0.05, min(float(request_timeout), remaining)),
+            )
+            remaining = max(0.0, deadline - time.monotonic())
+            if remaining <= 0:
+                break
+            targets = fetch_json(
+                f"{base}/json",
+                timeout=max(0.05, min(float(request_timeout), remaining)),
+            )
             if isinstance(targets, list):
                 return targets
         except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
             last_error = repr(exc)
-        time.sleep(0.5)
+        remaining = max(0.0, deadline - time.monotonic())
+        if remaining > 0:
+            time.sleep(min(0.5, remaining))
     raise TimeoutError(f"CDP port {cdp_port} not reachable. Last error: {last_error}")
 
 

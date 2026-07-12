@@ -2,9 +2,11 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from douluo_launcher.config import (
     AccountConfig,
+    AutomationSettings,
     SINGLE_LEVEL_NAME,
     compute_game_window_no,
     default_settings_path,
@@ -16,11 +18,40 @@ from douluo_launcher.config import (
     list_bookmark_top_level_dirs,
     load_accounts_from_bookmarks,
     load_settings,
+    app_root,
+    project_root,
+    source_project_root,
     user_data_dir,
 )
 
 
 class ConfigTests(unittest.TestCase):
+    def test_frozen_roots_stop_at_release_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            executable = Path(tmp) / "repo" / "dist" / "release" / "上号器.exe"
+            executable.parent.mkdir(parents=True)
+            with patch("douluo_launcher.config.sys.frozen", True, create=True), patch(
+                "douluo_launcher.config.sys.executable", str(executable)
+            ):
+                self.assertEqual(app_root(), executable.parent)
+                self.assertEqual(project_root(), executable.parent)
+                self.assertIsNone(source_project_root())
+
+    def test_frozen_user_data_initialization_ignores_cwd_legacy_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            app_dir, cwd, data_dir = root / "release", root / "repo", root / "user"
+            app_dir.mkdir()
+            cwd.mkdir()
+            (cwd / "automation_settings.json").write_text('{"canary":"repo-secret"}', encoding="utf-8")
+            with patch("douluo_launcher.config.sys.frozen", True, create=True):
+                result = initialize_user_data_dir(data_dir=data_dir, app_dir=app_dir, cwd=cwd)
+            self.assertIsNone(result.migrated_settings_from)
+            self.assertNotIn("repo-secret", result.settings_path.read_text(encoding="utf-8"))
+
+    def test_context_menu_blocking_defaults_to_false(self) -> None:
+        self.assertFalse(AutomationSettings().block_browser_context_menu)
+
     def test_user_data_dir_uses_env_override_before_appdata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -378,7 +409,7 @@ class ConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "settings.json"
             path.write_text(
-                '{"bookmark_file": "C:/Users/Administrator/AppData/Local/Microsoft/Edge/User Data/Default/Bookmarks", "bookmark_browser": "Edge", "bookmark_profile": "Default", "bookmark_root_name": "账号", "level_names": ["第一层", "第二层", "第三层", "第四层"], "passport_ocr_region_ratio": [0, 0.75, 1, 1], "qr_passport_ocr_region_ratio": [0, 0.65, 1, 1], "qr_passport_ocr_scale": 4, "passport_region_x_margin": 20, "passport_region_y_offset": 5, "passport_region_height": 45, "notice_close_outside_ratio": [0.08, 0.08], "notice_close_retries": 3, "notice_template_path": "notice.bmp", "passport_dialog_template_path": "dialog.bmp", "notice_visible_text": "公告", "passport_dialog_visible_text": "通行证登录", "login_success_hidden_text": "通行证登录"}',
+                '{"bookmark_file": "C:/Users/Administrator/AppData/Local/Microsoft/Edge/User Data/Default/Bookmarks", "bookmark_browser": "Edge", "bookmark_profile": "Default", "bookmark_root_name": "账号", "bookmark_root_guid": "root-guid", "bookmark_root_path": "roots/bookmark_bar/children/2", "bookmark_root_parent_path": "roots/bookmark_bar", "level_names": ["第一层", "第二层", "第三层", "第四层"], "passport_ocr_region_ratio": [0, 0.75, 1, 1], "qr_passport_ocr_region_ratio": [0, 0.65, 1, 1], "qr_passport_ocr_scale": 4, "passport_region_x_margin": 20, "passport_region_y_offset": 5, "passport_region_height": 45, "notice_close_outside_ratio": [0.08, 0.08], "notice_close_retries": 3, "notice_template_path": "notice.bmp", "passport_dialog_template_path": "dialog.bmp", "notice_visible_text": "公告", "passport_dialog_visible_text": "通行证登录", "login_success_hidden_text": "通行证登录"}',
                 encoding="utf-8",
             )
 
@@ -388,6 +419,9 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(settings.bookmark_browser, "Edge")
         self.assertEqual(settings.bookmark_profile, "Default")
         self.assertEqual(settings.bookmark_root_name, "账号")
+        self.assertEqual(settings.bookmark_root_guid, "root-guid")
+        self.assertEqual(settings.bookmark_root_path, "roots/bookmark_bar/children/2")
+        self.assertEqual(settings.bookmark_root_parent_path, "roots/bookmark_bar")
         self.assertEqual(settings.level_names[1], "第二层")
         self.assertEqual(settings.passport_ocr_region_ratio, (0, 0.75, 1, 1))
         self.assertEqual(settings.qr_passport_ocr_region_ratio, (0, 0.65, 1, 1))
@@ -440,6 +474,22 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(settings.speed_panel_top, 22)
         self.assertTrue(settings.speed_panel_debug)
         self.assertFalse(settings.speed_panel_remove_original_toggle)
+
+    def test_load_settings_accepts_optional_speed_panel_hotkey(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "settings.json"
+            path.write_text('{"speed_panel_hotkey": "Ctrl+Shift+K"}', encoding="utf-8")
+
+            settings = load_settings(path)
+
+        self.assertEqual(settings.speed_panel_hotkey, "Ctrl+Shift+K")
+
+    def test_load_settings_accepts_structured_speed_rate_hotkeys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "settings.json"
+            path.write_text('{"speed_rate_hotkeys":[{"rate":3.0,"hotkey":"Alt+2"}]}', encoding="utf-8")
+            settings = load_settings(path)
+        self.assertEqual(settings.speed_rate_hotkeys, [{"rate": 3.0, "hotkey": "Alt+2"}])
 
     def test_bookmark_candidates_are_metadata_only(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -15,6 +15,161 @@ from douluo_launcher.client_batch_store import (
 
 
 class ClientBatchStoreTests(unittest.TestCase):
+    def test_repair_does_not_match_local_window_by_reused_port_or_generic_title(self) -> None:
+        store = ClientBatchStore(path=Path("unused.json"))
+        store.create_batch("历史批次", scope="本地识别", base_port=9231)
+        binding = ClientBatchBinding(
+            "stable-account",
+            "斗罗大陆H5-1号",
+            pid=100,
+            hwnd=1000,
+            cdp_port=9231,
+            source="local_scan",
+            title="斗罗大陆H5-1号",
+        )
+        store.append_binding(binding)
+        scan = LocalClientScan(
+            pid=200,
+            hwnd=2000,
+            cdp_port=9231,
+            cdp_owner_pid=200,
+            cdp_ownership_status="verified",
+            cdp_available=True,
+            title="斗罗大陆H5-1号",
+        )
+        probe = RepairProbe(
+            pid_exists=lambda _pid: True,
+            process_is_x5game=lambda _pid: True,
+            cdp_available=lambda _port: True,
+            hwnd_for_pid=lambda _pid: 1000,
+            hwnd_valid=lambda _hwnd: True,
+        )
+
+        result = store.repair_current_batch_windows(probe=probe, local_scans=[scan])
+
+        self.assertEqual(result["stable-account"], "scan_missing")
+        self.assertEqual((binding.pid, binding.hwnd), (100, 1000))
+
+    def test_repair_migrates_stale_previous_version_pid_from_historical_hwnd_probe(self) -> None:
+        store = ClientBatchStore(path=Path("unused.json"))
+        store.create_batch("历史批次", scope="本地识别", base_port=9271)
+        binding = ClientBatchBinding(
+            "stable-account",
+            "账号1",
+            pid=100,
+            hwnd=1000,
+            cdp_port=9271,
+            status="客户端已就绪",
+        )
+        store.append_binding(binding)
+        recovered_scan = LocalClientScan(
+            pid=200,
+            hwnd=1000,
+            title="斗罗大陆H5-1号",
+            process_path="X5Game.exe",
+            cdp_port=9271,
+            cdp_owner_pid=200,
+            cdp_ownership_status="verified",
+            cdp_available=True,
+            is_x5game=True,
+        )
+        probe = RepairProbe(
+            pid_exists=lambda pid: int(pid) in {100, 200},
+            process_is_x5game=lambda pid: int(pid) == 200,
+            cdp_available=lambda port: int(port) == 9271,
+            hwnd_for_pid=lambda _pid: 0,
+            hwnd_valid=lambda hwnd: int(hwnd) == 1000,
+            scan_for_hwnd=lambda hwnd: recovered_scan if int(hwnd) == 1000 else None,
+        )
+
+        result = store.repair_current_batch_windows(probe=probe, local_scans=[])
+
+        self.assertEqual(result["stable-account"], "repaired")
+        self.assertEqual((binding.pid, binding.hwnd, binding.cdp_port), (200, 1000, 9271))
+        self.assertEqual(binding.status, "客户端已就绪")
+        self.assertEqual(binding.window_status, "restored")
+        self.assertEqual(binding.repair_status, "repaired")
+
+    def test_repair_rejects_historical_hwnd_when_verified_port_changed(self) -> None:
+        store = ClientBatchStore(path=Path("unused.json"))
+        store.create_batch("历史批次", scope="本地识别", base_port=9271)
+        binding = ClientBatchBinding(
+            "stable-account",
+            "账号1",
+            pid=100,
+            hwnd=1000,
+            cdp_port=9271,
+            status="客户端已就绪",
+        )
+        store.append_binding(binding)
+        recovered_scan = LocalClientScan(
+            pid=200,
+            hwnd=1000,
+            cdp_port=9999,
+            cdp_owner_pid=200,
+            cdp_ownership_status="verified",
+            cdp_available=True,
+            is_x5game=True,
+        )
+        probe = RepairProbe(
+            pid_exists=lambda _pid: True,
+            process_is_x5game=lambda _pid: False,
+            cdp_available=lambda _port: True,
+            hwnd_for_pid=lambda _pid: 0,
+            scan_for_hwnd=lambda _hwnd: recovered_scan,
+        )
+
+        result = store.repair_current_batch_windows(probe=probe, local_scans=[])
+
+        self.assertEqual(result["stable-account"], "pid_not_x5game")
+        self.assertEqual((binding.pid, binding.hwnd, binding.cdp_port), (100, 1000, 9271))
+
+    def test_local_scan_persists_verified_cdp_owner_and_mismatch_status(self) -> None:
+        store = ClientBatchStore(path=Path("unused.json"))
+        scans = [
+            LocalClientScan(
+                pid=200,
+                hwnd=2000,
+                cdp_port=9231,
+                cdp_owner_pid=999,
+                cdp_ownership_status="cdp_owner_mismatch",
+                cdp_available=False,
+                title="斗罗大陆H5-1号",
+            )
+        ]
+
+        store.identify_local_clients(scans)
+        binding = store.current_batch().bindings[0]
+
+        self.assertEqual(binding.cdp_owner_pid, 999)
+        self.assertEqual(binding.cdp_ownership_status, "cdp_owner_mismatch")
+        self.assertEqual(binding.window_status, "cdp_owner_mismatch")
+
+    def test_binding_round_trip_preserves_stable_account_identity_fields(self) -> None:
+        binding = ClientBatchBinding(
+            account_id="local_scan:9222:100:200",
+            account_name="斗罗大陆H5-1号",
+            account_key="存钻-1",
+            refresh_account_name="1",
+            bookmark_path="账号/存钻/1",
+            slot_index=1,
+            identity_status="resolved",
+            link_status="ready",
+            cdp_owner_pid=100,
+            cdp_ownership_status="verified",
+        )
+
+        restored = ClientBatchBinding.from_dict(binding.to_dict())
+
+        self.assertEqual(restored.account_key, "存钻-1")
+        self.assertEqual(restored.refresh_account_name, "1")
+        self.assertEqual(restored.bookmark_path, "账号/存钻/1")
+        self.assertEqual(restored.slot_index, 1)
+        self.assertEqual(restored.identity_status, "resolved")
+        self.assertEqual(restored.link_status, "ready")
+        self.assertEqual(restored.cdp_owner_pid, 100)
+        self.assertEqual(restored.cdp_ownership_status, "verified")
+
     def test_default_sessions_path_uses_appdata_user_data_dir(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             old_appdata = os.environ.get("APPDATA")
@@ -445,6 +600,85 @@ class ClientBatchStoreTests(unittest.TestCase):
         self.assertEqual([binding.cdp_port for binding in store.current_batch().bindings], list(range(9222, 9231)))
         self.assertTrue(any("数量差距较大" in note for note in result["notes"]))
 
+    def test_identify_local_clients_marks_unmatched_history_bindings_missing_when_restoring_subset(self) -> None:
+        store = ClientBatchStore()
+        batch = store.create_batch("全部-31号", scope="本地识别", base_port=9222)
+        for index, port in enumerate(range(9222, 9253), start=1):
+            store.append_binding(
+                ClientBatchBinding(
+                    f"old-{index}",
+                    f"旧{index}",
+                    pid=1000 + index,
+                    hwnd=2000 + index,
+                    cdp_port=port,
+                    status="客户端已就绪",
+                )
+            )
+
+        result = store.identify_local_clients(
+            [
+                LocalClientScan(
+                    pid=1000 + index,
+                    hwnd=2000 + index,
+                    title=f"斗罗大陆H5-{index}号",
+                    cdp_port=9221 + index,
+                    cdp_available=True,
+                )
+                for index in range(1, 30)
+            ]
+        )
+
+        self.assertEqual(result["restored_batches"], 1)
+        self.assertEqual(result["ready"], 29)
+        self.assertEqual(result["abnormal"], 2)
+        self.assertEqual(len(batch.bindings), 31)
+        self.assertEqual([binding.status for binding in batch.bindings[:29]], ["客户端已就绪"] * 29)
+        self.assertEqual([binding.status for binding in batch.bindings[29:]], ["未找到", "未找到"])
+        self.assertEqual([binding.window_status for binding in batch.bindings[29:]], ["scan_missing", "scan_missing"])
+        self.assertTrue(any("当前扫描 29 个，历史绑定 31 个，就绪 29 个，异常 2 个" in note for note in result["notes"]))
+
+    def test_repair_current_batch_requires_match_in_current_scan(self) -> None:
+        store = ClientBatchStore()
+        batch = store.create_batch("全部-31号", scope="本地识别", base_port=9222)
+        for index, port in enumerate(range(9222, 9253), start=1):
+            store.append_binding(
+                ClientBatchBinding(
+                    f"old-{index}",
+                    f"旧{index}",
+                    pid=1000 + index,
+                    hwnd=2000 + index,
+                    cdp_port=port,
+                    status="客户端已就绪",
+                )
+            )
+        scans = [
+            LocalClientScan(
+                pid=1000 + index,
+                hwnd=2000 + index,
+                title=f"斗罗大陆H5-{index}号",
+                cdp_port=9221 + index,
+                cdp_available=True,
+            )
+            for index in range(1, 30)
+        ]
+
+        results = store.repair_current_batch_windows(
+            probe=RepairProbe(
+                pid_exists=lambda pid: True,
+                process_is_x5game=lambda pid: True,
+                cdp_available=lambda port: True,
+                hwnd_for_pid=lambda pid: 1000 + int(pid),
+                hwnd_valid=lambda hwnd: True,
+            ),
+            local_scans=scans,
+        )
+
+        self.assertEqual(len(results), 31)
+        self.assertEqual(list(results.values()).count("repaired"), 29)
+        self.assertEqual(list(results.values()).count("scan_missing"), 2)
+        self.assertEqual([binding.status for binding in batch.bindings[:29]], ["客户端已就绪"] * 29)
+        self.assertEqual([binding.status for binding in batch.bindings[29:]], ["未找到", "未找到"])
+
     def test_identify_local_clients_creates_new_batch_when_history_is_subset_of_large_scan(self) -> None:
         store = ClientBatchStore()
         old_batch = store.create_batch("当前桌面识别-9窗-端口9222~9230", scope="本地识别", base_port=9222)
@@ -584,7 +818,7 @@ class ClientBatchStoreTests(unittest.TestCase):
         self.assertEqual(result["restored_batches"], 0)
         self.assertEqual(result["created_batches"], 1)
         self.assertEqual([len(batch.bindings) for batch in store.batches], [9, 9])
-        self.assertTrue(any("推断端口" in note for note in result["notes"]))
+        self.assertTrue(any("pid/hwnd 集合不同" in note for note in result["notes"]))
 
     def test_identify_local_clients_puts_unknown_windows_in_unassigned_batch(self) -> None:
         store = ClientBatchStore()

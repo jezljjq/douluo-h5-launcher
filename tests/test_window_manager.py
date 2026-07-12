@@ -10,6 +10,7 @@ if sys.platform != "win32":
 
 from douluo_launcher.window_manager import (  # noqa: E402
     GameWindow,
+    RowTileConfig,
     SlotEnvironment,
     SlotLayoutParams,
     TileConfig,
@@ -29,12 +30,41 @@ from douluo_launcher.window_manager import (  # noqa: E402
     is_game_window,
     sort_game_windows,
     tile_game_windows,
+    tile_game_windows_by_row_count,
     _write_window_detection_diagnostics,
     window_slots_profile_path,
 )
 
 
 class WindowManagerTests(unittest.TestCase):
+    def test_row_tile_preserves_ninth_slot_and_full_nine_window_size(self) -> None:
+        window = GameWindow(9009, "斗罗大陆H5-9号", 9, WindowRect(1, 2, 300, 400))
+        config = RowTileConfig(per_row=3, start_x=0, start_y=0, gap_x=0, gap_y=0)
+
+        with mock.patch("douluo_launcher.window_manager.get_screen_work_area", return_value=WindowRect(0, 0, 900, 900)), mock.patch(
+            "douluo_launcher.window_manager.get_full_screen_size", return_value=(900, 900)
+        ), mock.patch("douluo_launcher.window_manager._set_window_pos_with_retries", return_value=(True, "")) as move:
+            results = tile_game_windows_by_row_count(
+                config,
+                windows=[window],
+                slot_indexes=[8],
+                layout_window_count=9,
+            )
+
+        self.assertEqual((results[0].x, results[0].y, results[0].width, results[0].height), (600, 600, 300, 300))
+        self.assertEqual(move.call_args_list[-1].args[1:5], (600, 600, 300, 300))
+
+    def test_fixed_tile_preserves_middle_gap_without_backfilling(self) -> None:
+        windows = [
+            GameWindow(1001, "斗罗大陆H5-1号", 1, WindowRect(1, 2, 300, 400)),
+            GameWindow(1003, "斗罗大陆H5-3号", 3, WindowRect(1, 2, 300, 400)),
+        ]
+        config = TileConfig(width=300, height=400, start_x=10, start_y=20, offset_x=310, offset_y=410, per_row=3)
+
+        with mock.patch("douluo_launcher.window_manager._set_window_pos_with_retries", return_value=(True, "")):
+            results = tile_game_windows(config, windows=windows, slot_indexes=[0, 2], layout_window_count=3)
+
+        self.assertEqual([(result.x, result.y) for result in results], [(10, 20), (630, 20)])
     def test_extract_window_number(self) -> None:
         self.assertEqual(extract_window_number("斗罗大陆H5-1号"), 1)
         self.assertEqual(extract_window_number("斗罗大陆H5-1号-扫码登录"), 1)

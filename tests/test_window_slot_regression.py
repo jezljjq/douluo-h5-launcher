@@ -333,15 +333,14 @@ class WindowSlotRegressionTests(unittest.TestCase):
     def test_table_values_stay_aligned_with_declared_columns(self) -> None:
         account = AccountConfig("存钻", 2, 2, "https://example.com/z2", bookmark_title="z2", include_in_all=True)
 
-        values = _account_table_values(account, passport="14332db4", status="成功", timing="2.4s")
+        values = _account_table_values(account, window_title="斗罗大陆H5-2号", passport="14332db4", status="成功", timing="2.4s")
 
         self.assertEqual(set(ACCOUNT_TABLE_COLUMN_INDEX), set(ACCOUNT_TABLE_COLUMNS))
         self.assertEqual(len(values), len(ACCOUNT_TABLE_COLUMNS))
         row = dict(zip(ACCOUNT_TABLE_COLUMNS, values, strict=True))
         self.assertEqual(row["include_in_all"], "是")
-        self.assertEqual(row["passport"], "14332db4")
+        self.assertEqual(row["window_title"], "斗罗大陆H5-2号")
         self.assertEqual(row["status"], "成功")
-        self.assertEqual(row["timing"], "2.4s")
 
     def test_bookmark_custom_group_order_and_include_in_all_are_independent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

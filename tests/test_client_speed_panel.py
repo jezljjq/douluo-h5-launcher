@@ -7,9 +7,12 @@ from douluo_launcher.client_speed_panel import (
     build_hide_original_speed_overlay_script,
     build_speed_new_document_script,
     build_speed_navigation_guard_script,
+    build_speed_tree_toggle_script,
     apply_speed_rate_to_cdp,
     install_speed_navigation_guard,
+    native_speed_ui_result_from_payload,
     process_client_speed_panel,
+    SPEED_TREE_PANEL_SCRIPT,
 )
 
 
@@ -26,22 +29,31 @@ class FakeCdp:
 
 
 class ClientSpeedPanelTests(unittest.TestCase):
+    def test_tree_root_drag_is_clamped_and_does_not_trigger_click(self) -> None:
+        source = SPEED_TREE_PANEL_SCRIPT
+
+        self.assertIn("root.addEventListener('pointerdown'", source)
+        self.assertIn("Math.hypot(dx, dy) < 5", source)
+        self.assertIn("window.innerWidth - panel.offsetWidth", source)
+        self.assertIn("window.innerHeight - panel.offsetHeight", source)
+        self.assertIn("if (suppressClick)", source)
+        self.assertNotIn("localStorage.setItem('h5_speed_panel_position", source)
     def test_after_navigate_default_stage_only_hides_original_overlay(self) -> None:
-        cdp = FakeCdp(results=[{"hidden": True}])
+        cdp = FakeCdp(results=[{"status": "dom_removed", "domRemovedCount": 1}])
         logs: list[str] = []
 
         process_client_speed_panel(cdp, ClientSpeedPanelConfig(), trigger_stage="after_navigate", log=logs.append)
 
         self.assertEqual(len(cdp.expressions), 1)
         self.assertIn("请选择加速倍率", cdp.expressions[0])
-        self.assertIn("[客户端直登] 原加速浮层隐藏：隐藏数量=1", logs)
+        self.assertIn("[客户端直登] 网页原生加速入口处理：status=dom_removed count=1 css_hidden=0", logs)
 
     def test_after_game_ready_injects_timer_hook_panel(self) -> None:
         cdp = FakeCdp(
             results=[
-                {"hidden": False, "observerInstalled": True},
+                {"status": "not_found", "observerInstalled": True},
                 {"ok": True, "engine": "timer_hook", "panel": "speed-hack-panel", "current": 1.0},
-                {"hidden": True, "hiddenCount": 1, "observerInstalled": False},
+                {"status": "dom_removed", "domRemovedCount": 1, "observerInstalled": False},
             ]
         )
         logs: list[str] = []
@@ -52,7 +64,7 @@ class ClientSpeedPanelTests(unittest.TestCase):
         self.assertIn(CUSTOM_SPEED_PANEL_ID, cdp.expressions[1])
         self.assertIn("__H5_SPEED_HOOK_INSTALLED__", cdp.expressions[1])
         self.assertIn("__H5_HIDE_ORIGINAL_SPEED_PANEL_STRONG__", cdp.expressions[2])
-        self.assertIn("[客户端直登] 原加速浮层隐藏：隐藏数量=1", logs)
+        self.assertIn("[客户端直登] 网页原生加速入口处理：status=dom_removed count=1 css_hidden=0", logs)
 
     def test_disabled_options_skip_matching_evaluate_calls(self) -> None:
         cdp = FakeCdp()
@@ -82,19 +94,33 @@ class ClientSpeedPanelTests(unittest.TestCase):
         self.assertEqual(len(cdp.expressions), 3)
         self.assertIn("__H5_SPEED_HOOK_INSTALLED__", cdp.expressions[1])
 
-    def test_navigation_guard_blocks_context_menu_when_enabled(self) -> None:
+    def test_navigation_guard_never_blocks_context_menu_even_for_legacy_true_config(self) -> None:
         script = build_speed_navigation_guard_script(ClientSpeedPanelConfig(block_browser_context_menu=True))
 
         self.assertIn("__H5_SPEED_NAV_GUARD_INSTALLED__", script)
-        self.assertIn("contextmenu", script)
-        self.assertIn("preventDefault", script)
-        self.assertIn("__H5_HIDE_ORIGINAL_SPEED_PANEL_STRONG__", script)
+        self.assertNotIn("contextmenu", script)
+        self.assertNotIn("preventDefault", script)
+        self.assertIn("__H5_HANDLE_NATIVE_SPEED_UI__", script)
 
     def test_navigation_guard_does_not_block_context_menu_when_disabled(self) -> None:
         script = build_speed_navigation_guard_script(ClientSpeedPanelConfig(block_browser_context_menu=False))
 
         self.assertIn("__H5_SPEED_NAV_GUARD_INSTALLED__", script)
         self.assertNotIn("preventDefault", script)
+
+    def test_navigation_guard_recovers_after_bfcache_and_document_root_replacement(self) -> None:
+        script = build_speed_navigation_guard_script(ClientSpeedPanelConfig())
+
+        self.assertIn("'pageshow'", script)
+        self.assertIn("'popstate'", script)
+        self.assertIn("scheduleSpeedNavigationGuards", script)
+        self.assertIn("new MutationObserver(scheduleSpeedNavigationGuards)", script)
+        self.assertIn("__H5_SPEED_NAV_ROOT_OBSERVER__", script)
+        self.assertIn("__H5_HANDLE_NATIVE_SPEED_UI__", script)
+        self.assertIn("__H5_SPEED_ENSURE_PANEL__", script)
+
+    def test_context_menu_blocking_defaults_to_false(self) -> None:
+        self.assertFalse(ClientSpeedPanelConfig().block_browser_context_menu)
 
     def test_install_navigation_guard_uses_new_document_script_and_current_page(self) -> None:
         class GuardCdp(FakeCdp):
@@ -174,6 +200,60 @@ class ClientSpeedPanelTests(unittest.TestCase):
         self.assertIn("grid-template-columns: repeat(2, minmax(64px, 1fr))", script)
         self.assertIn("gap: 8px 10px", script)
 
+    def test_tree_panel_replaces_legacy_large_panel_with_real_branches(self) -> None:
+        script = SPEED_TREE_PANEL_SCRIPT
+
+        self.assertIn("speed-tree-branches::before", script)
+        self.assertIn("speed-tree-item::before", script)
+        self.assertIn(">1x</button>", script)
+        self.assertIn("data-speed-step=\"up\"", script)
+        self.assertIn("data-speed-step=\"down\"", script)
+        for rate in ("1", "2", "5", "50", "500"):
+            self.assertIn(f'data-speed-rate="{rate}"', script)
+        for legacy_id in ("speed-input-field", "speed-apply-btn", "speed-reset-btn", "speed-panel-close-btn", "speed-panel-resize-handle"):
+            self.assertNotIn(legacy_id, script)
+
+    def test_tree_panel_only_persists_and_highlights_after_apply_ok(self) -> None:
+        script = SPEED_TREE_PANEL_SCRIPT
+
+        success_block = script.split("window.__H5_SPEED_APPLY__ = function(rate)", 1)[1].split("return result;", 1)[0]
+        self.assertIn("result && result.ok === true", success_block)
+        self.assertIn("saveRate(applied)", success_block)
+        self.assertIn("updateHighlight", success_block)
+        self.assertIn("PRESETS = [1, 2, 5, 50, 500]", script)
+        self.assertIn("Math.max(0.1", script)
+        self.assertIn("__H5_SPEED_TREE_OBSERVER_INSTALLED__", script)
+        self.assertIn("current.dataset.speedTreePanel === '1'", script)
+        self.assertNotIn("confirm(", script)
+        self.assertNotIn("alert(", script)
+
+    def test_tree_root_displays_real_rate_and_steps_by_numeric_rules(self) -> None:
+        script = SPEED_TREE_PANEL_SCRIPT
+
+        self.assertIn("function formatRate", script)
+        self.assertIn("root.textContent = `${formatRate(current)}x`", script)
+        self.assertIn("current < 1", script)
+        self.assertIn("current === 1 ? 0.9", script)
+        self.assertIn("Math.max(0.1", script)
+        self.assertNotIn("const nextIndex = Math.max(0, Math.min(PRESETS.length - 1", script)
+
+    def test_tree_panel_opens_only_from_root_click_not_mouse_hover(self) -> None:
+        script = SPEED_TREE_PANEL_SCRIPT
+
+        self.assertIn("root.addEventListener('click'", script)
+        self.assertNotIn("panel.addEventListener('mouseenter', () => setExpanded(panel, true))", script)
+        self.assertIn("panel.addEventListener('mouseenter', cancelScheduledCollapse)", script)
+        self.assertIn("panel.addEventListener('mouseleave', () => scheduleCollapse(panel))", script)
+        self.assertIn("function cancelScheduledCollapse()", script)
+        self.assertIn("panel.matches(':hover')", script)
+
+    def test_tree_panel_toggle_script_does_not_change_rate(self) -> None:
+        script = build_speed_tree_toggle_script()
+
+        self.assertIn("__H5_SPEED_TREE_TOGGLE__", script)
+        self.assertNotIn("__H5_SPEED_APPLY__", script)
+        self.assertNotIn("data-speed-rate", script)
+
     def test_injected_js_hooks_time_functions_once_and_exposes_api(self) -> None:
         script = build_custom_speed_panel_script(ClientSpeedPanelConfig())
 
@@ -185,6 +265,14 @@ class ClientSpeedPanelTests(unittest.TestCase):
         self.assertIn("window.__H5_SPEED_APPLY__", script)
         self.assertIn("window.__H5_SPEED_GET__", script)
         self.assertIn("window.__H5_SPEED_ENSURE_PANEL__", script)
+
+    def test_timer_hook_core_scaling_algorithm_remains_unchanged(self) -> None:
+        script = build_custom_speed_panel_script(ClientSpeedPanelConfig())
+
+        self.assertIn("baseFakeTimeDate + (currentReal - baseRealTimeDate) * speedMultiplier", script)
+        self.assertIn("baseFakeTimePerf + (currentReal - baseRealTimePerf) * speedMultiplier", script)
+        self.assertIn("safeDelay / speedMultiplier", script)
+        self.assertIn("callback(performance.now())", script)
 
     def test_injected_js_is_idempotent_and_close_only_hides_panel(self) -> None:
         script = build_custom_speed_panel_script(ClientSpeedPanelConfig())
@@ -213,17 +301,15 @@ class ClientSpeedPanelTests(unittest.TestCase):
         self.assertIn("tagName === 'HTML'", script)
         self.assertIn("isProtectedNode(node)", script)
 
-    def test_hide_script_installs_global_function_observer_and_timer_fallback(self) -> None:
+    def test_hide_script_installs_single_debounced_observer_without_permanent_scan(self) -> None:
         script = build_hide_original_speed_overlay_script()
 
         self.assertIn("window.__H5_HIDE_ORIGINAL_SPEED_PANEL__", script)
         self.assertIn("window.__H5_HIDE_ORIGINAL_SPEED_PANEL_STRONG__", script)
         self.assertIn("__H5_ORIGINAL_SPEED_HIDE_OBSERVER_INSTALLED__", script)
-        self.assertIn("new MutationObserver", script)
-        self.assertIn("setInterval", script)
-        self.assertIn("500", script)
-        self.assertIn("2000", script)
-        self.assertIn("window.__H5_HIDE_ORIGINAL_SPEED_PANEL_STRONG__();", script)
+        self.assertEqual(script.count("new MutationObserver"), 1)
+        self.assertNotIn("setInterval", script)
+        self.assertIn("window.__H5_HANDLE_NATIVE_SPEED_UI__();", script)
 
     def test_hide_script_skips_custom_speed_panel_and_reopen_button(self) -> None:
         script = build_hide_original_speed_overlay_script()
@@ -328,21 +414,43 @@ class ClientSpeedPanelTests(unittest.TestCase):
         self.assertIn("TOGGLE_REMOVE_ORIGINAL = false", script)
         self.assertIn("style.setProperty('display', 'none', 'important')", script)
 
-    def test_hide_script_observer_and_timers_call_toggle_hide(self) -> None:
+    def test_hide_script_uses_one_combined_handler_for_overlay_and_toggle(self) -> None:
         script = build_hide_original_speed_overlay_script()
 
-        self.assertGreaterEqual(script.count("window.__H5_HIDE_ORIGINAL_SPEED_TOGGLE__();"), 4)
-        self.assertIn("window.__H5_HIDE_ORIGINAL_SPEED_PANEL_STRONG__();", script)
-        self.assertIn("__H5_ORIGINAL_SPEED_TOGGLE_SUPPRESSOR_INSTALLED__", script)
-        self.assertIn("30000", script)
-        self.assertIn("300", script)
+        self.assertIn("window.__H5_HANDLE_NATIVE_SPEED_UI__", script)
+        self.assertNotIn("__H5_ORIGINAL_SPEED_TOGGLE_SUPPRESSOR_INSTALLED__", script)
+        self.assertNotIn("__H5_ORIGINAL_SPEED_HIDE_SLOW_TIMER__", script)
+        self.assertNotIn("__H5_ORIGINAL_SPEED_TOGGLE_SLOW_TIMER__", script)
 
     def test_hide_script_runs_toggle_on_dom_ready_without_user_click(self) -> None:
         script = build_hide_original_speed_overlay_script()
 
         self.assertIn("DOMContentLoaded", script)
-        self.assertIn("runToggleSuppression", script)
+        self.assertIn("window.__H5_HANDLE_NATIVE_SPEED_UI__", script)
         self.assertNotIn(".click()", script)
+
+    def test_native_speed_ui_result_model_distinguishes_all_states(self) -> None:
+        payloads = [
+            ({"status": "dom_removed", "domRemovedCount": 2}, "dom_removed"),
+            ({"status": "css_hidden", "cssHiddenCount": 1}, "css_hidden"),
+            ({"status": "not_found"}, "not_found"),
+            ({"status": "non_dom", "nonDom": True}, "non_dom"),
+            ({"status": "failed", "reason": "boom"}, "failed"),
+        ]
+
+        self.assertEqual(
+            [native_speed_ui_result_from_payload(payload).status for payload, _expected in payloads],
+            [expected for _payload, expected in payloads],
+        )
+
+    def test_hide_script_reports_dom_remove_and_css_fallback_without_confusing_them(self) -> None:
+        script = build_hide_original_speed_overlay_script()
+
+        self.assertIn("return 'dom_removed'", script)
+        self.assertIn("return 'css_hidden'", script)
+        self.assertIn("status,", script)
+        self.assertIn("domRemovedCount", script)
+        self.assertIn("cssHiddenCount", script)
 
     def test_speed_panel_debug_false_omits_candidate_detail_logs(self) -> None:
         cdp = FakeCdp(results=[{
@@ -353,7 +461,7 @@ class ClientSpeedPanelTests(unittest.TestCase):
 
         process_client_speed_panel(cdp, ClientSpeedPanelConfig(speed_panel_debug=False), trigger_stage="after_navigate", log=logs.append)
 
-        self.assertIn("[客户端直登] 原加速浮层隐藏：未发现候选", logs)
+        self.assertIn("[客户端直登] 网页原生加速入口处理：status=not_found", logs)
         self.assertFalse(any("候选1 path=" in item for item in logs))
 
     def test_speed_panel_debug_true_outputs_candidate_summaries(self) -> None:
@@ -391,8 +499,8 @@ class ClientSpeedPanelTests(unittest.TestCase):
 
     def test_toggle_logs_count_and_debug_candidate_summary(self) -> None:
         cdp = FakeCdp(results=[{
-            "hidden": False,
-            "toggleHidden": True,
+            "status": "dom_removed",
+            "domRemovedCount": 1,
             "toggleHiddenCount": 1,
             "toggleCandidates": [{
                 "path": "body>div.rocket",
@@ -405,7 +513,7 @@ class ClientSpeedPanelTests(unittest.TestCase):
 
         process_client_speed_panel(cdp, ClientSpeedPanelConfig(speed_panel_debug=True), trigger_stage="after_navigate", log=logs.append)
 
-        self.assertIn("[客户端直登] 已隐藏原加速器入口按钮，数量=1", logs)
+        self.assertIn("[客户端直登] 网页原生加速入口处理：status=dom_removed count=1 css_hidden=0", logs)
         self.assertTrue(any("原加速器入口候选 path=body>div.rocket" in item for item in logs))
         self.assertFalse(any("secret" in item for item in logs))
 
@@ -415,7 +523,7 @@ class ClientSpeedPanelTests(unittest.TestCase):
 
         process_client_speed_panel(cdp, ClientSpeedPanelConfig(), trigger_stage="after_navigate", log=logs.append)
 
-        self.assertIn("[客户端直登] 原加速器入口按钮未命中 DOM，可能是 canvas/native overlay。", logs)
+        self.assertIn("[客户端直登] 网页原生加速入口处理：status=non_dom", logs)
 
 
 if __name__ == "__main__":

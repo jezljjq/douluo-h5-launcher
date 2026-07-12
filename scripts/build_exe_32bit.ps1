@@ -11,6 +11,14 @@ function Step([string]$Message) {
     Write-Host $Message -ForegroundColor Cyan
 }
 
+function Get-AppVersion() {
+    $version = (& py -3.14-32 -c "from douluo_launcher.version import APP_VERSION; print(APP_VERSION)")
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($version)) {
+        Fail "Unable to read APP_VERSION from douluo_launcher/version.py"
+    }
+    return ($version | Select-Object -First 1).Trim()
+}
+
 function Remove-IfExists([string]$Path) {
     if (Test-Path -LiteralPath $Path) {
         Remove-Item -LiteralPath $Path -Recurse -Force
@@ -83,7 +91,8 @@ Set-Location $ProjectRoot
 
 $AppName = -join @([char]0x4E0A, [char]0x53F7, [char]0x5668)
 $InternalBuildName = "Launcher"
-$ReleaseDirName = "斗罗大陆H5上号器-v1.3.0"
+$AppVersion = Get-AppVersion
+$ReleaseDirName = "斗罗大陆H5上号器-v$AppVersion"
 $DistParent = Join-Path $ProjectRoot "dist"
 $DistDir = Join-Path $DistParent $ReleaseDirName
 $InternalExePath = Join-Path $DistDir "$InternalBuildName.exe"
@@ -199,6 +208,7 @@ $PyInstallerArgs = @(
     "--hidden-import", "win32gui",
     "--hidden-import", "win32con",
     "--hidden-import", "playwright.sync_api",
+    "--hidden-import", "requests",
     "--hidden-import", "douluo_launcher",
     "--hidden-import", "douluo_launcher.config",
     "--hidden-import", "douluo_launcher.automation",

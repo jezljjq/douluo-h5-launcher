@@ -520,7 +520,6 @@ def _extract_clipboard_hex(text: str) -> str | None:
 class AccountRunner:
     # 坐标缓存（类级别，同尺寸窗口共享）
     _cached_btn: tuple[int, int] | None = None
-    _cached_btn_m2: tuple[int, int] | None = None  # 方式二独立缓存
     _cached_input: tuple[int, int] | None = None
     _cached_confirm: tuple[int, int] | None = None
     _cached_dialog_window_size: tuple[int, int] | None = None
@@ -1146,245 +1145,6 @@ class AccountRunner:
         self.log(f"[窗口{self.account.game_window_no}] 统一校验结果: unknown，需要重登")
         return "unknown"
 
-    # ===== 方式二：账号密码 + 通行证上号 =====
-
-    def run_method2(self, csv_account, verify_after_submit: bool = True) -> bool:
-        """方式二入口：账号密码登录 + 通行证上号。"""
-        from .config import AccountConfig
-        import time as _time
-        _timings: dict[str, float] = {}
-        _saved_account = self.account
-        self.last_fast_submit_result = "failed"
-        self.account = AccountConfig(
-            level="方式二", bookmark_no=0,
-            game_window_no=csv_account.game_window_no, url=csv_account.url
-        )
-
-        max_attempts = 2 if verify_after_submit else 1
-        for retry in range(max_attempts):
-            _t_start = _time.perf_counter()
-            _timings.clear()
-            playwright = None
-            browser = None
-            try:
-                # === 步骤1：OCR 提取通行证 ===
-                _t0 = _time.perf_counter()
-                self._ensure_not_stopped()
-                self.update_status(self.account, "OCR中")
-                self.log(f"[方式二] 从登录程序窗口提取通行证 (窗口{csv_account.game_window_no})")
-                passport, source = self._extract_passport_from_login_window()
-                if not passport:
-                    if source == "logged_in":
-                        self.last_fast_submit_result = "already_logged_in"
-                        self.update_status(self.account, "已登录，跳过")
-                        self.log("[方式二] 检测到已登录界面，跳过")
-                        _timings["总计"] = _time.perf_counter() - _t_start
-                        self._log_timings(_timings)
-                        return True
-                    # 二次确认
-                    time.sleep(0.5)
-                    passport2, source2 = self._extract_passport_from_login_window()
-                    if passport2:
-                        passport = passport2
-                        source = source2
-                    elif source2 == "logged_in":
-                        self.last_fast_submit_result = "already_logged_in"
-                        self.update_status(self.account, "已登录，跳过")
-                        _timings["总计"] = _time.perf_counter() - _t_start
-                        self._log_timings(_timings)
-                        return True
-                if not passport:
-                    raise RuntimeError(f"通行证识别失败（页面状态={source}）")
-                _timings["OCR"] = _time.perf_counter() - _t0
-                self.log(f"[方式二] 通行证: {passport} (来源={source})")
-                self.update_status(self.account, "已提取通行证")
-
-                # === 步骤2：打开浏览器 + 账号密码登录 ===
-                _t1 = _time.perf_counter()
-                self.update_status(self.account, "打开中")
-                self.log(f"[方式二] 打开链接: {csv_account.url}")
-                self._prepare_playwright_runtime()
-                _subprocess.Popen = _original_popen
-                try:
-                    from playwright.sync_api import sync_playwright
-                finally:
-                    _subprocess.Popen = _NoConsolePopen
-
-                playwright = sync_playwright().start()
-                launcher = getattr(playwright, self.settings.browser)
-                browser = launcher.launch(
-                    headless=False,
-                    args=[
-                        f"--window-size={self.settings.window_width},{self.settings.window_height}",
-                        "--window-position=100,100",
-                    ],
-                )
-                page = browser.new_page(
-                    viewport={"width": self.settings.window_width, "height": self.settings.window_height}
-                )
-                page.goto(csv_account.url, wait_until="domcontentloaded", timeout=self.settings.page_load_timeout_ms)
-                self.log(f"[方式二] 页面已打开: {page.title}")
-
-                if not self._detect_login_form(page):
-                    raise RuntimeError("未检测到账号密码登录界面")
-                self.update_status(self.account, "输入中")
-                self._fill_and_submit_login(page, csv_account.username, csv_account.password)
-                self.log(f"[方式二] 账号密码已提交 (username={csv_account.username}, password=已填写)")
-
-                if not self._wait_game_page_ready(page):
-                    raise RuntimeError("登录后未进入正式游戏页")
-                self.log("[方式二] 已进入游戏页面")
-                _timings["打开页面"] = _time.perf_counter() - _t1
-
-                # === 步骤3：关闭公告（多点几次确保公告消失） ===
-                _t2 = _time.perf_counter()
-                self.update_status(self.account, "关闭公告")
-                self._close_m2_notice(page)
-                self.update_status(self.account, "已关闭公告")
-                self.log("[方式二] 公告已关闭")
-                _timings["关闭公告"] = _time.perf_counter() - _t2
-                self._wait_or_stop(page, self.settings.after_notice_wait_ms)
-                self._ensure_not_stopped()
-
-                # === 步骤4+5+6：按钮+输入+确认（方式二独立模板匹配，不套用方式一坐标） ===
-                _t_btn = _time.perf_counter()
-                browser_hwnd = self._find_game_browser_window()
-                if browser_hwnd is None:
-                    raise RuntimeError("未找到浏览器窗口")
-                self._write_browser_pos(browser_hwnd)
-                viewport_key = self._get_browser_viewport_size(browser_hwnd)
-
-                cache_key = (self.settings.window_width, self.settings.window_height)
-                # 方式二通行证按钮位置不同，必须独立模板匹配
-                button_used_cache = False
-                button_source = "unknown"
-                button_match_score: float | None = None
-                if AccountRunner._cached_window_size == cache_key and AccountRunner._cached_btn_m2:
-                    btn_pos = AccountRunner._cached_btn_m2
-                    button_used_cache = True
-                    button_source = "memory_cache_m2"
-                    self.log(f"[方式二] 使用方式二缓存按钮坐标: {btn_pos}")
-                else:
-                    _client = self._capture_browser_client(browser_hwnd, "m2_button_match.png")
-                    # 保存方式二浏览器截图供手动分析（不清理）
-                    try:
-                        _ref_path = self._debug_dir / "m2_browser_screenshot.png"
-                        _client.save(str(_ref_path))
-                        self.log(f"[方式二] 浏览器截图已保存: {_ref_path}")
-                    except Exception:
-                        pass
-                    if self._m2_notice_overlay_visible(_client):
-                        raise RuntimeError("方式二公告仍未关闭，停止定位通行证按钮")
-                    btn_pos, button_match_score, button_source = self._locate_passport_button_with_details(
-                        _client,
-                        use_fallback=False,
-                    )
-                    if btn_pos:
-                        AccountRunner._cached_btn_m2 = btn_pos
-                        AccountRunner._cached_window_size = cache_key
-                        self.log(
-                            f"[方式二] 模板匹配定位按钮: {btn_pos} "
-                            f"score={button_match_score:.3f}（已缓存到方式二）"
-                        )
-                    else:
-                        raise RuntimeError("方式二通行证按钮模板匹配失败，请检查模板文件")
-                btn_vx, btn_vy = btn_pos
-
-                input_x, input_y, confirm_x, confirm_y = self._click_passport_button_with_retry(
-                    browser_hwnd,
-                    (btn_vx, btn_vy),
-                    "方式二",
-                    viewport_key,
-                    button_used_cache,
-                    button_source,
-                    button_match_score,
-                )
-
-                self.update_status(self.account, "输入中")
-                self.log(f"[方式二] 输入通行证并点击确认: {passport}")
-                if not self._dm_chain(
-                    [f"click,{input_x},{input_y},80",
-                     f"type,{passport}",
-                     f"click,{confirm_x},{confirm_y},100"],
-                    "输入+确认"
-                ):
-                    raise RuntimeError("Dm 输入+确认失败")
-                self.update_status(self.account, "已输入通行证")
-                self.log("[方式二] 输入+确认完成（Dm 合并调用）")
-                _timings["点击按钮"] = _time.perf_counter() - _t_btn
-
-                if not verify_after_submit:
-                    time.sleep(0.3)
-                    self.last_fast_submit_result = "submitted"
-                    self.update_status(self.account, "待复核")
-                    _timings["校验"] = 0
-                    _timings["总计"] = _time.perf_counter() - _t_start
-                    self._log_timings(_timings)
-                    self.log(
-                        f"[窗口{csv_account.game_window_no}] 方式二提交完成，等待统一校验"
-                    )
-                    self._clean_tmp()
-                    return True
-
-                # === 步骤7：校验 ===
-                _t_verify = _time.perf_counter()
-                self.log("[方式二] 校验登录程序窗口：检测QR页面是否消失")
-                verified_success = False
-                _verify_deadline = time.perf_counter() + 10.0
-                _poll = 0
-                while time.perf_counter() < _verify_deadline:
-                    self._ensure_not_stopped()
-                    time.sleep(0.2)
-                    state = self._quick_login_state()
-                    if state == "logged_in":
-                        verified_success = True
-                        break
-                    if _poll >= 5 and _poll % 15 == 0 and state == "qr_page":
-                        p_after, _ = self._extract_passport_from_login_window()
-                        if p_after is not None and p_after != passport:
-                            break
-                    _poll += 1
-
-                if verified_success:
-                    self.update_status(self.account, "成功")
-                    _timings["校验"] = _time.perf_counter() - _t_verify
-                    _timings["总计"] = _time.perf_counter() - _t_start
-                    self._log_timings(_timings)
-                    self.log("[方式二] 登录成功（QR码消失）")
-                    self._clean_tmp()
-                    return True
-                if retry == 0:
-                    self.log("[方式二] 校验超时QR未消失，重试整流程")
-                    self._clean_tmp()
-                    continue
-                raise RuntimeError("校验超时，QR页面未消失")
-
-            except Exception as exc:
-                self.update_status(self.account, "失败")
-                self.log(f"[方式二] 失败: {exc}")
-                self._save_error_snapshots()
-                if retry + 1 < max_attempts:
-                    self.log("[方式二] 异常，重试整流程")
-                    continue
-                self.last_timings = {}
-                return False
-            finally:
-                self.account = _saved_account
-                if browser is not None:
-                    time.sleep(2)
-                    try:
-                        browser.close()
-                    except Exception:
-                        pass
-                if playwright is not None:
-                    try:
-                        playwright.stop()
-                    except Exception:
-                        pass
-
-        self.last_timings = {}
-        return False
-
     def _detect_login_form(self, page) -> bool:
         """检测页面是否包含账号密码登录表单。返回 True/False。"""
         import time as _time
@@ -1427,7 +1187,7 @@ class AccountRunner:
         username_input.click()
         _time.sleep(0.15)
         username_input.fill(username)
-        self.log(f"[方式二] 账号已输入 (username={username})")
+        self.log("[账号登录] 账号已输入")
 
         # 2. 定位密码输入框（placeholder="密码" 或 input[type=password]）
         password_input = None
@@ -1445,7 +1205,7 @@ class AccountRunner:
         password_input.click()
         _time.sleep(0.15)
         password_input.fill(password)
-        self.log("[方式二] 密码已输入 (password=已填写)")
+        self.log("[账号登录] 密码已输入")
 
         # 3. 点击"立即登录"按钮（右侧橙色按钮，不要点"手机注册"）
         _time.sleep(0.2)
@@ -1474,7 +1234,7 @@ class AccountRunner:
         if login_btn is None:
             raise RuntimeError("未找到\"立即登录\"按钮")
         login_btn.click()
-        self.log("[方式二] 已点击\"立即登录\"")
+        self.log("[账号登录] 已点击\"立即登录\"")
 
     def _wait_game_page_ready(self, page) -> bool:
         """等待登录成功后进入正式游戏页。返回 True/False。"""
@@ -3904,12 +3664,9 @@ class AccountRunner:
         viewport_key: tuple[int, int] | None,
         label: str,
     ) -> None:
-        if label == "方式二":
-            AccountRunner._cached_btn_m2 = None
-        else:
-            AccountRunner._cached_btn = None
-            if viewport_key is not None:
-                self._remove_passport_dialog_coord_cache(viewport_key)
+        AccountRunner._cached_btn = None
+        if viewport_key is not None:
+            self._remove_passport_dialog_coord_cache(viewport_key)
         AccountRunner._cached_input = None
         AccountRunner._cached_confirm = None
         AccountRunner._cached_dialog_window_size = None
@@ -4200,10 +3957,7 @@ class AccountRunner:
                     context["retry_match_pos"] = match_pos
                     context["retry_match_score"] = match_score
                     context["retry_match_source"] = match_source
-                    if label == "方式二":
-                        AccountRunner._cached_btn_m2 = match_pos
-                    else:
-                        AccountRunner._cached_btn = match_pos
+                    AccountRunner._cached_btn = match_pos
                     AccountRunner._cached_window_size = (
                         self.settings.window_width,
                         self.settings.window_height,
@@ -4583,41 +4337,6 @@ class AccountRunner:
             )
         return center
 
-    def _close_m2_notice(self, page) -> None:
-        width = int(self.settings.window_width)
-        height = int(self.settings.window_height)
-        points = [
-            (width - 15, 15, "右上角关闭"),
-            (int(width * 0.495), int(height * 0.897), "底部圆形关闭"),
-            (int(width * 0.08), int(height * 0.08), "公告外区域"),
-            (740, 680, "历史关闭坐标"),
-        ]
-
-        for attempt in range(1, max(1, self.settings.notice_close_retries) + 2):
-            self._ensure_not_stopped()
-            image = self._capture_page_image(page, f"m2_notice_before_{attempt}.png")
-            if image is not None and not self._m2_notice_overlay_visible(image):
-                self.log(f"[方式二] 公告检测：未发现遮挡弹窗（第{attempt}次检查）")
-                return
-
-            self.log(f"[方式二] 尝试关闭公告（第{attempt}次）")
-            for x, y, label in points:
-                if 0 <= x < width and 0 <= y < height:
-                    self.log(f"[方式二] 点击公告关闭候选：{label} ({x},{y})")
-                    page.mouse.click(x, y)
-                    self._wait_or_stop(page, 180)
-
-            self._wait_or_stop(page, 300)
-            image = self._capture_page_image(page, f"m2_notice_after_{attempt}.png")
-            if image is not None and not self._m2_notice_overlay_visible(image):
-                self.log(f"[方式二] 公告关闭成功（第{attempt}次）")
-                return
-            if attempt <= self.settings.notice_close_retries:
-                self.log("[方式二] 公告仍存在，继续重试")
-
-        self._capture_page_image(page, "m2_notice_still_visible.png")
-        raise RuntimeError("方式二公告关闭失败")
-
     def _capture_page_image(self, page, file_name: str | None = None):
         try:
             import io
@@ -4633,44 +4352,8 @@ class AccountRunner:
                     pass
             return image
         except Exception as exc:
-            self.log(f"[方式二] 公告截图检测失败: {exc}")
+            self.log(f"[账号登录] 页面截图检测失败: {exc}")
             return None
-
-    @staticmethod
-    def _m2_notice_overlay_visible(image) -> bool:
-        import numpy as np
-
-        arr = np.array(image.convert("RGB"))
-        height, width = arr.shape[:2]
-        center = arr[int(height * 0.08): int(height * 0.90), int(width * 0.26): int(width * 0.74)]
-        if center.size == 0:
-            return False
-
-        r_arr = arr[:, :, 0].astype(int)
-        g_arr = arr[:, :, 1].astype(int)
-        b_arr = arr[:, :, 2].astype(int)
-        center_r = center[:, :, 0].astype(int)
-        center_g = center[:, :, 1].astype(int)
-        center_b = center[:, :, 2].astype(int)
-
-        bright_center = (
-            (center_r > 210)
-            & (center_g > 190)
-            & (center_b > 160)
-            & (abs(center_r - center_g) < 70)
-        )
-        orange_center = (
-            (center_r > 180)
-            & (center_g > 45)
-            & (center_g < 130)
-            & (center_b < 90)
-        )
-        dark_page = (r_arr < 70) & (g_arr < 70) & (b_arr < 70)
-
-        bright_ratio = float(bright_center.mean())
-        orange_ratio = float(orange_center.mean())
-        dark_ratio = float(dark_page.mean())
-        return bright_ratio > 0.16 and orange_ratio > 0.006 and dark_ratio > 0.30
 
     def _locate_passport_button_with_details(
         self,

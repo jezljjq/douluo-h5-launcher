@@ -10,15 +10,15 @@ from unittest import mock
 import douluo_launcher.gui as gui_module
 from douluo_launcher.config import AccountConfig
 from douluo_launcher.client_direct_login import ClientDirectRunRecord
+from douluo_launcher.client_cdp_ownership import CdpOwnershipResult
 from douluo_launcher.client_batch_store import ClientBatchBinding, ClientBatchStore
+from douluo_launcher.client_speed_control import SpeedApplyResult
 from douluo_launcher.background_login import BackgroundDependencyCheck, BackgroundLoginResult
+from douluo_launcher.direct_link_refresh import DirectLinkStore
 from douluo_launcher.gui import (
     ACCOUNT_TABLE_COLUMN_INDEX,
     ACCOUNT_TABLE_COLUMNS,
-    RUN_MODE_BACKGROUND_LABEL,
     RUN_MODE_CLIENT_DIRECT_LABEL,
-    RUN_MODE_FOREGROUND_LABEL,
-    BACKGROUND_SERIAL_CONCURRENCY,
     CLIENT_DIRECT_LOGIN_SCOPE_PENDING,
     GUI_DEFAULT_HEIGHT,
     GUI_DEFAULT_WIDTH,
@@ -48,64 +48,297 @@ from douluo_launcher.gui import (
 )
 from douluo_launcher.config import BookmarkCandidate, BookmarkRootCandidate
 from douluo_launcher.path_utils import ResolvedGamePath
-from douluo_launcher.window_manager import TileConfig, WindowRect
+from douluo_launcher.window_manager import GameWindow, RowTileConfig, TileConfig, WindowRect
+
+
+# Historical labels are retained only inside legacy regression inputs.  The
+# production GUI no longer defines or restores these modes.
+RUN_MODE_BACKGROUND_LABEL = "后台登录模式（已移除）"
+RUN_MODE_FOREGROUND_LABEL = "前台辅助模式（已移除）"
+BACKGROUND_SERIAL_CONCURRENCY = 1
 
 
 class GuiGroupSettingsTests(unittest.TestCase):
-    def test_work_mode_choices_show_account_password_and_client_direct_by_default(self) -> None:
-        self.assertEqual(
-            gui_module.RUN_MODE_CHOICES,
-            (gui_module.RUN_MODE_ACCOUNT_PASSWORD_LABEL, RUN_MODE_CLIENT_DIRECT_LABEL),
+    def test_local_scan_discovers_cdp_from_window_process_owner_without_candidate_ports(self) -> None:
+        windows = [
+            SimpleNamespace(hwnd=101, title="斗罗大陆H5-1号", rect=WindowRect(1, 2, 300, 400)),
+            SimpleNamespace(hwnd=102, title="斗罗大陆H5-2号", rect=WindowRect(5, 6, 300, 400)),
+        ]
+        fake = SimpleNamespace(client_batch_store=SimpleNamespace(batches=[]), logs=[])
+        fake._wm_game_exe_path_filter = lambda: r"E:\Program Files\DLH5\X5Game.exe"
+        fake._log = fake.logs.append
+
+        def discover(hwnd: int, pid: int, **_kwargs):
+            port = 9555 if hwnd == 101 else 9666
+            return CdpOwnershipResult("verified", hwnd=hwnd, window_pid=pid, port=port, owner_pid=pid)
+
+        with mock.patch("douluo_launcher.gui.list_game_windows", return_value=windows), mock.patch(
+            "douluo_launcher.gui.get_window_process_id", side_effect={101: 201, 102: 202}.get
+        ), mock.patch(
+            "douluo_launcher.gui.get_process_path_by_pid", return_value=r"E:\Program Files\DLH5\X5Game.exe"
+        ), mock.patch(
+            "douluo_launcher.gui.discover_window_cdp_endpoint", side_effect=discover, create=True
+        ) as ownership_discovery, mock.patch(
+            "douluo_launcher.gui.wait_for_cdp_targets",
+            return_value=[{"webSocketDebuggerUrl": "ws://127.0.0.1/devtools/page/1"}],
+        ), mock.patch(
+            "douluo_launcher.gui.select_page_target",
+            return_value={"webSocketDebuggerUrl": "ws://127.0.0.1/devtools/page/1"},
+        ), mock.patch("douluo_launcher.gui.list_tcp_listeners_by_port", return_value={}), mock.patch(
+            "douluo_launcher.gui.list_process_parents", return_value={}
+        ):
+            scans = LauncherApp._scan_local_client_direct_clients(fake)
+
+        self.assertEqual([scan.cdp_port for scan in scans], [9555, 9666])
+        self.assertTrue(all(scan.cdp_available for scan in scans))
+        self.assertTrue(all(not scan.cdp_port_inferred for scan in scans))
+        self.assertEqual([(call.args[0], call.args[1]) for call in ownership_discovery.call_args_list], [(101, 201), (102, 202)])
+
+    def test_local_scan_blocks_every_binding_when_verified_port_is_duplicated(self) -> None:
+        windows = [
+            SimpleNamespace(hwnd=101, title="斗罗大陆H5-1号", rect=WindowRect(1, 2, 300, 400)),
+            SimpleNamespace(hwnd=102, title="斗罗大陆H5-2号", rect=WindowRect(5, 6, 300, 400)),
+        ]
+        fake = SimpleNamespace(logs=[])
+        fake._wm_game_exe_path_filter = lambda: r"E:\Program Files\DLH5\X5Game.exe"
+        fake._log = fake.logs.append
+
+        def discover(hwnd: int, pid: int, **_kwargs):
+            return CdpOwnershipResult("verified", hwnd=hwnd, window_pid=pid, port=9555, owner_pid=pid)
+
+        with mock.patch("douluo_launcher.gui.list_game_windows", return_value=windows), mock.patch(
+            "douluo_launcher.gui.get_window_process_id", side_effect={101: 201, 102: 202}.get
+        ), mock.patch(
+            "douluo_launcher.gui.get_process_path_by_pid", return_value=r"E:\Program Files\DLH5\X5Game.exe"
+        ), mock.patch(
+            "douluo_launcher.gui.discover_window_cdp_endpoint", side_effect=discover
+        ), mock.patch(
+            "douluo_launcher.gui.wait_for_cdp_targets",
+            return_value=[{"webSocketDebuggerUrl": "ws://127.0.0.1/devtools/page/1"}],
+        ), mock.patch(
+            "douluo_launcher.gui.select_page_target",
+            return_value={"webSocketDebuggerUrl": "ws://127.0.0.1/devtools/page/1"},
+        ), mock.patch("douluo_launcher.gui.list_tcp_listeners_by_port", return_value={}), mock.patch(
+            "douluo_launcher.gui.list_process_parents", return_value={}
+        ):
+            scans = LauncherApp._scan_local_client_direct_clients(fake)
+
+        self.assertEqual([scan.cdp_port for scan in scans], [0, 0])
+        self.assertEqual([scan.cdp_ownership_status for scan in scans], ["cdp_owner_conflict"] * 2)
+
+    def test_local_scan_batch_maps_nine_current_group_accounts_by_unique_slots(self) -> None:
+        accounts = [
+            AccountConfig("存钻", index, index, f"https://bookmark.invalid/{index}", bookmark_title=str(index))
+            for index in range(1, 10)
+        ]
+        bindings = [
+            ClientBatchBinding(
+                account_id=f"local_scan:{9221 + index}:{1000 + index}:{2000 + index}",
+                account_name=f"斗罗大陆H5-{index}号",
+                cdp_port=9221 + index,
+                source="local_scan",
+                title=f"斗罗大陆H5-{index}号",
+                slot_index=index,
+            )
+            for index in range(1, 10)
+        ]
+        batch = SimpleNamespace(bindings=bindings, scope="本地识别", base_port=9222)
+        owner = SimpleNamespace(accounts=accounts)
+
+        resolution = gui_module._resolve_client_direct_batch_accounts(owner, batch, accounts)
+
+        self.assertEqual(resolution.status, "resolved")
+        self.assertEqual([account.key for account in resolution.accounts], [account.key for account in accounts])
+        self.assertEqual([binding.account_key for binding in bindings], [account.key for account in accounts])
+        self.assertEqual([binding.account_id for binding in bindings], [account.key for account in accounts])
+        self.assertEqual([binding.slot_index for binding in bindings], list(range(1, 10)))
+
+    def test_local_scan_slot_mapping_uses_account_library_order_not_ui_argument_order(self) -> None:
+        accounts = [AccountConfig("存钻", index, index, "/", bookmark_title=str(index)) for index in range(1, 4)]
+        bindings = [
+            ClientBatchBinding(f"local_scan:{index}", f"窗口{index}", source="local_scan", slot_index=index)
+            for index in range(1, 4)
+        ]
+        batch = SimpleNamespace(bindings=bindings, scope="本地识别", base_port=9222)
+
+        resolution = gui_module._resolve_client_direct_batch_accounts(
+            SimpleNamespace(accounts=accounts),
+            batch,
+            list(reversed(accounts)),
         )
-        self.assertNotIn(RUN_MODE_BACKGROUND_LABEL, gui_module.RUN_MODE_CHOICES)
+
+        self.assertEqual(resolution.status, "resolved")
+        self.assertEqual([binding.account_key for binding in bindings], [account.key for account in accounts])
+
+    def test_local_scan_batch_maps_then_injects_latest_urls_for_all_nine_slots(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            direct_links_path = Path(temp_dir) / "direct_links.enc.json"
+            accounts = [
+                AccountConfig("存钻", index, index, "/", bookmark_title=str(index))
+                for index in range(1, 10)
+            ]
+            bindings = [
+                ClientBatchBinding(
+                    account_id=f"local_scan:{9221 + index}:{1000 + index}:{2000 + index}",
+                    account_name=f"斗罗大陆H5-{index}号",
+                    cdp_port=9221 + index,
+                    source="local_scan",
+                    title=f"斗罗大陆H5-{index}号",
+                    slot_index=index,
+                    login_url="/",
+                )
+                for index in range(1, 10)
+            ]
+            batch = SimpleNamespace(bindings=bindings, scope="本地识别", base_port=9222)
+            batch_store = SimpleNamespace(batches=[batch], current_batch=lambda: batch, save=mock.Mock())
+            owner = SimpleNamespace(
+                accounts=accounts,
+                refresh_direct_links_path=direct_links_path,
+                client_batch_store=batch_store,
+                client_direct_bindings={},
+                _log=mock.Mock(),
+            )
+            link_store = DirectLinkStore(direct_links_path)
+            link_store.links = {
+                f"refresh-row-{index}": {
+                    "direct_url": f"https://latest.invalid/login/{index}",
+                    "bookmark_path": f"账号/存钻/{index}",
+                    "expire_hint": "2099-01-01T00:00:00+00:00",
+                }
+                for index, account in enumerate(accounts, start=1)
+            }
+            link_store.save()
+
+            resolution = gui_module._resolve_client_direct_batch_accounts(owner, batch, accounts)
+            resolved = gui_module._inject_latest_client_direct_urls(owner, resolution.accounts)
+
+            self.assertEqual(resolution.status, "resolved")
+            self.assertTrue(all(account.url.startswith("https://latest.invalid/login/") for account in resolved))
+            self.assertTrue(all(binding.login_url != "/" for binding in bindings))
+            self.assertTrue(all(binding.link_status == "ready" for binding in bindings))
+            self.assertEqual([binding.account_key for binding in bindings], [account.key for account in accounts])
+
+    def test_local_scan_batch_rejects_count_mismatch_without_guessing_identity(self) -> None:
+        accounts = [AccountConfig("存钻", index, index, "https://bookmark.invalid") for index in range(1, 9)]
+        bindings = [
+            ClientBatchBinding(
+                account_id=f"local_scan:{index}",
+                account_name=f"斗罗大陆H5-{index}号",
+                source="local_scan",
+                slot_index=index,
+            )
+            for index in range(1, 10)
+        ]
+        original_ids = [binding.account_id for binding in bindings]
+        batch = SimpleNamespace(bindings=bindings, scope="本地识别", base_port=9222)
+
+        resolution = gui_module._resolve_client_direct_batch_accounts(SimpleNamespace(accounts=accounts), batch, accounts)
+
+        self.assertEqual(resolution.status, "count_mismatch")
+        self.assertEqual([binding.account_id for binding in bindings], original_ids)
+
+    def test_local_scan_batch_rejects_duplicate_slot(self) -> None:
+        accounts = [AccountConfig("存钻", 1, 1, "u1"), AccountConfig("存钻", 2, 2, "u2")]
+        bindings = [
+            ClientBatchBinding("local_scan:1", "窗口A", source="local_scan", slot_index=1),
+            ClientBatchBinding("local_scan:2", "窗口B", source="local_scan", slot_index=1),
+        ]
+        batch = SimpleNamespace(bindings=bindings, scope="本地识别", base_port=9222)
+
+        resolution = gui_module._resolve_client_direct_batch_accounts(SimpleNamespace(accounts=accounts), batch, accounts)
+
+        self.assertEqual(resolution.status, "slot_conflict")
+        self.assertTrue(all(binding.account_id.startswith("local_scan:") for binding in bindings))
+
+    def test_history_batch_resolves_by_stable_account_key_not_window_title(self) -> None:
+        account = AccountConfig("存钻", 1, 1, "https://bookmark.invalid", bookmark_title="账号一")
+        binding = ClientBatchBinding(
+            account_id="legacy-local-id",
+            account_name="斗罗大陆H5-1号",
+            account_key=account.key,
+            source="local_scan",
+            slot_index=1,
+        )
+        batch = SimpleNamespace(bindings=[binding], scope="本地识别", base_port=9222)
+
+        resolution = gui_module._resolve_client_direct_batch_accounts(
+            SimpleNamespace(accounts=[account]), batch, []
+        )
+
+        self.assertEqual(resolution.status, "resolved")
+        self.assertEqual(resolution.accounts, [account])
+        self.assertEqual(binding.account_id, account.key)
+
+    def test_client_launch_throttle_stops_queued_launch_without_waiting_for_interval(self) -> None:
+        now = [0.0]
+        sleeps: list[float] = []
+        stop_event = threading.Event()
+        throttle = gui_module._ClientLaunchThrottle(
+            interval=1.0,
+            clock=lambda: now[0],
+            sleep=lambda seconds: (sleeps.append(seconds), now.__setitem__(0, now[0] + seconds)),
+        )
+
+        self.assertTrue(throttle.wait(stop_event))
+        stop_event.set()
+        self.assertFalse(throttle.wait(stop_event))
+        self.assertEqual(sleeps, [])
+
+    def _local_scans_for_batch(self, batch):
+        return [
+            gui_module.LocalClientScan(
+                pid=int(binding.pid or 0),
+                hwnd=int(binding.hwnd or 0),
+                title=str(binding.title or binding.account_name or ""),
+                cdp_port=int(binding.cdp_port or 0),
+                cdp_available=True,
+            )
+            for binding in getattr(batch, "bindings", []) or []
+            if str(getattr(binding, "status", "")) != "pid_missing"
+        ]
+
+    def test_work_mode_only_keeps_client_direct(self) -> None:
         source = inspect.getsource(LauncherApp._build_widgets)
         self.assertIn("text=\"工作模式\"", source)
         self.assertIn("indicatoron=False", source)
-        self.assertIn("self.run_mode_account_password_btn", source)
         self.assertIn("self.run_mode_client_btn", source)
-        self.assertIn("self.run_mode_foreground_btn", source)
+        self.assertNotIn("run_mode_account_password_btn", source)
+        self.assertNotIn("run_mode_foreground_btn", source)
         self.assertNotIn("self.run_mode_box = ttk.Combobox", source)
         self.assertLess(
-            source.index("self.run_mode_account_password_btn"),
-            source.index("self.run_mode_client_btn"),
-        )
-        self.assertLess(
             source.index('text="工作模式"'),
-            source.index('text="读取收藏夹 / 账号配置"'),
+            source.index('text="账号配置"'),
         )
 
-    def test_foreground_mode_entry_is_hidden_by_default_as_legacy_compat(self) -> None:
+    def test_foreground_and_method2_entries_are_deleted(self) -> None:
         source = Path("douluo_launcher/gui.py").read_text(encoding="utf-8")
 
-        self.assertIn("self.run_mode_foreground_btn.pack_forget()", source)
-        self.assertIn("旧版兼容", source)
-        self.assertIn("账号密码登录模式", source)
+        for removed in ("run_mode_foreground_btn", "旧版兼容", "旧方式二", "method2", "csv_accounts"):
+            self.assertNotIn(removed, source)
 
-    def test_account_password_mode_does_not_show_legacy_method_labels_by_default(self) -> None:
+    def test_account_source_is_refresh_library_only(self) -> None:
         source = inspect.getsource(LauncherApp._build_widgets)
 
-        self.assertNotIn("方式一：通行证上号", source)
-        self.assertNotIn("方式二：账号密码 + 通行证上号", source)
-        self.assertIn("当前模式：账号密码登录模式，使用账号密码配置，通过原方式二流程登录。", source)
+        self.assertIn("账号来源：刷新地址账号库", source)
+        self.assertIn('text="账号管理"', source)
+        self.assertNotIn("自动查找收藏夹", source)
+        self.assertNotIn("读取账号", source)
 
-    def test_legacy_passport_mode_hidden_by_default(self) -> None:
-        source = inspect.getsource(LauncherApp._sync_account_source_controls)
-
-        self.assertIn("show_legacy_method_row", source)
-        self.assertIn("self.method_row.grid_remove()", source)
-        self.assertIn("旧版通行证上号（兼容）", inspect.getsource(LauncherApp._build_widgets))
-
-    def test_account_password_mode_still_uses_original_method2_value(self) -> None:
+    def test_startup_loads_refresh_account_library_without_scanning_removed_bookmark_ui(self) -> None:
         fake = SimpleNamespace(
-            method_var=SimpleNamespace(value="", set=lambda value: setattr(fake.method_var, "value", value), get=lambda: fake.method_var.value),
-            calls=[],
+            _load_accounts=mock.Mock(),
+            _refresh_bookmark_root_candidates=mock.Mock(),
         )
-        fake._on_run_mode_changed = lambda: fake.calls.append("changed")
 
-        LauncherApp._on_account_password_run_mode_changed(fake)
+        LauncherApp._load_default_config_if_present(fake)
 
-        self.assertEqual(fake.method_var.value, "method2")
-        self.assertEqual(fake.calls, ["changed"])
+        fake._load_accounts.assert_called_once_with()
+        fake._refresh_bookmark_root_candidates.assert_not_called()
+
+    def test_advanced_configuration_state_and_callbacks_are_deleted(self) -> None:
+        source = Path("douluo_launcher/gui.py").read_text(encoding="utf-8")
+        for removed in ("advanced_config_visible", "_toggle_advanced_config", "_method1_advanced_frame", "_current_level_counts"):
+            self.assertNotIn(removed, source)
 
     def test_window_manager_layout_uses_aligned_sections(self) -> None:
         source = inspect.getsource(LauncherApp._build_widgets)
@@ -113,16 +346,17 @@ class GuiGroupSettingsTests(unittest.TestCase):
         self.assertIn('text="游戏程序："', source)
         self.assertIn('self.wm_game_path_row', source)
         self.assertIn('self.wm_compact_frame', source)
-        self.assertIn('text="提示："', source)
-        self.assertIn('text="布局参数："', source)
-        self.assertIn('text="标题设置："', source)
-        self.assertIn('text="窗口操作："', source)
-        self.assertIn('self.wm_legacy_launch_frame', source)
+        self.assertIn('text="标题模板"', source)
+        self.assertIn('text="自动编号标题"', source)
+        self.assertIn('text="禁止超宽"', source)
+        self.assertNotIn('text="窗口操作："', source)
+        self.assertNotIn('self.wm_legacy_launch_frame', source)
+        self.assertNotIn('text="批量启动窗口"', source)
 
     def test_account_table_height_shows_rows_not_only_header(self) -> None:
         source = inspect.getsource(LauncherApp._build_widgets)
 
-        self.assertIn('text="读取收藏夹 / 账号配置"', source)
+        self.assertIn('text="账号配置"', source)
         self.assertIn('text="账号范围用于决定本批客户端数量和登录账号。"', source)
         self.assertIn('text="账号列表 / 当前账号来源"', source)
         self.assertIn("height=10", source)
@@ -132,7 +366,7 @@ class GuiGroupSettingsTests(unittest.TestCase):
 
         self.assertIn("client_direct_buttons = (", source)
         self.assertIn('("准备客户端", 14, self._prepare_client_direct_current_scope, 0, 0)', source)
-        self.assertIn('("执行客户端登录", 16, self._login_prepared_client_direct_current_scope, 0, 4)', source)
+        self.assertIn('("执行登录并进入游戏", 18, self._login_prepared_client_direct_current_scope, 0, 4)', source)
         self.assertIn('("修复本批窗口", 14, self._repair_client_direct_current_batch, 0, 0)', source)
         self.assertIn('("识别本地客户端", 16, self._identify_local_client_direct_clients, 0, 1)', source)
         self.assertIn('("关闭本批客户端", 14, self._close_client_direct_current_batch, 0, 3)', source)
@@ -166,24 +400,20 @@ class GuiGroupSettingsTests(unittest.TestCase):
         self.assertIn("self.client_direct_delete_batch_btn", source)
         self.assertIn("self.client_direct_cleanup_batches_btn", source)
 
-    def test_client_direct_port_setting_lives_in_advanced_config(self) -> None:
+    def test_client_direct_port_setting_is_internal_only(self) -> None:
         source = inspect.getsource(LauncherApp._build_widgets)
 
-        self.assertIn('text="端口设置"', source)
-        self.assertIn("self.client_direct_base_port_spin", source)
-        self.assertIn("self._method1_advanced_frame", source)
+        self.assertNotIn('text="端口设置"', source)
+        self.assertNotIn("client_direct_base_port_spin", source)
+        self.assertIn('text="预计端口范围："', source)
 
-    def test_client_speed_panel_settings_live_in_advanced_config(self) -> None:
+    def test_client_speed_panel_fixed_settings_are_not_exposed(self) -> None:
         source = inspect.getsource(LauncherApp._build_widgets)
 
-        self.assertIn('text="加速面板"', source)
-        self.assertIn('text="替换网页加速浮层"', source)
-        self.assertIn('text="显示自定义变速器"', source)
-        self.assertIn('text="原浮层诊断日志"', source)
-        self.assertIn('text="删除原入口按钮"', source)
-        self.assertIn("self.default_speed_rate_var", source)
-        self.assertIn("self.speed_panel_position_var", source)
-        self.assertIn("self._method1_advanced_frame", source)
+        for removed in ("替换网页加速浮层", "显示自定义变速器", "原浮层诊断日志", "删除原入口按钮", "default_speed_rate_var"):
+            self.assertNotIn(removed, source)
+        self.assertIn('text="快捷键设置"', source)
+        self.assertNotIn("client_speed_hotkey_row", source)
 
     def test_client_speed_panel_options_default_rate_falls_back_to_one(self) -> None:
         class Var:
@@ -213,8 +443,139 @@ class GuiGroupSettingsTests(unittest.TestCase):
         self.assertEqual(options["speed_hook_stage"], "after_game_ready")
         self.assertTrue(options["speed_panel_debug"])
         self.assertFalse(options["speed_panel_remove_original_toggle"])
-        self.assertTrue(options["block_browser_context_menu"])
+        self.assertFalse(options["block_browser_context_menu"])
         self.assertEqual(fake.default_speed_rate_var.value, "1.0")
+
+    def test_speed_rate_hotkey_confirm_registers_persists_and_closes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings_path = Path(tmp) / "automation_settings.json"
+            settings_path.write_text('{"bookmark_file": "keep"}', encoding="utf-8")
+            listener = mock.Mock()
+            listener.replace.return_value = (True, "已注册 4 组加速器快捷键")
+            dialog = mock.Mock()
+            def var(value):
+                return SimpleNamespace(get=lambda: value)
+            variables = [(var("3"), var("Alt"), var("2")), (var("6"), var("Alt"), var("3")), (var("20"), var("Alt"), var("4")), (var("50"), var("Alt"), var("5"))]
+            fake = SimpleNamespace(
+                speed_rate_hotkeys=[],
+                _speed_hotkey_listener=listener,
+                settings_path=SimpleNamespace(get=lambda: str(settings_path)),
+                logs=[],
+            )
+            fake._log = fake.logs.append
+
+            self.assertTrue(LauncherApp._confirm_speed_hotkey_settings(fake, dialog, variables))
+            saved = gui_module.json.loads(settings_path.read_text(encoding="utf-8"))
+
+        listener.replace.assert_called_once()
+        self.assertEqual(saved["bookmark_file"], "keep")
+        self.assertEqual(saved["speed_panel_hotkey"], "")
+        self.assertEqual(saved["speed_rate_hotkeys"][1], {"rate": 6.0, "hotkey": "Alt+3"})
+        dialog.destroy.assert_called_once()
+
+    def test_speed_rate_hotkey_save_failure_restores_old_registration_and_keeps_dialog(self) -> None:
+        def var(value):
+            return SimpleNamespace(get=lambda: value)
+        variables = [(var("3"), var("Alt"), var("2")), (var("6"), var("Alt"), var("3")), (var("20"), var("Alt"), var("4")), (var("50"), var("Alt"), var("5"))]
+        old_rows = [{"rate": 2.0, "hotkey": "Ctrl+2"}]
+        listener = mock.Mock()
+        listener.replace.side_effect = [(True, "new ok"), (True, "old restored")]
+        fake = SimpleNamespace(speed_rate_hotkeys=old_rows, _speed_hotkey_listener=listener, logs=[])
+        fake._log = fake.logs.append
+        dialog = mock.Mock()
+        with mock.patch.object(LauncherApp, "_save_speed_rate_hotkeys", side_effect=OSError("disk full")), \
+             mock.patch("douluo_launcher.gui.messagebox.showerror"):
+            self.assertFalse(LauncherApp._confirm_speed_hotkey_settings(fake, dialog, variables))
+        self.assertEqual(listener.replace.call_args_list[1].args[0], old_rows)
+        self.assertEqual(fake.speed_rate_hotkeys, old_rows)
+        dialog.destroy.assert_not_called()
+
+    def test_speed_rate_hotkey_worker_uses_real_binding_rates_and_scope(self) -> None:
+        records = [
+            ClientDirectRunRecord("a1", "账号1", pid=1234, hwnd=5678, cdp_port=9222),
+            ClientDirectRunRecord("a2", "账号2", pid=1235, hwnd=5679, cdp_port=9223),
+        ]
+        fake = SimpleNamespace(
+            _speed_hotkey_toggle_lock=threading.Lock(),
+            client_speed_control_scope_var=SimpleNamespace(get=lambda: "当前批次"),
+            default_speed_rate_var=SimpleNamespace(get=lambda: "1.0", set=lambda _value: None),
+            logs=[],
+        )
+        fake._log = fake.logs.append
+        fake._queue_log = fake.logs.append
+        applied_rates = []
+
+        with mock.patch.object(LauncherApp, "_client_speed_control_scope_bindings", return_value=records) as scoped, \
+             mock.patch.object(LauncherApp, "_client_speed_control_skip_reason", return_value=""), \
+             mock.patch.object(LauncherApp, "_apply_client_speed_to_binding", side_effect=lambda _self, _record, rate, _config: applied_rates.append(rate) or SpeedApplyResult(True, "applied", "ok")):
+            LauncherApp._speed_rate_hotkey_worker(fake, 5.0)
+            self.assertEqual(applied_rates, [5.0, 5.0])
+            records[0].speed_rate = records[1].speed_rate = 5.0
+            LauncherApp._speed_rate_hotkey_worker(fake, 5.0)
+
+        self.assertEqual(scoped.call_count, 2)
+        self.assertEqual(applied_rates, [5.0, 5.0, 1.0, 1.0])
+        self.assertTrue(any("成功=2" in line for line in fake.logs))
+
+    def test_speed_hotkey_controls_live_under_speed_control_not_account_config(self) -> None:
+        source = inspect.getsource(LauncherApp._build_widgets)
+        account_start = source.index('account_config_frame = ttk.LabelFrame')
+        run_start = source.index('run_frame = ttk.LabelFrame')
+        speed_start = source.index('self.client_speed_control_row = ttk.Frame')
+        hotkey_start = source.index('text="快捷键设置"')
+        self.assertNotIn("client_speed_hotkey_row", source)
+        self.assertGreater(hotkey_start, speed_start)
+        self.assertEqual(source.count("client_speed_control_scope_var"), 1)
+
+    def test_speed_hotkey_dialog_has_four_rows_confirm_and_cancel(self) -> None:
+        source = inspect.getsource(LauncherApp._open_speed_hotkey_settings)
+        self.assertIn("for index in range(4)", source)
+        self.assertIn('text="确定"', source)
+        self.assertIn('text="取消"', source)
+        self.assertIn("dialog.withdraw()", source)
+        self.assertIn("_position_dialog_relative_to_owner(dialog, self)", source)
+        self.assertIn("dialog.deiconify()", source)
+        self.assertIn("dialog.grab_set()", source)
+        self.assertLess(source.index("dialog.withdraw()"), source.index("_position_dialog_relative_to_owner(dialog, self)"))
+        self.assertLess(source.index("_position_dialog_relative_to_owner(dialog, self)"), source.index("dialog.deiconify()"))
+
+    def test_old_single_hotkey_is_not_registered_at_startup(self) -> None:
+        source = inspect.getsource(LauncherApp.__init__)
+        self.assertNotIn("_register_saved_speed_panel_hotkey", source)
+        self.assertIn("_register_saved_speed_rate_hotkeys", source)
+
+    def test_startup_hotkey_migration_notice_is_deferred_until_log_widget_exists(self) -> None:
+        fake = SimpleNamespace(_user_data_startup_logs=[])
+
+        LauncherApp._log_or_defer_startup(fake, "旧快捷键未注册")
+
+        self.assertEqual(fake._user_data_startup_logs, ["旧快捷键未注册"])
+
+    def test_startup_notice_uses_log_after_widget_exists(self) -> None:
+        fake = SimpleNamespace(log_text=object(), _user_data_startup_logs=[], logs=[])
+        fake._log = fake.logs.append
+
+        LauncherApp._log_or_defer_startup(fake, "ready")
+
+        self.assertEqual(fake.logs, ["ready"])
+        self.assertEqual(fake._user_data_startup_logs, [])
+
+    def test_refresh_address_button_is_in_account_row_not_work_mode(self) -> None:
+        source = inspect.getsource(LauncherApp._build_widgets)
+        work_start = source.index('work_mode_frame = ttk.LabelFrame')
+        account_start = source.index('account_config_frame = ttk.LabelFrame')
+        run_start = source.index('run_frame = ttk.LabelFrame')
+        self.assertNotIn("refresh_address_btn", source[work_start:account_start])
+        self.assertIn("refresh_address_btn", source[account_start:run_start])
+
+    def test_client_direct_record_round_trip_preserves_saved_speed_rate(self) -> None:
+        binding = ClientBatchBinding("a1", "账号1", pid=1, hwnd=2, cdp_port=9222, speed_rate=50)
+
+        record = LauncherApp._record_from_batch_binding(SimpleNamespace(), binding)
+        restored = LauncherApp._batch_binding_from_record(SimpleNamespace(), record)
+
+        self.assertEqual(record.speed_rate, 50)
+        self.assertEqual(restored.speed_rate, 50)
 
     def test_speed_control_invalid_rate_logs_and_skips_apply(self) -> None:
         fake = SimpleNamespace(
@@ -242,25 +603,138 @@ class GuiGroupSettingsTests(unittest.TestCase):
             applied: list[tuple[str, float]] = []
             fake = SimpleNamespace(
                 client_batch_store=store,
-                client_speed_control_rate_var=SimpleNamespace(get=lambda: "50"),
-                client_speed_control_scope_var=SimpleNamespace(get=lambda: "当前批次"),
                 client_speed_control_status_var=SimpleNamespace(set=lambda _value: None),
+                stop_event=threading.Event(),
                 logs=[],
+                bars=[],
+                worker_thread=object(),
             )
-            fake._log = lambda message: fake.logs.append(message)
-            fake._apply_client_speed_to_binding = lambda binding, rate: applied.append((binding.account_id, rate))
+            fake._queue_log = lambda message: fake.logs.append(message)
+            fake._update_status_bar = lambda message: fake.bars.append(message)
+            fake.after = lambda _delay, callback: callback()
             fake._sync_client_direct_batch_status = lambda: None
 
             with mock.patch.object(LauncherApp, "_client_direct_pid_exists", return_value=True), mock.patch.object(
                 LauncherApp,
                 "_client_direct_process_is_x5game",
                 return_value=True,
-            ), mock.patch.object(LauncherApp, "_client_direct_cdp_available", return_value=True):
-                LauncherApp._apply_client_speed_control(fake)
+            ), mock.patch.object(LauncherApp, "_client_direct_cdp_available", return_value=True), mock.patch.object(
+                LauncherApp,
+                "_apply_client_speed_to_binding",
+                side_effect=lambda _owner, binding, rate, _config: (
+                    applied.append((binding.account_id, rate))
+                    or SpeedApplyResult(True, "applied", "ok")
+                ),
+            ):
+                LauncherApp._client_speed_control_worker(
+                    fake,
+                    list(batch.bindings),
+                    50.0,
+                    gui_module.ClientSpeedPanelConfig(),
+                )
 
             self.assertEqual(applied, [("good", 50.0)])
             self.assertEqual(good.speed_rate, 50.0)
-            self.assertTrue(any("目标4，成功1，失败0，跳过3" in item for item in fake.logs))
+            self.assertEqual(good.window_status, "")
+            self.assertEqual(good.status, "客户端登录成功")
+            self.assertTrue(any("目标4，成功1，失败0，跳过3，停止0" in item for item in fake.logs))
+
+    def test_speed_control_button_starts_background_worker_without_inline_cdp(self) -> None:
+        store = ClientBatchStore()
+        batch = store.create_batch("当前批次", scope="当前层", base_port=9222)
+        batch.bindings = [ClientBatchBinding("a1", "账号1", pid=1, hwnd=11, cdp_port=9222)]
+        started: list[object] = []
+
+        class FakeThread:
+            def __init__(self, *, target, args, daemon):
+                self.target = target
+                self.args = args
+                self.daemon = daemon
+
+            def is_alive(self):
+                return False
+
+            def start(self):
+                started.append(self)
+
+        fake = SimpleNamespace(
+            client_batch_store=store,
+            client_speed_control_rate_var=SimpleNamespace(get=lambda: "50"),
+            client_speed_control_scope_var=SimpleNamespace(get=lambda: "当前批次"),
+            client_speed_control_status_var=SimpleNamespace(set=lambda _value: None),
+            default_speed_rate_var=SimpleNamespace(get=lambda: "1", set=lambda _value: None),
+            stop_event=threading.Event(),
+            worker_thread=None,
+            logs=[],
+        )
+        fake._log = fake.logs.append
+
+        with mock.patch("douluo_launcher.gui.threading.Thread", FakeThread), mock.patch.object(
+            LauncherApp,
+            "_ensure_client_direct_selected_batch_current",
+        ), mock.patch.object(LauncherApp, "_apply_client_speed_to_binding") as apply_binding:
+            LauncherApp._apply_client_speed_control(fake)
+
+        self.assertEqual(len(started), 1)
+        self.assertIs(started[0].target, LauncherApp._client_speed_control_worker)
+        self.assertTrue(started[0].daemon)
+        apply_binding.assert_not_called()
+
+    def test_speed_control_keeps_required_rates_and_target_scopes_without_warnings(self) -> None:
+        source = inspect.getsource(LauncherApp._build_widgets)
+
+        self.assertIn('text="恢复 1.0"', source)
+        self.assertIn('for preset in ("2", "5", "50", "500")', source)
+        self.assertNotIn("askyesno", source[source.index("self.client_speed_control_row") :])
+        self.assertIn(gui_module.CLIENT_SPEED_SCOPE_SELECTED, gui_module.CLIENT_SPEED_SCOPE_CHOICES)
+        self.assertIn(gui_module.CLIENT_SPEED_SCOPE_CURRENT_BATCH, gui_module.CLIENT_SPEED_SCOPE_CHOICES)
+        self.assertIn(gui_module.CLIENT_SPEED_SCOPE_ALL_LIVE, gui_module.CLIENT_SPEED_SCOPE_CHOICES)
+
+    def test_speed_control_all_fail_does_not_save_rate_or_batch(self) -> None:
+        store = ClientBatchStore()
+        batch = store.create_batch("当前批次", scope="当前层", base_port=9222)
+        item = ClientBatchBinding(
+            "a1",
+            "账号1",
+            pid=1,
+            hwnd=11,
+            cdp_port=9222,
+            status="客户端登录成功",
+            window_status="restored",
+            speed_rate=2,
+        )
+        batch.bindings = [item]
+        store.save = mock.Mock()
+        fake = SimpleNamespace(
+            client_batch_store=store,
+            client_speed_control_status_var=SimpleNamespace(set=lambda _value: None),
+            stop_event=threading.Event(),
+            worker_thread=object(),
+            logs=[],
+        )
+        fake._queue_log = fake.logs.append
+        fake._update_status_bar = lambda _message: None
+        fake.after = lambda _delay, callback: callback()
+        fake._sync_client_direct_batch_status = lambda: None
+
+        with mock.patch.object(LauncherApp, "_client_direct_pid_exists", return_value=True), mock.patch.object(
+            LauncherApp, "_client_direct_process_is_x5game", return_value=True
+        ), mock.patch.object(LauncherApp, "_client_direct_cdp_available", return_value=True), mock.patch.object(
+            LauncherApp,
+            "_apply_client_speed_to_binding",
+            return_value=SpeedApplyResult(False, "apply_failed", "ok=false"),
+        ):
+            LauncherApp._client_speed_control_worker(
+                fake,
+                [item],
+                50,
+                gui_module.ClientSpeedPanelConfig(),
+            )
+
+        self.assertEqual(item.speed_rate, 2)
+        self.assertEqual(item.status, "客户端登录成功")
+        self.assertEqual(item.window_status, "restored")
+        store.save.assert_not_called()
 
     def test_client_direct_batch_dropdown_uses_summary_without_extra_status_label(self) -> None:
         store = ClientBatchStore()
@@ -341,11 +815,10 @@ class GuiGroupSettingsTests(unittest.TestCase):
         self.assertEqual([account.level for account in skipped], ["单层账号", "存钻"])
 
     def test_run_mode_labels_map_to_stable_keys(self) -> None:
-        self.assertEqual(_run_mode_key_from_label(RUN_MODE_FOREGROUND_LABEL), "foreground")
-        self.assertEqual(_run_mode_key_from_label(gui_module.RUN_MODE_ACCOUNT_PASSWORD_LABEL), "foreground")
-        self.assertEqual(_run_mode_key_from_label(RUN_MODE_BACKGROUND_LABEL), "background")
+        self.assertEqual(_run_mode_key_from_label(RUN_MODE_FOREGROUND_LABEL), "client_direct")
+        self.assertEqual(_run_mode_key_from_label(RUN_MODE_BACKGROUND_LABEL), "client_direct")
         self.assertEqual(_run_mode_key_from_label(RUN_MODE_CLIENT_DIRECT_LABEL), "client_direct")
-        self.assertEqual(_run_mode_key_from_label("未知"), "foreground")
+        self.assertEqual(_run_mode_key_from_label("未知"), "client_direct")
 
     def test_client_direct_auto_enter_reads_boolean_var(self) -> None:
         fake = SimpleNamespace(client_direct_auto_enter_var=SimpleNamespace(get=lambda: True))
@@ -656,7 +1129,10 @@ class GuiGroupSettingsTests(unittest.TestCase):
         fake._set_status = lambda _account, status: fake.statuses.append(status)
         fake._log = lambda message: fake.logs.append(message)
 
-        with mock.patch("douluo_launcher.gui.messagebox.showwarning") as warning:
+        with mock.patch("douluo_launcher.gui.messagebox.showwarning") as warning, mock.patch(
+            "douluo_launcher.gui._inject_latest_client_direct_urls",
+            side_effect=lambda _owner, values: values,
+        ):
             LauncherApp._start_client_direct_single_run(fake, account)
 
         fake._setup_log_file.assert_called_once_with(cleanup_old=False)
@@ -686,13 +1162,22 @@ class GuiGroupSettingsTests(unittest.TestCase):
         fake._start_client_direct_prepared_login_run = mock.Mock()
         fake._log = lambda message: fake.logs.append(message)
 
-        LauncherApp._prepare_client_direct_current_scope(fake)
-        LauncherApp._login_prepared_client_direct_current_scope(fake)
+        with mock.patch.object(
+            LauncherApp,
+            "_client_direct_accounts_with_local_links",
+            side_effect=lambda _owner, values: values,
+        ):
+            LauncherApp._prepare_client_direct_current_scope(fake)
+            LauncherApp._login_prepared_client_direct_current_scope(fake)
 
         fake._start_client_direct_prepare_run.assert_called_once_with(accounts, run_label="客户端准备当前层", append=False)
-        fake._start_client_direct_prepared_login_run.assert_called_once_with(accounts, run_label="客户端当前层登录")
+        fake._start_client_direct_prepared_login_run.assert_called_once_with(
+            accounts,
+            run_label="客户端当前层登录",
+            auto_enter_game=True,
+        )
         self.assertTrue(any("准备客户端" in line and "存钻" in line for line in fake.logs))
-        self.assertTrue(any("执行客户端登录" in line and "自动进入游戏" in line for line in fake.logs))
+        self.assertTrue(any("执行客户端登录" in line and "进入游戏" in line for line in fake.logs))
 
     def test_client_direct_three_step_buttons_use_all_level_filtered_accounts(self) -> None:
         accounts = [
@@ -726,11 +1211,20 @@ class GuiGroupSettingsTests(unittest.TestCase):
         fake._wm_read_arrangement_config = mock.Mock(return_value=None)
         fake._log = lambda message: fake.logs.append(message)
 
-        LauncherApp._prepare_client_direct_current_scope(fake)
-        LauncherApp._login_prepared_client_direct_current_scope(fake)
+        with mock.patch.object(
+            LauncherApp,
+            "_client_direct_accounts_with_local_links",
+            side_effect=lambda _owner, values: values,
+        ):
+            LauncherApp._prepare_client_direct_current_scope(fake)
+            LauncherApp._login_prepared_client_direct_current_scope(fake)
 
         fake._start_client_direct_prepare_run.assert_called_once_with(accounts, run_label="客户端准备当前层", append=False)
-        fake._start_client_direct_prepared_login_run.assert_called_once_with(accounts, run_label="客户端当前层登录")
+        fake._start_client_direct_prepared_login_run.assert_called_once_with(
+            accounts,
+            run_label="客户端当前层登录",
+            auto_enter_game=True,
+        )
         self.assertTrue(any("层级=全部" in line for line in fake.logs))
 
     def test_client_direct_prepare_cancel_keeps_live_batch_and_does_not_start_worker(self) -> None:
@@ -1003,7 +1497,12 @@ class GuiGroupSettingsTests(unittest.TestCase):
         fake._start_client_direct_prepare_run = mock.Mock()
         fake._log = lambda message: fake.logs.append(message)
 
-        LauncherApp._append_client_direct_current_scope(fake)
+        with mock.patch.object(
+            LauncherApp,
+            "_client_direct_accounts_with_local_links",
+            side_effect=lambda _owner, values: values,
+        ):
+            LauncherApp._append_client_direct_current_scope(fake)
 
         fake._start_client_direct_prepare_run.assert_called_once_with([new_account], run_label="客户端追加准备", append=True)
         self.assertIn(existing.key, fake.client_direct_bindings)
@@ -1108,7 +1607,8 @@ class GuiGroupSettingsTests(unittest.TestCase):
         fake._log = lambda message: fake.logs.append(message)
         fake._start_client_direct_prepared_login_run = mock.Mock()
 
-        LauncherApp._login_prepared_client_direct_current_scope(fake)
+        with mock.patch.object(LauncherApp, "_client_direct_binding_ready_for_arrange", return_value=True):
+            LauncherApp._login_prepared_client_direct_current_scope(fake)
 
         called_accounts = fake._start_client_direct_prepared_login_run.call_args.args[0]
         self.assertEqual([account.key for account in called_accounts], [second.key])
@@ -1148,6 +1648,22 @@ class GuiGroupSettingsTests(unittest.TestCase):
             self.assertEqual(store.current_batch().bindings[0].status, "closed")
             store.switch_batch(batch_a.batch_id)
             self.assertEqual(store.current_batch().bindings[0].status, "prepared")
+
+    def test_recently_closed_pid_not_x5game_requires_same_pid_dead_hwnd_and_dead_cdp(self) -> None:
+        binding = ClientBatchBinding("a1", "账号1", pid=202, hwnd=22, cdp_port=9222, status="pid_not_x5game")
+        fake = SimpleNamespace()
+        fresh_marker = (202, gui_module.time.monotonic())
+
+        with mock.patch("douluo_launcher.gui.user32.IsWindow", return_value=False), \
+             mock.patch.object(LauncherApp, "_client_direct_cdp_available", return_value=False):
+            self.assertTrue(LauncherApp._client_direct_recently_closed_safe_to_reopen(fake, binding, fresh_marker))
+            self.assertFalse(LauncherApp._client_direct_recently_closed_safe_to_reopen(fake, binding, (999, fresh_marker[1])))
+        with mock.patch("douluo_launcher.gui.user32.IsWindow", return_value=True), \
+             mock.patch.object(LauncherApp, "_client_direct_cdp_available", return_value=False):
+            self.assertFalse(LauncherApp._client_direct_recently_closed_safe_to_reopen(fake, binding, fresh_marker))
+        with mock.patch("douluo_launcher.gui.user32.IsWindow", return_value=False), \
+             mock.patch.object(LauncherApp, "_client_direct_cdp_available", return_value=True):
+            self.assertFalse(LauncherApp._client_direct_recently_closed_safe_to_reopen(fake, binding, fresh_marker))
 
     def test_client_direct_arrange_uses_only_prepared_binding_hwnds(self) -> None:
         accounts = [
@@ -1220,7 +1736,11 @@ class GuiGroupSettingsTests(unittest.TestCase):
                 for window in windows
             ]
 
-        with mock.patch("douluo_launcher.gui.user32.IsWindow", side_effect=lambda hwnd: int(hwnd) in {111, 222}), mock.patch(
+        with mock.patch.object(
+            LauncherApp,
+            "_client_direct_binding_ready_for_arrange",
+            side_effect=lambda _self, record: int(record.hwnd) in {111, 222},
+        ), mock.patch("douluo_launcher.gui.user32.IsWindow", side_effect=lambda hwnd: int(hwnd) in {111, 222}), mock.patch(
             "douluo_launcher.gui.get_window_rect",
             return_value=WindowRect(10, 20, 810, 620),
         ), mock.patch.object(LauncherApp, "_client_direct_tile_binding_windows", side_effect=tile_windows):
@@ -1275,7 +1795,11 @@ class GuiGroupSettingsTests(unittest.TestCase):
             ]
 
         renamed = []
-        with mock.patch("douluo_launcher.gui.user32.IsWindow", side_effect=lambda hwnd: int(hwnd) in {111, 222}), mock.patch(
+        with mock.patch.object(
+            LauncherApp,
+            "_client_direct_binding_ready_for_arrange",
+            side_effect=lambda _self, record: int(record.hwnd) in {111, 222},
+        ), mock.patch("douluo_launcher.gui.user32.IsWindow", side_effect=lambda hwnd: int(hwnd) in {111, 222}), mock.patch(
             "douluo_launcher.gui.get_window_rect",
             return_value=WindowRect(10, 20, 810, 620),
         ), mock.patch.object(LauncherApp, "_client_direct_tile_binding_windows", side_effect=tile_windows), mock.patch(
@@ -1322,6 +1846,10 @@ class GuiGroupSettingsTests(unittest.TestCase):
             LauncherApp,
             "_client_direct_cdp_available",
             return_value=True,
+        ), mock.patch.object(
+            LauncherApp,
+            "_scan_local_client_direct_clients",
+            return_value=self._local_scans_for_batch(batch),
         ), mock.patch("douluo_launcher.gui.wait_for_client_hwnd_by_pid", return_value=30):
             LauncherApp._repair_client_direct_current_batch(fake)
 
@@ -1583,6 +2111,7 @@ class GuiGroupSettingsTests(unittest.TestCase):
             mock.patch.object(LauncherApp, "_client_direct_pid_exists", side_effect=pid_exists),
             mock.patch.object(LauncherApp, "_client_direct_process_is_x5game", return_value=True),
             mock.patch.object(LauncherApp, "_client_direct_cdp_available", return_value=True),
+            mock.patch.object(LauncherApp, "_scan_local_client_direct_clients", return_value=self._local_scans_for_batch(batch)),
             mock.patch("douluo_launcher.gui.wait_for_client_hwnd_by_pid", side_effect=lambda pid, timeout=0.5: 2000 + int(pid) - 1000),
             mock.patch("douluo_launcher.gui.is_tcp_port_available", return_value=True),
             mock.patch("douluo_launcher.gui.Path.exists", return_value=True),
@@ -1662,6 +2191,7 @@ class GuiGroupSettingsTests(unittest.TestCase):
             mock.patch.object(LauncherApp, "_client_direct_pid_exists", side_effect=lambda _self, pid: int(pid) != 9009),
             mock.patch.object(LauncherApp, "_client_direct_process_is_x5game", return_value=True),
             mock.patch.object(LauncherApp, "_client_direct_cdp_available", return_value=True),
+            mock.patch.object(LauncherApp, "_scan_local_client_direct_clients", return_value=self._local_scans_for_batch(batch)),
             mock.patch("douluo_launcher.gui.wait_for_client_hwnd_by_pid", return_value=2001),
             mock.patch("douluo_launcher.gui.is_tcp_port_available", return_value=True),
             mock.patch("douluo_launcher.gui.Path.exists", return_value=True),
@@ -1718,6 +2248,7 @@ class GuiGroupSettingsTests(unittest.TestCase):
             mock.patch.object(LauncherApp, "_client_direct_pid_exists", return_value=True),
             mock.patch.object(LauncherApp, "_client_direct_process_is_x5game", return_value=True),
             mock.patch.object(LauncherApp, "_client_direct_cdp_available", return_value=True),
+            mock.patch.object(LauncherApp, "_scan_local_client_direct_clients", return_value=self._local_scans_for_batch(batch)),
             mock.patch("douluo_launcher.gui.wait_for_client_hwnd_by_pid", side_effect=lambda pid, **_kwargs: int(pid) + 1000),
         ):
             LauncherApp._repair_client_direct_current_batch(fake)
@@ -1775,6 +2306,7 @@ class GuiGroupSettingsTests(unittest.TestCase):
             mock.patch.object(LauncherApp, "_client_direct_pid_exists", side_effect=lambda _self, pid: int(pid) != 9009),
             mock.patch.object(LauncherApp, "_client_direct_process_is_x5game", return_value=True),
             mock.patch.object(LauncherApp, "_client_direct_cdp_available", return_value=True),
+            mock.patch.object(LauncherApp, "_scan_local_client_direct_clients", return_value=self._local_scans_for_batch(batch)),
             mock.patch("douluo_launcher.gui.wait_for_client_hwnd_by_pid", return_value=2001),
             mock.patch("douluo_launcher.gui.is_tcp_port_available", return_value=True),
             mock.patch("douluo_launcher.gui.Path.exists", return_value=True),
@@ -1786,7 +2318,8 @@ class GuiGroupSettingsTests(unittest.TestCase):
         self.assertEqual(statuses[:8], ["客户端登录成功"] * 8)
         self.assertEqual(statuses[8], "客户端已启动/待登录")
 
-        pending_accounts = LauncherApp._client_direct_accounts_for_login_scope(fake, CLIENT_DIRECT_LOGIN_SCOPE_PENDING)
+        with mock.patch.object(LauncherApp, "_client_direct_binding_ready_for_arrange", return_value=True):
+            pending_accounts = LauncherApp._client_direct_accounts_for_login_scope(fake, CLIENT_DIRECT_LOGIN_SCOPE_PENDING)
         self.assertEqual([account.key for account in pending_accounts], [accounts[8].key])
 
     def test_repair_current_batch_cancel_reopen_keeps_pid_missing_and_does_not_start_client(self) -> None:
@@ -1821,6 +2354,7 @@ class GuiGroupSettingsTests(unittest.TestCase):
             mock.patch.object(LauncherApp, "_client_direct_pid_exists", return_value=False),
             mock.patch.object(LauncherApp, "_client_direct_process_is_x5game", return_value=True),
             mock.patch.object(LauncherApp, "_client_direct_cdp_available", return_value=True),
+            mock.patch.object(LauncherApp, "_scan_local_client_direct_clients", return_value=self._local_scans_for_batch(batch)),
             mock.patch("douluo_launcher.gui.prepare_client_direct_client") as prepare,
         ):
             LauncherApp._repair_client_direct_current_batch(fake)
@@ -1873,6 +2407,7 @@ class GuiGroupSettingsTests(unittest.TestCase):
             mock.patch.object(LauncherApp, "_client_direct_pid_exists", side_effect=lambda _self, pid: int(pid) != 9009),
             mock.patch.object(LauncherApp, "_client_direct_process_is_x5game", return_value=True),
             mock.patch.object(LauncherApp, "_client_direct_cdp_available", return_value=True),
+            mock.patch.object(LauncherApp, "_scan_local_client_direct_clients", return_value=self._local_scans_for_batch(batch)),
             mock.patch("douluo_launcher.gui.wait_for_client_hwnd_by_pid", return_value=2001),
             mock.patch("douluo_launcher.gui.is_tcp_port_available", side_effect=lambda port: int(port) != 9230),
             mock.patch("douluo_launcher.gui.find_next_available_port_range", return_value=9231),
@@ -1952,7 +2487,8 @@ class GuiGroupSettingsTests(unittest.TestCase):
         fake._log = lambda message: fake.logs.append(message)
         fake._start_client_direct_prepared_login_run = mock.Mock()
 
-        LauncherApp._login_prepared_client_direct_current_scope(fake)
+        with mock.patch.object(LauncherApp, "_client_direct_binding_ready_for_arrange", return_value=True):
+            LauncherApp._login_prepared_client_direct_current_scope(fake)
 
         fake._start_client_direct_prepared_login_run.assert_called_once()
         self.assertEqual([account.key for account in fake._start_client_direct_prepared_login_run.call_args.args[0]], [accounts[1].key])
@@ -2124,7 +2660,11 @@ class GuiGroupSettingsTests(unittest.TestCase):
                 for window in windows
             ]
 
-        with mock.patch("douluo_launcher.gui.user32.IsWindow", side_effect=lambda hwnd: int(hwnd) == 111), mock.patch(
+        with mock.patch.object(
+            LauncherApp,
+            "_client_direct_binding_ready_for_arrange",
+            side_effect=lambda _self, record: int(record.hwnd) == 111,
+        ), mock.patch("douluo_launcher.gui.user32.IsWindow", side_effect=lambda hwnd: int(hwnd) == 111), mock.patch(
             "douluo_launcher.gui.get_window_rect",
             return_value=WindowRect(10, 20, 810, 620),
         ), mock.patch.object(LauncherApp, "_client_direct_tile_binding_windows", side_effect=tile_windows):
@@ -2222,10 +2762,13 @@ class GuiGroupSettingsTests(unittest.TestCase):
         fake._write_file_log = lambda message: fake.file_logs.append(message)
 
         def prepare_result(config, **_kwargs):
+            pid = 2000 + config.cdp_port
+            hwnd = 3000 + config.cdp_port
             return SimpleNamespace(
                 success=True,
                 message="客户端已启动，待登录",
-                binding=SimpleNamespace(pid=2000 + config.cdp_port, hwnd=3000 + config.cdp_port, cdp_port=config.cdp_port),
+                binding=SimpleNamespace(pid=pid, hwnd=hwnd, cdp_port=config.cdp_port),
+                ownership=CdpOwnershipResult("verified", hwnd=hwnd, window_pid=pid, port=config.cdp_port, owner_pid=pid),
             )
 
         with mock.patch("douluo_launcher.gui.is_tcp_port_available", return_value=True), mock.patch(
@@ -2248,6 +2791,257 @@ class GuiGroupSettingsTests(unittest.TestCase):
         self.assertEqual(fake.client_direct_bindings[accounts[1].key].hwnd, 3000 + 9223)
         self.assertTrue(any("只启动客户端，不执行登录" in line for line in fake.logs))
 
+    def test_client_direct_prepare_worker_does_not_count_success_with_zero_hwnd(self) -> None:
+        account = AccountConfig(
+            "第一层",
+            1,
+            1,
+            "https://7tu7tu.com/dldl?gid=1002997&pid=1&token=t&time=123&sign=s&isPcLauncher=true",
+        )
+        fake = SimpleNamespace(
+            stop_event=threading.Event(),
+            client_direct_bindings={account.key: ClientDirectRunRecord(account.key, account.display_name)},
+            logs=[],
+            statuses=[],
+            bars=[],
+            file_logs=[],
+            _log_file=None,
+        )
+        fake._queue_log = fake.logs.append
+        fake._queue_status = lambda _account, status: fake.statuses.append(status)
+        fake._update_status_bar = fake.bars.append
+        fake._write_file_log = fake.file_logs.append
+        result = SimpleNamespace(
+            success=True,
+            message="ready",
+            binding=SimpleNamespace(pid=1234, hwnd=0, cdp_port=9222),
+            ownership=CdpOwnershipResult("verified", hwnd=0, window_pid=1234, port=9222, owner_pid=1234),
+        )
+
+        with mock.patch("douluo_launcher.gui.is_tcp_port_available", return_value=True), mock.patch(
+            "douluo_launcher.gui._ClientLaunchThrottle", return_value=SimpleNamespace(wait=lambda _stop: True)
+        ), mock.patch("douluo_launcher.gui.prepare_client_direct_client", return_value=result):
+            LauncherApp._client_direct_prepare_worker(
+                fake,
+                [account],
+                r"E:\Program Files\DLH5\X5Game.exe",
+                "HWND零值准备",
+                9222,
+                8,
+            )
+
+        self.assertEqual(fake.statuses[-1], "启动失败")
+        self.assertEqual(fake.client_direct_bindings[account.key].status, "启动失败")
+        self.assertTrue(any("成功0，失败1" in line for line in fake.logs))
+
+    def test_one_click_pending_status_with_zero_hwnd_never_enters_success_set(self) -> None:
+        account = AccountConfig("第一层", 1, 1, "https://example.invalid/")
+        fake = SimpleNamespace(
+            worker_thread=None,
+            _client_direct_one_click_accounts=[account],
+            client_direct_bindings={
+                account.key: ClientDirectRunRecord(
+                    account.key,
+                    account.display_name,
+                    pid=1234,
+                    hwnd=0,
+                    cdp_port=9222,
+                    cdp_ownership_status="verified",
+                    status="客户端已启动/待登录",
+                )
+            },
+        )
+
+        with mock.patch("douluo_launcher.gui.messagebox.showwarning") as warning, mock.patch.object(
+            LauncherApp, "_arrange_prepared_client_direct_current_scope"
+        ) as arrange, mock.patch.object(LauncherApp, "_login_prepared_client_direct_current_scope") as login:
+            LauncherApp._continue_client_direct_one_click_after_prepare(fake)
+
+        warning.assert_called_once()
+        arrange.assert_not_called()
+        login.assert_not_called()
+
+    def test_one_click_unchecked_auto_enter_stays_before_game_but_manual_login_enters(self) -> None:
+        account = AccountConfig("第一层", 1, 1, "https://example.invalid/")
+        fake = SimpleNamespace(
+            worker_thread=None,
+            _client_direct_one_click_accounts=[account],
+            _client_direct_one_click_auto_enter_game=False,
+            client_direct_bindings={account.key: ClientDirectRunRecord(account.key, account.display_name)},
+            logs=[],
+        )
+        fake._log = fake.logs.append
+
+        with mock.patch.object(LauncherApp, "_client_direct_binding_ready_for_arrange", return_value=True), mock.patch.object(
+            LauncherApp, "_arrange_prepared_client_direct_current_scope", return_value=True
+        ), mock.patch.object(LauncherApp, "_login_prepared_client_direct_current_scope") as login:
+            LauncherApp._continue_client_direct_one_click_after_prepare(fake)
+
+        login.assert_called_once_with(fake, [account], auto_enter_game=False)
+
+        fake._start_client_direct_prepared_login_run = mock.Mock()
+        fake.level_var = SimpleNamespace(get=lambda: "第一层")
+        fake.client_direct_concurrency_var = SimpleNamespace(get=lambda: 8, set=lambda _value: None)
+        LauncherApp._login_prepared_client_direct_current_scope(fake, [account])
+        fake._start_client_direct_prepared_login_run.assert_called_once_with(
+            [account], run_label="客户端当前层登录", auto_enter_game=True
+        )
+
+    def test_client_direct_row_arrange_keeps_ninth_slot_in_nine_window_plan(self) -> None:
+        fake = SimpleNamespace()
+        window = GameWindow(9009, "斗罗大陆H5-9号", 9, WindowRect(0, 0, 300, 400))
+        config = RowTileConfig(per_row=3, start_x=0, start_y=0, gap_x=0, gap_y=0)
+        plan = SimpleNamespace(
+            screen_width=900,
+            screen_height=900,
+            work_area=WindowRect(0, 0, 900, 900),
+            work_area_width=900,
+            work_area_height=900,
+            cols=3,
+            rows=3,
+            window_count=9,
+            target_width=300,
+            target_height=300,
+        )
+
+        with mock.patch("douluo_launcher.gui.calculate_row_tile_plan", return_value=plan), mock.patch(
+            "douluo_launcher.gui._safe_wm_title_template", return_value="斗罗大陆H5-{index}号"
+        ), mock.patch("douluo_launcher.gui.tile_game_windows_by_row_count", return_value=[]) as tile:
+            LauncherApp._client_direct_tile_binding_windows(
+                fake,
+                [window],
+                gui_module.WM_TILE_MODE_ROW_COUNT,
+                config,
+                9,
+                lambda _message: None,
+            )
+
+        self.assertEqual(tile.call_args.kwargs["slot_indexes"], [8])
+        self.assertEqual(tile.call_args.kwargs["layout_window_count"], 9)
+
+    def test_client_direct_prepare_worker_31_ports_continues_after_one_failure(self) -> None:
+        accounts = [
+            AccountConfig(
+                "批次31",
+                index,
+                index,
+                f"https://7tu7tu.com/dldl?gid=1002997&pid=1&token=t{index}&time=123&sign=s{index}&isPcLauncher=true",
+            )
+            for index in range(1, 32)
+        ]
+        fake = SimpleNamespace(
+            stop_event=threading.Event(),
+            client_direct_bindings={
+                account.key: ClientDirectRunRecord(account.key, account.display_name, login_url=account.url)
+                for account in accounts
+            },
+            logs=[],
+            statuses=[],
+            bars=[],
+            file_logs=[],
+            _log_file=None,
+        )
+        fake._queue_log = fake.logs.append
+        fake._queue_status = lambda account, status: fake.statuses.append((account.key, status))
+        fake._update_status_bar = fake.bars.append
+        fake._write_file_log = fake.file_logs.append
+
+        def prepare_result(config, **_kwargs):
+            if config.cdp_port == 9237:
+                return SimpleNamespace(
+                    success=False,
+                    message="bad token=private&sign=private",
+                    binding=SimpleNamespace(pid=0, hwnd=0, cdp_port=config.cdp_port),
+                )
+            return SimpleNamespace(
+                success=True,
+                message="ready",
+                binding=SimpleNamespace(pid=10000 + config.cdp_port, hwnd=20000 + config.cdp_port, cdp_port=config.cdp_port),
+                ownership=CdpOwnershipResult(
+                    "verified",
+                    hwnd=20000 + config.cdp_port,
+                    window_pid=10000 + config.cdp_port,
+                    port=config.cdp_port,
+                    owner_pid=10000 + config.cdp_port,
+                ),
+            )
+
+        with mock.patch("douluo_launcher.gui.is_tcp_port_available", return_value=True), mock.patch(
+            "douluo_launcher.gui._ClientLaunchThrottle",
+            return_value=SimpleNamespace(wait=lambda _stop: True),
+        ), mock.patch(
+            "douluo_launcher.gui.prepare_client_direct_client", side_effect=prepare_result
+        ) as prepare:
+            LauncherApp._client_direct_prepare_worker(
+                fake,
+                accounts,
+                r"E:\Program Files\DLH5\X5Game.exe",
+                "31窗口模拟准备",
+                9222,
+                8,
+            )
+
+        ports = sorted(call.args[0].cdp_port for call in prepare.call_args_list)
+        self.assertEqual(ports, list(range(9222, 9253)))
+        statuses = [status for _key, status in fake.statuses]
+        self.assertEqual(statuses.count("客户端已启动/待登录"), 30)
+        self.assertEqual(statuses.count("启动失败"), 1)
+        self.assertNotIn("private", "\n".join(fake.logs))
+
+    def test_client_direct_prepare_worker_stop_prevents_remaining_31_launches(self) -> None:
+        accounts = [
+            AccountConfig(
+                "批次31",
+                index,
+                index,
+                f"https://7tu7tu.com/dldl?gid=1002997&pid=1&token=t{index}&time=123&sign=s{index}&isPcLauncher=true",
+            )
+            for index in range(1, 32)
+        ]
+        stop_event = threading.Event()
+        fake = SimpleNamespace(
+            stop_event=stop_event,
+            client_direct_bindings={
+                account.key: ClientDirectRunRecord(account.key, account.display_name, login_url=account.url)
+                for account in accounts
+            },
+            logs=[],
+            statuses=[],
+            bars=[],
+            file_logs=[],
+            _log_file=None,
+        )
+        fake._queue_log = fake.logs.append
+        fake._queue_status = lambda account, status: fake.statuses.append((account.key, status))
+        fake._update_status_bar = fake.bars.append
+        fake._write_file_log = fake.file_logs.append
+
+        def stop_after_first(config, **_kwargs):
+            stop_event.set()
+            return SimpleNamespace(
+                success=False,
+                message="用户停止",
+                binding=SimpleNamespace(pid=100, hwnd=200, cdp_port=config.cdp_port),
+            )
+
+        with mock.patch("douluo_launcher.gui.is_tcp_port_available", return_value=True), mock.patch(
+            "douluo_launcher.gui._ClientLaunchThrottle",
+            return_value=SimpleNamespace(wait=lambda _stop: True),
+        ), mock.patch(
+            "douluo_launcher.gui.prepare_client_direct_client", side_effect=stop_after_first
+        ) as prepare:
+            LauncherApp._client_direct_prepare_worker(
+                fake,
+                accounts,
+                r"E:\Program Files\DLH5\X5Game.exe",
+                "31窗口停止模拟",
+                9222,
+                1,
+            )
+
+        self.assertEqual(prepare.call_count, 1)
+        self.assertTrue(all(record.status == "已停止" for record in fake.client_direct_bindings.values()))
+
     def test_client_direct_prepared_login_worker_uses_saved_binding_without_prepare(self) -> None:
         account = AccountConfig(
             "第一层",
@@ -2265,6 +3059,7 @@ class GuiGroupSettingsTests(unittest.TestCase):
                     pid=2345,
                     hwnd=3456,
                     cdp_port=9222,
+                    speed_rate=50,
                     login_url=account.url,
                     status="待登录",
                 )
@@ -2285,7 +3080,10 @@ class GuiGroupSettingsTests(unittest.TestCase):
             message="客户端已就绪，未自动进入游戏",
             binding=SimpleNamespace(pid=2345, hwnd=3456, cdp_port=9222),
         )
+        ownership = CdpOwnershipResult("verified", hwnd=3456, window_pid=2345, port=9222, owner_pid=2345)
         with mock.patch.object(LauncherApp, "_client_direct_is_window_alive", return_value=True), mock.patch(
+            "douluo_launcher.gui.validate_window_cdp_endpoint", return_value=ownership
+        ), mock.patch(
             "douluo_launcher.gui.prepare_client_direct_client"
         ) as prepare, mock.patch(
             "douluo_launcher.gui.execute_prepared_client_direct_login",
@@ -2301,6 +3099,7 @@ class GuiGroupSettingsTests(unittest.TestCase):
         prepare.assert_not_called()
         self.assertEqual(execute.call_args.args[0].cdp_port, 9222)
         self.assertEqual(execute.call_args.args[0].full_login_url, account.url)
+        self.assertEqual(execute.call_args.args[0].default_speed_rate, 50)
         self.assertEqual(execute.call_args.args[1].pid, 2345)
         self.assertEqual(execute.call_args.args[1].hwnd, 3456)
         self.assertEqual(execute.call_args.args[1].login_url, account.url)
@@ -2353,6 +3152,83 @@ class GuiGroupSettingsTests(unittest.TestCase):
         self.assertEqual(fake.statuses, ["客户端已关闭"])
         self.assertEqual(fake.client_direct_bindings[account.key].status, "客户端已关闭")
 
+    def test_client_direct_prepared_login_worker_blocks_invalid_ownership_before_execute(self) -> None:
+        account = AccountConfig(
+            "第一层",
+            1,
+            1,
+            "https://7tu7tu.com/dldl?gid=1002997&pid=1&token=t&time=123&sign=s&isPcLauncher=true",
+        )
+        record = ClientDirectRunRecord(
+            account.key,
+            account.display_name,
+            pid=2345,
+            hwnd=3456,
+            cdp_port=9222,
+            login_url=account.url,
+            status="待登录",
+        )
+        fake = SimpleNamespace(
+            stop_event=threading.Event(),
+            client_direct_bindings={account.key: record},
+            logs=[],
+            statuses=[],
+            bars=[],
+            file_logs=[],
+            _log_file=None,
+        )
+        fake._queue_log = fake.logs.append
+        fake._queue_status = lambda _account, status: fake.statuses.append(status)
+        fake._update_status_bar = fake.bars.append
+        fake._write_file_log = fake.file_logs.append
+        mismatch = CdpOwnershipResult("hwnd_pid_mismatch", hwnd=3456, window_pid=2345, port=9222)
+
+        with mock.patch.object(LauncherApp, "_client_direct_is_window_alive", return_value=True), mock.patch(
+            "douluo_launcher.gui.validate_window_cdp_endpoint", return_value=mismatch
+        ), mock.patch("douluo_launcher.gui.execute_prepared_client_direct_login") as execute:
+            LauncherApp._client_direct_prepared_login_worker(fake, [account], True, "登录前复核", 8)
+
+        execute.assert_not_called()
+        self.assertEqual(record.status, "hwnd_pid_mismatch")
+        self.assertIn("hwnd_pid_mismatch", fake.statuses)
+
+    def test_prepared_login_worker_reports_link_missing_before_cdp_and_keeps_window_health(self) -> None:
+        account = AccountConfig("存钻", 1, 1, "/", bookmark_title="1")
+        record = ClientDirectRunRecord(
+            account_id=account.key,
+            account_name=account.display_name,
+            account_key=account.key,
+            slot_index=1,
+            link_status="link_missing",
+            window_status="cdp_unavailable",
+            pid=2345,
+            hwnd=3456,
+            cdp_port=9222,
+            login_url="/",
+        )
+        fake = SimpleNamespace(
+            stop_event=SimpleNamespace(is_set=lambda: False),
+            client_direct_bindings={account.key: record},
+            logs=[],
+            statuses=[],
+            bars=[],
+            file_logs=[],
+            _log_file=None,
+        )
+        fake._queue_log = fake.logs.append
+        fake._queue_status = lambda _account, status: fake.statuses.append(status)
+        fake._update_status_bar = fake.bars.append
+        fake._write_file_log = fake.file_logs.append
+
+        with mock.patch("douluo_launcher.gui.execute_prepared_client_direct_login") as execute:
+            LauncherApp._client_direct_prepared_login_worker(fake, [account], True, "本地识别登录")
+
+        execute.assert_not_called()
+        self.assertEqual(record.status, "link_missing")
+        self.assertEqual(record.link_status, "link_missing")
+        self.assertEqual(record.window_status, "cdp_unavailable")
+        self.assertIn("link_missing", fake.statuses)
+
     def test_client_direct_prepared_login_worker_updates_progress_statuses_from_cdp_log(self) -> None:
         account = AccountConfig(
             "第一层",
@@ -2396,7 +3272,10 @@ class GuiGroupSettingsTests(unittest.TestCase):
             log("enterGame called")
             return result
 
+        ownership = CdpOwnershipResult("verified", hwnd=3456, window_pid=2345, port=9222, owner_pid=2345)
         with mock.patch.object(LauncherApp, "_client_direct_is_window_alive", return_value=True), mock.patch(
+            "douluo_launcher.gui.validate_window_cdp_endpoint", return_value=ownership
+        ), mock.patch(
             "douluo_launcher.gui.execute_prepared_client_direct_login",
             side_effect=execute,
         ):
@@ -3270,14 +4149,13 @@ class GuiGroupSettingsTests(unittest.TestCase):
             include_in_all=False,
         )
 
-        values = _account_table_values(account, passport="d40786fa", status="成功", timing="8.1s")
+        values = _account_table_values(account, window_title="斗罗大陆H5-3号", passport="d40786fa", status="成功", timing="8.1s")
 
         self.assertEqual(len(values), len(ACCOUNT_TABLE_COLUMNS))
         self.assertEqual(values[ACCOUNT_TABLE_COLUMN_INDEX["include_in_all"]], "否")
-        self.assertEqual(values[ACCOUNT_TABLE_COLUMN_INDEX["passport"]], "d40786fa")
-        self.assertEqual(values[ACCOUNT_TABLE_COLUMN_INDEX["url"]], "dldl.50pk.com /login.php 参数完整")
+        self.assertEqual(values[ACCOUNT_TABLE_COLUMN_INDEX["window_title"]], "斗罗大陆H5-3号")
         self.assertEqual(values[ACCOUNT_TABLE_COLUMN_INDEX["status"]], "成功")
-        self.assertEqual(values[ACCOUNT_TABLE_COLUMN_INDEX["timing"]], "8.1s")
+        self.assertEqual(ACCOUNT_TABLE_COLUMNS, ("level", "bookmark", "window_title", "include_in_all", "status"))
 
     def test_account_url_display_masks_login_query_parameters(self) -> None:
         display = _account_url_display_value(
@@ -3477,6 +4355,26 @@ class GuiGroupSettingsTests(unittest.TestCase):
         self.assertEqual(_compact_number_ranges(plan.required_windows), "1-49")
         self.assertEqual(_compact_number_ranges(plan.visible_windows), "1-9")
         self.assertEqual(_compact_number_ranges(plan.missing_windows), "10-49")
+
+_REMOVED_V1413_BEHAVIOR_TESTS = {
+    name
+    for name in dir(GuiGroupSettingsTests)
+    if name.startswith("test_background_")
+    or name.startswith("test_current_level_serial_")
+    or name in {
+        "test_client_direct_all_serial_requires_all_level",
+        "test_client_direct_mode_allows_current_layer_and_all_serial_but_blocks_method2",
+        "test_client_direct_run_mode_starts_single_account_runner_without_serial_precheck",
+    }
+}
+for _test_name in _REMOVED_V1413_BEHAVIOR_TESTS:
+    setattr(
+        GuiGroupSettingsTests,
+        _test_name,
+        unittest.skip("v1.4.13 已删除旧版兼容/后台/方式二执行链")(
+            getattr(GuiGroupSettingsTests, _test_name)
+        ),
+    )
 
 
 if __name__ == "__main__":

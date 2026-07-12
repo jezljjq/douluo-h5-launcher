@@ -4,7 +4,9 @@
   "bookmark_browser": "",
   "bookmark_profile": "",
   "bookmark_root_name": "账号",
+  "bookmark_root_guid": "",
   "bookmark_root_path": "",
+  "bookmark_root_parent_path": "",
   "bookmark_root_display_name": "",
   "level_names": [
     "第一层",
@@ -120,12 +122,14 @@
   "custom_speed_panel_enabled": true,
   "speed_engine": "timer_hook",
   "default_speed_rate": 1.0,
+  "speed_panel_hotkey": "",
+  "speed_rate_hotkeys": [],
   "speed_hook_stage": "after_game_ready",
   "speed_panel_position": "left_top",
   "speed_panel_left": 12,
   "speed_panel_top": 12,
   "speed_panel_debug": false,
   "speed_panel_remove_original_toggle": true,
-  "block_browser_context_menu": true,
+  "block_browser_context_menu": false,
   "account_group_settings": {}
 }

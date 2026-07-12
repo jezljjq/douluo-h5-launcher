@@ -9,6 +9,7 @@ import time
 import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
+from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from urllib.parse import urlparse
@@ -20,13 +21,8 @@ except Exception:
     TkinterDnD = None
 
 from .automation import AccountRunner
-from .background_capability import build_background_capability_report, write_background_capability_report
-from .background_login import (
-    BackgroundSingleAccountRunner,
-    check_background_runtime_dependencies,
-    release_background_playwright_for_current_thread,
-)
 from .client_batch_store import (
+    BUSINESS_STATUS_VALUES,
     ClientBatchBinding,
     ClientBatchStore,
     LocalClientScan,
@@ -42,6 +38,12 @@ from .client_cdp import (
     select_page_target,
     wait_for_cdp_targets,
 )
+from .client_cdp_ownership import (
+    discover_window_cdp_endpoint,
+    list_process_parents,
+    list_tcp_listeners_by_port,
+    validate_window_cdp_endpoint,
+)
 from .client_direct_login import (
     ClientDirectLoginConfig,
     ClientBinding,
@@ -53,12 +55,29 @@ from .client_direct_login import (
     prepare_client_direct_client,
     wait_for_client_hwnd_by_pid,
 )
-from .client_speed_panel import ClientSpeedPanelConfig, apply_speed_rate_to_cdp
+from .client_speed_panel import ClientSpeedPanelConfig
+from .client_speed_hotkey import (
+    WindowsSpeedHotkey,
+    compose_speed_hotkey,
+    normalize_speed_hotkey_bindings,
+)
+from .client_login_accounts import (
+    LoginAccountRosterStore,
+    build_launcher_accounts,
+    logical_group_from_bookmark_path,
+    stable_refresh_account_key,
+)
+from .client_speed_control import (
+    SpeedApplyResult,
+    SpeedControlSummary,
+    apply_speed_rate_to_binding,
+    run_speed_control_batch,
+    toggle_speed_tree_for_binding,
+)
 from .config import (
     AccountConfig,
     BookmarkCandidate,
     BookmarkRootCandidate,
-    CSVAccount,
     LEVELS,
     SELECTABLE_LEVELS,
     SINGLE_LEVEL_NAME,
@@ -74,10 +93,38 @@ from .config import (
     list_bookmark_top_level_dirs,
     load_accounts_from_bookmark_root,
     load_accounts_from_bookmarks,
-    load_csv_accounts,
     load_settings,
     scan_bookmark_root_candidates,
     select_bookmark_candidate_for_startup,
+)
+from .direct_link_refresh import (
+    LOGIN_ENDPOINT,
+    AccountsStore,
+    BookmarkBatchItem,
+    BookmarkUrlUpdater,
+    BookmarkWriteContext,
+    CaptureFailed,
+    ChannelConfig,
+    DirectLinkRefreshService,
+    DirectLinkStore,
+    DirectLoginFields,
+    LoginFailed,
+    RefreshAccount,
+    default_refresh_data_dir,
+    delete_refresh_account_resources,
+    ensure_refresh_data_dir,
+    import_accounts_from_file,
+    import_accounts_from_text,
+    load_channels,
+    merge_accounts_by_name,
+    redact_sensitive_text,
+    resolve_client_direct_url_for_account,
+    resolve_client_direct_url_for_identity,
+)
+from .direct_link_login import (
+    DirectLinkLoginOptions,
+    create_login_capturer,
+    load_http_har_for_mode,
 )
 from .dm_client import diagnose_dm_environment_with_32bit_python, select_login_window_by_game_no
 from .path_utils import first_dropped_file_path, resolve_game_executable_path
@@ -131,17 +178,12 @@ WM_POLL_INTERVAL_SECONDS = 0.5
 WM_FINAL_DELAY_SECONDS = 1
 WM_TILE_MODE_FIXED = "固定参数排列"
 WM_TILE_MODE_ROW_COUNT = "根据行数排列"
-RUN_MODE_FOREGROUND_LABEL = "前台辅助模式"
-RUN_MODE_ACCOUNT_PASSWORD_LABEL = "账号密码登录模式"
-RUN_MODE_BACKGROUND_LABEL = "后台登录模式（实验）"
 RUN_MODE_CLIENT_DIRECT_LABEL = "客户端直登模式"
-RUN_MODE_CHOICES = (RUN_MODE_ACCOUNT_PASSWORD_LABEL, RUN_MODE_CLIENT_DIRECT_LABEL)
-BACKGROUND_SERIAL_CONCURRENCY = 1
-RUN_MODE_BACKGROUND_HINT = "实验功能，支持方式一单账号/当前层串行/全部串行，并发=1"
-RUN_MODE_CLIENT_DIRECT_HINT = "客户端直登模式，支持单账号/当前层准备、排列、登录"
+RUN_MODE_CLIENT_DIRECT_HINT = "客户端直登模式，优先读取本地直登链接库，支持单账号/当前层准备、排列、登录"
 CLIENT_DIRECT_CDP_PORT = 9222
 CLIENT_DIRECT_CONCURRENCY_MIN = 1
 CLIENT_DIRECT_CONCURRENCY_MAX = 8
+CLIENT_DIRECT_LAUNCH_INTERVAL_SECONDS = 0.15
 CLIENT_DIRECT_LOGIN_SCOPE_PENDING = "待登录账号"
 CLIENT_DIRECT_LOGIN_SCOPE_SELECTED = "选中账号"
 CLIENT_DIRECT_LOGIN_SCOPE_FAILED = "失败账号"
@@ -194,14 +236,7 @@ LOG_PANEL_MIN_HEIGHT = LOG_PANEL_EXPANDED_HEIGHT
 
 
 def _run_mode_key_from_label(label: str) -> str:
-    clean_label = str(label or "").strip()
-    if clean_label == RUN_MODE_BACKGROUND_LABEL:
-        return "background"
-    if clean_label == RUN_MODE_CLIENT_DIRECT_LABEL:
-        return "client_direct"
-    if clean_label == RUN_MODE_ACCOUNT_PASSWORD_LABEL:
-        return "foreground"
-    return "foreground"
+    return "client_direct"
 
 
 def _direct_login_entry_label(url: str) -> str:
@@ -276,6 +311,33 @@ def _run_bounded_client_direct_tasks(items, concurrency: int, worker):
             yield future.result()
 
 
+class _ClientLaunchThrottle:
+    def __init__(
+        self,
+        interval: float = CLIENT_DIRECT_LAUNCH_INTERVAL_SECONDS,
+        *,
+        clock=None,
+        sleep=None,
+    ) -> None:
+        self.interval = max(0.0, float(interval))
+        self.clock = clock or time.monotonic
+        self.sleep = sleep or time.sleep
+        self._lock = threading.Lock()
+        self._next_launch = 0.0
+
+    def wait(self, stop_event) -> bool:
+        with self._lock:
+            while True:
+                if stop_event is not None and stop_event.is_set():
+                    return False
+                remaining = self._next_launch - self.clock()
+                if remaining <= 0:
+                    break
+                self.sleep(min(0.05, remaining))
+            self._next_launch = self.clock() + self.interval
+            return True
+
+
 def _safe_wm_expected_window_size(owner) -> tuple[int, int] | None:
     getter = getattr(owner, "_wm_expected_window_size_filter", None)
     if not callable(getter):
@@ -300,38 +362,30 @@ def _safe_wm_title_template(owner) -> str | None:
 ACCOUNT_TABLE_COLUMNS = (
     "level",
     "bookmark",
-    "window",
+    "window_title",
     "include_in_all",
-    "passport",
-    "url",
     "status",
-    "timing",
 )
 ACCOUNT_TABLE_COLUMN_INDEX = {column: index for index, column in enumerate(ACCOUNT_TABLE_COLUMNS)}
 ACCOUNT_TABLE_HEADINGS = {
     "level": "层级",
     "bookmark": "收藏编号",
-    "window": "窗口号",
+    "window_title": "窗口标题",
     "include_in_all": "参与全部串行",
-    "passport": "本次通行证",
-    "url": "链接",
     "status": "状态",
-    "timing": "耗时",
 }
 ACCOUNT_TABLE_COLUMNS_CONFIG = {
     "level": {"width": 70, "anchor": tk.CENTER},
     "bookmark": {"width": 70, "anchor": tk.CENTER},
-    "window": {"width": 65, "anchor": tk.CENTER},
+    "window_title": {"width": 180, "anchor": tk.CENTER},
     "include_in_all": {"width": 95, "anchor": tk.CENTER},
-    "passport": {"width": 110, "anchor": tk.CENTER},
-    "url": {"width": 390},
     "status": {"width": 130, "anchor": tk.CENTER},
-    "timing": {"width": 70, "anchor": tk.CENTER},
 }
 
 
 def _account_table_values(
     account: AccountConfig,
+    window_title: str = "",
     passport: str = "",
     status: str = "未开始",
     timing: str = "",
@@ -339,13 +393,25 @@ def _account_table_values(
     return (
         account.level,
         account.bookmark_title or account.bookmark_no,
-        account.game_window_no,
+        window_title or "未绑定",
         "是" if account.include_in_all else "否",
-        passport,
-        _account_url_display_value(account.url),
         status,
-        timing,
     )
+
+
+def _bound_window_title(owner, account: AccountConfig) -> str:
+    record = (getattr(owner, "client_direct_bindings", {}) or {}).get(account.key)
+    if record is None or int(getattr(record, "hwnd", 0) or 0) <= 0:
+        return "未绑定"
+    hwnd = int(record.hwnd)
+    try:
+        length = int(user32.GetWindowTextLengthW(hwnd) or 0)
+        buffer = ctypes.create_unicode_buffer(max(2, length + 1))
+        user32.GetWindowTextW(hwnd, buffer, len(buffer))
+        actual = str(buffer.value or "").strip()
+    except Exception:
+        actual = ""
+    return actual or str(getattr(record, "title", "") or "").strip() or "未绑定"
 
 
 def _format_bookmark_file_candidate_label(candidate: BookmarkCandidate, root_count: int | None = None) -> str:
@@ -413,6 +479,8 @@ def _root_candidate_belongs_to_bookmark_file(candidate: BookmarkRootCandidate, b
 
 
 def _replace_account_table_value(values: object, column: str, value: str) -> list[object]:
+    if column not in ACCOUNT_TABLE_COLUMN_INDEX:
+        return list(values if isinstance(values, (list, tuple)) else ())
     updated = list(values if isinstance(values, (list, tuple)) else ())
     if len(updated) < len(ACCOUNT_TABLE_COLUMNS):
         updated.extend([""] * (len(ACCOUNT_TABLE_COLUMNS) - len(updated)))
@@ -470,6 +538,84 @@ class ClientDirectAccountRef:
     game_window_no: int = 0
 
 
+@dataclass(frozen=True)
+class ClientBatchAccountResolution:
+    accounts: list[AccountConfig]
+    status: str
+    message: str
+    mapped: int = 0
+
+
+def _resolve_client_direct_batch_accounts(
+    owner,
+    batch,
+    candidate_accounts: list[AccountConfig],
+) -> ClientBatchAccountResolution:
+    bindings = list(getattr(batch, "bindings", []) or [])
+    if not bindings:
+        return ClientBatchAccountResolution([], "empty", "当前批次没有绑定记录")
+
+    all_accounts = list(getattr(owner, "accounts", []) or [])
+    account_by_key = {account.key: account for account in all_accounts}
+    slots = [int(getattr(binding, "slot_index", 0) or index + 1) for index, binding in enumerate(bindings)]
+    if any(slot <= 0 for slot in slots) or len(set(slots)) != len(slots):
+        return ClientBatchAccountResolution([], "slot_conflict", "批次槽位缺失或重复，已阻止账号身份猜测")
+
+    assignments: dict[int, AccountConfig] = {}
+    used_keys: set[str] = set()
+    unresolved_indexes: list[int] = []
+    for index, binding in enumerate(bindings):
+        stable_key = str(getattr(binding, "account_key", "") or "").strip()
+        if not stable_key:
+            legacy_id = str(getattr(binding, "account_id", "") or "").strip()
+            if legacy_id and not legacy_id.startswith("local_scan:"):
+                stable_key = legacy_id
+        account = account_by_key.get(stable_key)
+        if account is None:
+            unresolved_indexes.append(index)
+            continue
+        if account.key in used_keys:
+            return ClientBatchAccountResolution([], "identity_conflict", "同一稳定账号被多个 binding 占用")
+        assignments[index] = account
+        used_keys.add(account.key)
+
+    if unresolved_indexes:
+        library_order = {account.key: index for index, account in enumerate(all_accounts)}
+        candidates = [
+            account
+            for _source_index, account in sorted(
+                enumerate(list(candidate_accounts or [])),
+                key=lambda item: (library_order.get(item[1].key, len(library_order) + item[0]), item[0]),
+            )
+        ]
+        if len(candidates) != len(bindings):
+            return ClientBatchAccountResolution(
+                [],
+                "count_mismatch",
+                f"当前分组账号数 {len(candidates)} 与批次绑定数 {len(bindings)} 不一致，已阻止槽位猜测",
+            )
+        if set(slots) != set(range(1, len(bindings) + 1)):
+            return ClientBatchAccountResolution([], "slot_conflict", "批次槽位不是唯一连续序列，已阻止账号身份猜测")
+        for index in unresolved_indexes:
+            account = candidates[slots[index] - 1]
+            if account.key in used_keys:
+                return ClientBatchAccountResolution([], "identity_conflict", "槽位映射与已有稳定账号身份冲突")
+            assignments[index] = account
+            used_keys.add(account.key)
+
+    ordered_accounts: list[AccountConfig] = []
+    for index, binding in sorted(enumerate(bindings), key=lambda item: slots[item[0]]):
+        account = assignments[index]
+        binding.account_id = account.key
+        binding.account_key = account.key
+        binding.account_name = account.display_name
+        binding.refresh_account_name = str(account.bookmark_title or account.bookmark_no)
+        binding.slot_index = slots[index]
+        binding.identity_status = "resolved"
+        ordered_accounts.append(account)
+    return ClientBatchAccountResolution(ordered_accounts, "resolved", "批次账号身份已解析", len(ordered_accounts))
+
+
 def _group_counts_for_accounts(accounts: list[AccountConfig] | tuple[AccountConfig, ...]) -> tuple[tuple[str, int], ...]:
     counts: dict[str, int] = {}
     for account in accounts:
@@ -516,7 +662,1433 @@ def _format_group_counts(group_counts: tuple[tuple[str, int], ...]) -> str:
     return "、".join(f"{group} {count} 个" for group, count in group_counts) if group_counts else "无"
 
 
+def _build_gui_refresh_login_capturer(playwright_capturer, log, fallback_confirm=None):
+    options = DirectLinkLoginOptions(mode="auto")
+    har_payload = load_http_har_for_mode(options, log=log)
+    return create_login_capturer(
+        options,
+        har_payload,
+        playwright_capturer=playwright_capturer,
+        log=log,
+        fallback_confirm=fallback_confirm,
+    )
+
+
+def _bookmark_write_context_from_owner(owner) -> BookmarkWriteContext | None:
+    try:
+        bookmark_file = Path(str(owner.bookmark_path.get() or "").strip())
+        root_path = str(owner.bookmark_root_path.get() or "").strip()
+        root_name = str(owner.bookmark_root_name.get() or "").strip()
+        root_guid = str(getattr(owner, "bookmark_root_guid", None).get() or "").strip() if getattr(owner, "bookmark_root_guid", None) is not None else ""
+        root_parent_path = str(getattr(owner, "bookmark_root_parent_path", None).get() or "").strip() if getattr(owner, "bookmark_root_parent_path", None) is not None else ""
+    except Exception:
+        return None
+    if not bookmark_file.is_file() or not root_name or not (root_guid or root_path or root_parent_path):
+        return None
+    try:
+        info = describe_bookmark_file(bookmark_file)
+    except Exception:
+        return None
+    if not root_parent_path and "/children/" in root_path:
+        root_parent_path = root_path.rsplit("/children/", 1)[0]
+    return BookmarkWriteContext(
+        bookmark_file=bookmark_file,
+        browser=str(info.browser or ""),
+        profile=str(info.profile or ""),
+        root_path=root_path,
+        root_name=root_name,
+        root_guid=root_guid,
+        root_parent_path=root_parent_path,
+        allow_create_root=True,
+    )
+
+
+def _refresh_account_aliases(account: AccountConfig) -> set[str]:
+    return {
+        str(value or "").strip()
+        for value in (
+            account.key,
+            account.bookmark_title,
+            account.bookmark_no,
+            account.display_name,
+        )
+        if str(value or "").strip()
+    }
+
+
+def _synchronize_refreshed_urls(owner, results) -> dict[str, int]:
+    counts = {"accounts": 0, "bindings": 0, "conflicts": 0}
+    accounts = list(getattr(owner, "accounts", []) or [])
+    batch_store = getattr(owner, "client_batch_store", None)
+    bindings = []
+    if batch_store is not None and getattr(batch_store, "batches", None):
+        try:
+            bindings = list(batch_store.current_batch().bindings)
+        except Exception:
+            bindings = []
+
+    for result in results:
+        direct_url = str(getattr(result, "direct_url", "") or "").strip()
+        result_name = str(getattr(result, "name", "") or "").strip()
+        if not direct_url or not result_name:
+            continue
+        account_indexes = [
+            index
+            for index, account in enumerate(accounts)
+            if result_name in _refresh_account_aliases(account)
+        ]
+        if len(account_indexes) > 1:
+            counts["conflicts"] += 1
+            continue
+
+        matched_account = None
+        if len(account_indexes) == 1:
+            account_index = account_indexes[0]
+            matched_account = accounts[account_index]
+            if str(matched_account.url or "") != direct_url:
+                accounts[account_index] = replace(matched_account, url=direct_url)
+                matched_account = accounts[account_index]
+                counts["accounts"] += 1
+
+        binding_matches = []
+        for binding in bindings:
+            aliases = {
+                str(getattr(binding, "account_id", "") or "").strip(),
+                str(getattr(binding, "account_name", "") or "").strip(),
+            }
+            expected = {result_name}
+            if matched_account is not None:
+                expected.update({matched_account.key, matched_account.display_name})
+            if aliases & expected:
+                binding_matches.append(binding)
+        if len(binding_matches) == 1:
+            binding = binding_matches[0]
+            if str(getattr(binding, "login_url", "") or "") != direct_url:
+                binding.login_url = direct_url
+                counts["bindings"] += 1
+        elif len(binding_matches) > 1:
+            counts["conflicts"] += 1
+
+    owner.accounts = accounts
+    if counts["accounts"]:
+        refresh_table = getattr(owner, "_refresh_table", None)
+        if callable(refresh_table):
+            refresh_table()
+        refresh_choices = getattr(owner, "_refresh_account_choices", None)
+        if callable(refresh_choices):
+            refresh_choices()
+    if counts["bindings"] and batch_store is not None:
+        batch_store.save()
+    logger = getattr(owner, "_log", None)
+    if callable(logger) and any(counts.values()):
+        logger(
+            f"[刷新地址] URL同步：账号={counts['accounts']}，批次绑定={counts['bindings']}，"
+            f"冲突={counts['conflicts']}"
+        )
+    return counts
+
+
+def _inject_latest_client_direct_urls(owner, accounts: list[AccountConfig]) -> list[AccountConfig]:
+    direct_links_path = getattr(owner, "refresh_direct_links_path", None)
+    if direct_links_path is None:
+        direct_links_path = ensure_refresh_data_dir().direct_links_path
+    resolved_accounts: list[AccountConfig] = []
+    counts = {"updated": 0, "current": 0, "expired": 0, "missing": 0, "conflicts": 0, "bindings": 0}
+    records = getattr(owner, "client_direct_bindings", {}) or {}
+    batch_store = getattr(owner, "client_batch_store", None)
+    batch_bindings = []
+    batch_dirty = False
+    if batch_store is not None and getattr(batch_store, "batches", None):
+        try:
+            batch_bindings = list(batch_store.current_batch().bindings)
+        except Exception:
+            batch_bindings = []
+
+    for account in accounts:
+        matches = [
+            binding
+            for binding in batch_bindings
+            if str(getattr(binding, "account_key", "") or getattr(binding, "account_id", "")) == account.key
+        ]
+        record = records.get(account.key)
+        identity = matches[0] if len(matches) == 1 else record
+        resolved = resolve_client_direct_url_for_identity(
+            account,
+            direct_links_path,
+            account_key=str(getattr(identity, "account_key", "") or account.key),
+            refresh_account_name=str(getattr(identity, "refresh_account_name", "") or ""),
+            bookmark_path=str(getattr(identity, "bookmark_path", "") or ""),
+            slot_index=int(getattr(identity, "slot_index", 0) or 0),
+        )
+        binding_identity_conflict = len(matches) > 1
+        if not binding_identity_conflict and resolved.status in {"found", "expired"} and resolved.direct_url:
+            updated_account = replace(account, url=resolved.direct_url)
+            resolved_accounts.append(updated_account)
+            if resolved.direct_url != account.url:
+                counts["updated"] += 1
+            if resolved.expired:
+                counts["expired"] += 1
+            if record is not None:
+                if str(getattr(record, "login_url", "") or "") != resolved.direct_url:
+                    record.login_url = resolved.direct_url
+                    counts["bindings"] += 1
+                record.account_id = account.key
+                record.account_key = account.key
+                record.refresh_account_name = resolved.name
+                record.bookmark_path = resolved.bookmark_path
+                record.identity_status = "resolved"
+                record.link_status = "expired" if resolved.expired else "ready"
+            if len(matches) == 1:
+                binding = matches[0]
+                before = (
+                    str(getattr(binding, "login_url", "") or ""),
+                    str(getattr(binding, "account_id", "") or ""),
+                    str(getattr(binding, "account_key", "") or ""),
+                    str(getattr(binding, "refresh_account_name", "") or ""),
+                    str(getattr(binding, "bookmark_path", "") or ""),
+                    str(getattr(binding, "identity_status", "") or ""),
+                    str(getattr(binding, "link_status", "") or ""),
+                )
+                binding.login_url = resolved.direct_url
+                binding.account_id = account.key
+                binding.account_key = account.key
+                binding.refresh_account_name = resolved.name
+                binding.bookmark_path = resolved.bookmark_path
+                binding.identity_status = "resolved"
+                binding.link_status = "expired" if resolved.expired else "ready"
+                after = (
+                    binding.login_url,
+                    binding.account_id,
+                    binding.account_key,
+                    binding.refresh_account_name,
+                    binding.bookmark_path,
+                    binding.identity_status,
+                    binding.link_status,
+                )
+                if after != before:
+                    batch_dirty = True
+                if before[0] != resolved.direct_url:
+                    counts["bindings"] += 1
+                else:
+                    counts["current"] += 1
+            elif len(matches) > 1:
+                counts["conflicts"] += 1
+            continue
+        resolved_accounts.append(account)
+        link_status = "link_conflict" if binding_identity_conflict or resolved.status == "conflict" else "link_missing"
+        if resolved.status != "conflict" and is_complete_direct_login_url(account.url):
+            link_status = "fallback_valid"
+        if record is not None:
+            record.link_status = link_status
+            if link_status == "fallback_valid":
+                record.login_url = account.url
+        for binding in matches:
+            before = (
+                str(getattr(binding, "login_url", "") or ""),
+                str(getattr(binding, "link_status", "") or ""),
+            )
+            binding.link_status = link_status
+            if link_status == "fallback_valid":
+                binding.login_url = account.url
+            after = (
+                str(getattr(binding, "login_url", "") or ""),
+                str(getattr(binding, "link_status", "") or ""),
+            )
+            if after != before:
+                batch_dirty = True
+        if binding_identity_conflict or resolved.status == "conflict":
+            counts["conflicts"] += 1
+        else:
+            counts["missing"] += 1
+
+    if batch_dirty and batch_store is not None:
+        batch_store.save()
+    logger = getattr(owner, "_log", None) or getattr(owner, "_queue_log", None)
+    if callable(logger):
+        logger(
+            "[客户端直登] 最新链接注入："
+            f"更新={counts['updated']}，已是最新={counts['current']}，过期提示={counts['expired']}，缺失={counts['missing']}，"
+            f"冲突={counts['conflicts']}，binding更新={counts['bindings']}"
+        )
+    return resolved_accounts
+
+
+def _refresh_status_display(status: str) -> str:
+    clean_status = str(status or "").strip()
+    labels = {
+        "local_success": "本地刷新成功",
+        "bookmark_success": "收藏夹刷新成功",
+        "bookmark_update_skipped": "本地成功/收藏夹未写回",
+        "bookmark_not_found": "本地成功/收藏夹未找到",
+        "bookmark_conflict": "本地成功/收藏夹冲突",
+        "bookmark_browser_running": "本地成功/浏览器运行未写回",
+        "bookmark_write_failed": "本地成功/收藏夹写入失败",
+        "capture_failed": "刷新失败",
+        "login_failed": "登录失败",
+        "write_failed": "写入失败",
+        "stopping": "停止中",
+        "stopped": "已停止",
+    }
+    return labels.get(clean_status, clean_status or "待刷新")
+
+
+def _refresh_status_tag(status: str) -> str:
+    clean_status = str(status or "").strip()
+    if clean_status in {"local_success", "bookmark_success", "success"}:
+        return "success"
+    if clean_status == "bookmark_update_skipped":
+        return "skip"
+    if clean_status in {
+        "bookmark_not_found",
+        "bookmark_conflict",
+        "bookmark_browser_running",
+        "bookmark_write_failed",
+    } or "failed" in clean_status or "失败" in clean_status:
+        return "failed"
+    if clean_status in {"skipped", "stopped"}:
+        return "skip"
+    if clean_status == "stopping":
+        return "running"
+    return "running" if clean_status not in {"", "待刷新"} else ""
+
+
+def _format_refresh_summary(summary) -> str:
+    return (
+        f"总数 {summary.total} / 成功 {summary.success} / 失败 {summary.failure} / "
+        f"本地链接 {summary.local_links} / 收藏夹成功 {summary.bookmark_success} / "
+        f"收藏夹未写回 {getattr(summary, 'bookmark_skipped', 0)} / 收藏夹失败 {summary.bookmark_failure}"
+    )
+
+
+def _refresh_password_display(password: str) -> str:
+    return "******" if str(password or "") else ""
+
+
+def _parse_refresh_json_or_jsonp(text: str) -> dict[str, object]:
+    clean = str(text or "").strip()
+    match = re.match(r"^[\w$.]+\((.*)\)\s*;?$", clean, re.S)
+    if match:
+        clean = match.group(1)
+    try:
+        payload = json.loads(clean)
+    except json.JSONDecodeError as exc:
+        raise CaptureFailed(f"h5sdk/login 响应不是有效 JSON/JSONP: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise CaptureFailed("h5sdk/login 响应不是对象")
+    return payload
+
+
+def _extract_refresh_login_fields(payload: dict[str, object]) -> DirectLoginFields:
+    state = payload.get("state")
+    if str(state) not in {"1", "True", "true"}:
+        raise LoginFailed(str(payload.get("msg") or "登录接口返回失败"))
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        raise CaptureFailed("h5sdk/login 响应缺少 data 对象")
+    fields = DirectLoginFields(
+        token=str(data.get("token") or ""),
+        time=str(data.get("time") or ""),
+        sign=str(data.get("sign") or ""),
+        uid=str(data.get("uid") or ""),
+        uname=str(data.get("uname") or ""),
+    )
+    try:
+        fields.validate()
+    except ValueError as exc:
+        raise CaptureFailed(str(exc)) from exc
+    return fields
+
+
+def _centered_child_position(
+    owner_bounds: tuple[int, int, int, int],
+    child_size: tuple[int, int],
+    work_area: tuple[int, int, int, int],
+) -> tuple[int, int]:
+    owner_x, owner_y, owner_width, owner_height = (int(value) for value in owner_bounds)
+    child_width, child_height = (max(1, int(value)) for value in child_size)
+    work_left, work_top, work_right, work_bottom = (int(value) for value in work_area)
+    x = owner_x + (max(1, owner_width) - child_width) // 2
+    y = owner_y + (max(1, owner_height) - child_height) // 2
+    max_x = max(work_left, work_right - child_width)
+    max_y = max(work_top, work_bottom - child_height)
+    return min(max(x, work_left), max_x), min(max(y, work_top), max_y)
+
+
+def _tk_top_level_window_id(widget) -> int:
+    try:
+        return int(str(widget.wm_frame()), 0)
+    except Exception:
+        return int(widget.winfo_id())
+
+
+def _native_window_bounds(widget) -> tuple[int, int, int, int] | None:
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        rect = wintypes.RECT()
+        get_window_rect = ctypes.windll.user32.GetWindowRect
+        get_window_rect.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.RECT))
+        get_window_rect.restype = wintypes.BOOL
+        if get_window_rect(wintypes.HWND(_tk_top_level_window_id(widget)), ctypes.byref(rect)):
+            return (
+                int(rect.left),
+                int(rect.top),
+                max(1, int(rect.right - rect.left)),
+                max(1, int(rect.bottom - rect.top)),
+            )
+    except Exception:
+        pass
+    return None
+
+
+def _monitor_work_area_for_owner(owner) -> tuple[int, int, int, int]:
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class MonitorInfo(ctypes.Structure):
+                _fields_ = (
+                    ("cbSize", wintypes.DWORD),
+                    ("rcMonitor", wintypes.RECT),
+                    ("rcWork", wintypes.RECT),
+                    ("dwFlags", wintypes.DWORD),
+                )
+
+            user32 = ctypes.windll.user32
+            monitor_from_window = user32.MonitorFromWindow
+            monitor_from_window.argtypes = (wintypes.HWND, wintypes.DWORD)
+            monitor_from_window.restype = wintypes.HANDLE
+            get_monitor_info = user32.GetMonitorInfoW
+            get_monitor_info.argtypes = (wintypes.HANDLE, ctypes.POINTER(MonitorInfo))
+            get_monitor_info.restype = wintypes.BOOL
+            monitor = monitor_from_window(wintypes.HWND(_tk_top_level_window_id(owner)), 2)
+            info = MonitorInfo(cbSize=ctypes.sizeof(MonitorInfo))
+            if monitor and get_monitor_info(monitor, ctypes.byref(info)):
+                work = info.rcWork
+                return int(work.left), int(work.top), int(work.right), int(work.bottom)
+        except Exception:
+            pass
+
+    try:
+        left = int(owner.winfo_vrootx())
+        top = int(owner.winfo_vrooty())
+        width = max(1, int(owner.winfo_vrootwidth()))
+        height = max(1, int(owner.winfo_vrootheight()))
+    except Exception:
+        left = 0
+        top = 0
+        width = max(1, int(owner.winfo_screenwidth()))
+        height = max(1, int(owner.winfo_screenheight()))
+    return left, top, left + width, top + height
+
+
+def _move_tk_window(dialog, x: int, y: int) -> None:
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            set_window_pos = ctypes.windll.user32.SetWindowPos
+            set_window_pos.argtypes = (
+                wintypes.HWND,
+                wintypes.HWND,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                wintypes.UINT,
+            )
+            set_window_pos.restype = wintypes.BOOL
+            flags = 0x0001 | 0x0004 | 0x0010
+            if set_window_pos(
+                wintypes.HWND(_tk_top_level_window_id(dialog)),
+                wintypes.HWND(0),
+                x,
+                y,
+                0,
+                0,
+                flags,
+            ):
+                return
+        except Exception:
+            pass
+    dialog.geometry(f"{int(x):+d}{int(y):+d}")
+
+
+def _position_dialog_relative_to_owner(
+    dialog,
+    owner,
+    *,
+    work_area_provider=None,
+    move_window=None,
+) -> tuple[int, int]:
+    dialog.update_idletasks()
+    dialog_bounds = _native_window_bounds(dialog)
+    if dialog_bounds is not None:
+        width, height = dialog_bounds[2:]
+    else:
+        width = int(dialog.winfo_width())
+        height = int(dialog.winfo_height())
+        if width <= 1:
+            width = int(dialog.winfo_reqwidth())
+        if height <= 1:
+            height = int(dialog.winfo_reqheight())
+    owner_bounds = _native_window_bounds(owner)
+    if owner_bounds is None:
+        owner_bounds = (
+            int(owner.winfo_rootx()),
+            int(owner.winfo_rooty()),
+            int(owner.winfo_width()),
+            int(owner.winfo_height()),
+        )
+    provider = work_area_provider or _monitor_work_area_for_owner
+    position = _centered_child_position(owner_bounds, (width, height), provider(owner))
+    mover = move_window or _move_tk_window
+    mover(dialog, *position)
+    return position
+
+
+class RefreshAddressDialog(tk.Toplevel):
+    columns = ("checked", "name", "username", "password", "bookmark_path", "mode", "status", "message")
+
+    def __init__(self, owner: "LauncherApp") -> None:
+        super().__init__(owner)
+        self.withdraw()
+        self.owner = owner
+        self.title("刷新客户端直登地址")
+        self.geometry("1080x560")
+        self.minsize(980, 500)
+        self.transient(owner)
+        self.paths = ensure_refresh_data_dir()
+        self.account_store = AccountsStore(self.paths.accounts_path)
+        self.channels = load_channels(self.paths.data_dir)
+        self.accounts: list[RefreshAccount] = []
+        self.checked_names: set[str] = set()
+        self.message_by_name: dict[str, str] = {}
+        self.stop_event = threading.Event()
+        self.worker_thread: threading.Thread | None = None
+        self._close_when_idle = False
+        self.channel_var = tk.StringVar(value=next(iter(self.channels), "正式服"))
+        self.status_var = tk.StringVar(value=f"数据目录：{self.paths.data_dir}")
+        self.bookmark_context_var = tk.StringVar(value=self._bookmark_context_label())
+        self.backup_var = tk.StringVar(value="收藏夹备份：尚未生成")
+        self.sync_bookmarks_var = tk.BooleanVar(value=self._load_sync_bookmark_preference())
+        self._build_widgets()
+        self._load_accounts()
+        _position_dialog_relative_to_owner(self, owner)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.deiconify()
+        self.lift()
+        self.focus_set()
+
+    def _build_widgets(self) -> None:
+        root = ttk.Frame(self, padding=10)
+        root.pack(fill=tk.BOTH, expand=True)
+        root.rowconfigure(2, weight=1)
+        root.columnconfigure(0, weight=1)
+
+        top = ttk.Frame(root)
+        top.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        ttk.Label(top, text="登录渠道：").pack(side=tk.LEFT)
+        ttk.Combobox(
+            top,
+            textvariable=self.channel_var,
+            values=tuple(self.channels.keys()),
+            width=16,
+            state="readonly",
+        ).pack(side=tk.LEFT, padx=(4, 16))
+        ttk.Label(top, textvariable=self.status_var, foreground="#666666").pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        context_row = ttk.Frame(root)
+        context_row.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        ttk.Label(context_row, textvariable=self.bookmark_context_var).pack(side=tk.LEFT)
+        ttk.Checkbutton(
+            context_row,
+            text="刷新成功后同步/导入收藏夹",
+            variable=self.sync_bookmarks_var,
+            command=self._save_sync_bookmark_preference,
+        ).pack(side=tk.LEFT, padx=(16, 0))
+        ttk.Label(context_row, textvariable=self.backup_var, foreground="#666666").pack(side=tk.LEFT, padx=(16, 8))
+        ttk.Button(context_row, text="打开备份目录", command=lambda: self._open_directory(self.paths.backups_dir)).pack(side=tk.RIGHT)
+        ttk.Button(context_row, text="打开直登链接目录", command=lambda: self._open_directory(self.paths.url_dir)).pack(side=tk.RIGHT, padx=(0, 6))
+
+        table_frame = ttk.Frame(root)
+        table_frame.grid(row=2, column=0, sticky="nsew")
+        table_frame.rowconfigure(0, weight=1)
+        table_frame.columnconfigure(0, weight=1)
+        self.tree = ttk.Treeview(table_frame, columns=self.columns, show="headings", selectmode="extended", height=12)
+        headings = {
+            "checked": "勾选",
+            "name": "名称",
+            "username": "账号",
+            "password": "密码",
+            "bookmark_path": "收藏夹位置",
+            "mode": "刷新方式",
+            "status": "状态",
+            "message": "消息",
+        }
+        widths = {
+            "checked": 52,
+            "name": 90,
+            "username": 140,
+            "password": 70,
+            "bookmark_path": 220,
+            "mode": 82,
+            "status": 110,
+            "message": 260,
+        }
+        for column in self.columns:
+            self.tree.heading(column, text=headings[column])
+            self.tree.column(
+                column,
+                width=widths[column],
+                anchor=tk.CENTER if column in {"checked", "password", "mode", "status"} else tk.W,
+            )
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(table_frame, command=self.tree.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        self.tree.configure(yscrollcommand=scrollbar.set)
+        self.tree.bind("<Button-1>", self._on_tree_click)
+        self.tree.bind("<space>", lambda _event: self._toggle_selected_checked())
+        self.tree.tag_configure("success", foreground="#008800")
+        self.tree.tag_configure("failed", foreground="#cc0000")
+        self.tree.tag_configure("running", foreground="#0066cc")
+        self.tree.tag_configure("skip", foreground="#888888")
+
+        actions = ttk.Frame(root)
+        actions.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        for text, command in (
+            ("新增账号", self._add_account),
+            ("编辑账号", self._edit_selected_account),
+            ("移除账号", self._delete_selected_accounts),
+            ("导入账号", self._import_file),
+            ("从剪贴板导入", self._import_clipboard),
+            ("清空列表", self._clear_accounts),
+            ("测试选中账号", self._test_selected),
+            ("刷新选中", self._refresh_selected),
+            ("刷新全部", self._refresh_all),
+            ("同步现有链接到收藏夹", self._sync_existing_links_to_bookmarks),
+            ("停止刷新", self._stop_refresh),
+            ("关闭", self._close),
+        ):
+            ttk.Button(actions, text=text, command=command).pack(side=tk.LEFT, padx=(0, 6), pady=2)
+
+    def _bookmark_context_label(self) -> str:
+        context = _bookmark_write_context_from_owner(self.owner)
+        if context is None:
+            return "收藏夹：未配置可写入的 Bookmarks/profile"
+        return f"收藏夹：{context.browser or '未知浏览器'} / {context.profile or '未知 profile'}"
+
+    def _load_sync_bookmark_preference(self) -> bool:
+        path = self.paths.data_dir / "refresh_preferences.json"
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
+            return bool(payload.get("sync_bookmarks_after_refresh", False))
+        except Exception:
+            return False
+
+    def _save_sync_bookmark_preference(self) -> None:
+        path = self.paths.data_dir / "refresh_preferences.json"
+        temp = path.with_suffix(path.suffix + ".tmp")
+        temp.write_text(json.dumps({"sync_bookmarks_after_refresh": bool(self.sync_bookmarks_var.get())}, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp.replace(path)
+
+    def _open_directory(self, path: Path) -> None:
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            os.startfile(str(path))
+        except Exception as exc:
+            messagebox.showerror("打开目录", redact_sensitive_text(exc), parent=self)
+
+    def _load_accounts(self) -> None:
+        self.accounts = self.account_store.load()
+        self.checked_names = {account.name for account in self.accounts if account.enabled}
+        self._refresh_table()
+
+    def _save_accounts(self) -> None:
+        self.account_store.save(self.accounts)
+
+    def _refresh_table(self) -> None:
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        for account in self.accounts:
+            status = account.last_status or "待刷新"
+            tag = "skip" if not account.enabled else _refresh_status_tag(status)
+            self.tree.insert("", tk.END, iid=account.name, values=self._row_values(account), tags=(tag,))
+
+    def _row_values(self, account: RefreshAccount) -> tuple[str, str, str, str, str, str, str, str]:
+        return (
+            "☑" if account.name in self.checked_names else "☐",
+            account.name,
+            account.username,
+            _refresh_password_display(account.password),
+            account.bookmark_path,
+            account.refresh_mode,
+            _refresh_status_display(account.last_status or "待刷新"),
+            self.message_by_name.get(account.name, ""),
+        )
+
+    def _on_tree_click(self, event: object) -> None:
+        row_id = self.tree.identify_row(getattr(event, "y", 0))
+        column = self.tree.identify_column(getattr(event, "x", 0))
+        if row_id and column == "#1":
+            self._toggle_checked(row_id)
+
+    def _toggle_checked(self, name: str) -> None:
+        if name in self.checked_names:
+            self.checked_names.remove(name)
+        else:
+            self.checked_names.add(name)
+        account = self._account_by_name(name)
+        if account is not None and self.tree.exists(name):
+            self.tree.item(name, values=self._row_values(account))
+
+    def _toggle_selected_checked(self) -> None:
+        for name in self.tree.selection():
+            self._toggle_checked(str(name))
+
+    def _account_by_name(self, name: str) -> RefreshAccount | None:
+        for account in self.accounts:
+            if account.name == name:
+                return account
+        return None
+
+    def _selected_names(self) -> set[str]:
+        checked = {name for name in self.checked_names if self._account_by_name(name) is not None}
+        if checked:
+            return checked
+        return {str(name) for name in self.tree.selection()}
+
+    def _selected_accounts(self) -> list[RefreshAccount]:
+        names = self._selected_names()
+        return [account for account in self.accounts if account.name in names]
+
+    def _add_account(self) -> None:
+        account = self._account_editor("新增账号")
+        if account is None:
+            return
+        self.accounts = merge_accounts_by_name([*self.accounts, account])
+        self.checked_names.add(account.name)
+        self._save_accounts()
+        self._refresh_table()
+
+    def _edit_selected_account(self) -> None:
+        selected = self._selected_accounts()
+        if len(selected) != 1:
+            messagebox.showwarning("编辑账号", "请选择一个账号。", parent=self)
+            return
+        account = self._account_editor("编辑账号", selected[0])
+        if account is None:
+            return
+        self.accounts = [account if item.name == selected[0].name else item for item in self.accounts]
+        if selected[0].name != account.name:
+            self.checked_names.discard(selected[0].name)
+        self.checked_names.add(account.name)
+        self._save_accounts()
+        self._refresh_table()
+
+    def _account_editor(self, title: str, account: RefreshAccount | None = None) -> RefreshAccount | None:
+        dialog = tk.Toplevel(self)
+        dialog.title(title)
+        dialog.transient(self)
+        dialog.resizable(False, False)
+        frame = ttk.Frame(dialog, padding=12)
+        frame.pack(fill=tk.BOTH, expand=True)
+        name_var = tk.StringVar(value=getattr(account, "name", ""))
+        username_var = tk.StringVar(value=getattr(account, "username", ""))
+        password_var = tk.StringVar(value=getattr(account, "password", ""))
+        bookmark_var = tk.StringVar(value=getattr(account, "bookmark_path", ""))
+        bookmark_preview_var = tk.StringVar(value="")
+        channel_var = tk.StringVar(value=getattr(account, "channel", self.channel_var.get()) or self.channel_var.get())
+        enabled_var = tk.BooleanVar(value=bool(getattr(account, "enabled", True)))
+        fields = (
+            ("名称", name_var, False),
+            ("账号", username_var, False),
+            ("密码", password_var, True),
+            ("收藏夹位置", bookmark_var, False),
+        )
+        for row, (label, var, secret) in enumerate(fields):
+            ttk.Label(frame, text=label, width=12, anchor="e").grid(row=row, column=0, sticky="e", padx=(0, 8), pady=4)
+            ttk.Entry(frame, textvariable=var, width=42, show="*" if secret else "").grid(row=row, column=1, sticky="ew", pady=4)
+        ttk.Label(frame, textvariable=bookmark_preview_var, foreground="#666666").grid(
+            row=4, column=1, sticky="w", pady=(0, 4)
+        )
+        ttk.Label(frame, text="登录渠道", width=12, anchor="e").grid(row=5, column=0, sticky="e", padx=(0, 8), pady=4)
+        ttk.Combobox(frame, textvariable=channel_var, values=tuple(self.channels.keys()), width=39, state="readonly").grid(
+            row=5, column=1, sticky="ew", pady=4
+        )
+        ttk.Checkbutton(frame, text="启用", variable=enabled_var).grid(row=6, column=1, sticky="w", pady=4)
+        result: dict[str, RefreshAccount] = {}
+
+        def update_bookmark_preview(*_args) -> None:
+            context = _bookmark_write_context_from_owner(self.owner)
+            preview = BookmarkUrlUpdater(context=context, dry_run=True).preview(bookmark_var.get())
+            bookmark_preview_var.set(preview.message)
+
+        bookmark_var.trace_add("write", update_bookmark_preview)
+        update_bookmark_preview()
+
+        def save() -> None:
+            name = name_var.get().strip()
+            username = username_var.get().strip()
+            password = password_var.get()
+            missing = [field for field, value in (("名称", name), ("账号", username), ("密码", password)) if not str(value).strip()]
+            if missing:
+                messagebox.showwarning(title, "缺少字段：" + "、".join(missing), parent=dialog)
+                return
+            result["account"] = RefreshAccount(
+                name=name,
+                username=username,
+                password=password,
+                channel=channel_var.get().strip() or "正式服",
+                bookmark_path=bookmark_var.get().strip(),
+                enabled=bool(enabled_var.get()),
+                remark=getattr(account, "remark", "") if account is not None else "",
+                last_refresh_time=getattr(account, "last_refresh_time", "") if account is not None else "",
+                expire_hint=getattr(account, "expire_hint", "") if account is not None else "",
+                last_status=getattr(account, "last_status", "待刷新") if account is not None else "待刷新",
+            )
+            dialog.destroy()
+
+        button_row = ttk.Frame(frame)
+        button_row.grid(row=7, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        ttk.Button(button_row, text="保存", command=save).pack(side=tk.RIGHT, padx=(8, 0))
+        ttk.Button(button_row, text="取消", command=dialog.destroy).pack(side=tk.RIGHT)
+        dialog.grab_set()
+        dialog.wait_window()
+        return result.get("account")
+
+    def _delete_selected_accounts(self) -> None:
+        names = self._selected_names()
+        if not names:
+            messagebox.showwarning("移除账号", "请先勾选或选择账号。", parent=self)
+            return
+        if not messagebox.askyesno(
+            "移除账号",
+            "仅从上号器本地账号库、直登链接库、生成的 .url、批次绑定和运行缓存中移除。\n"
+            "不会删除原始 CSV/Excel/文本导入文件，也不会删除浏览器收藏夹。\n\n"
+            f"确定移除选中的 {len(names)} 个账号吗？",
+            parent=self,
+        ):
+            return
+        results = []
+        for name in sorted(names):
+            account_keys = {
+                account.key
+                for account in list(getattr(self.owner, "accounts", []) or [])
+                if name in _refresh_account_aliases(account)
+            }
+            result = delete_refresh_account_resources(
+                self.paths,
+                name,
+                account_keys=account_keys,
+                client_batch_store=getattr(self.owner, "client_batch_store", None),
+                runtime_cache=getattr(self.owner, "client_direct_bindings", None),
+            )
+            results.append(result)
+            if result.account_removed and account_keys:
+                self.owner.accounts = [
+                    account for account in list(getattr(self.owner, "accounts", []) or [])
+                    if account.key not in account_keys
+                ]
+        self.accounts = self.account_store.load()
+        self.checked_names -= names
+        self._refresh_table()
+        refresh_table = getattr(self.owner, "_refresh_table", None)
+        if callable(refresh_table):
+            refresh_table()
+        refresh_choices = getattr(self.owner, "_refresh_account_choices", None)
+        if callable(refresh_choices):
+            refresh_choices()
+        removed_files = sum(len(result.url_files_removed) for result in results)
+        removed_bindings = sum(result.bindings_removed for result in results)
+        removed_accounts = sum(1 for result in results if result.account_removed)
+        errors = sum(len(result.errors) for result in results)
+        self.status_var.set(
+            f"账号记录 {removed_accounts}/{len(results)}，生成链接 {removed_files} 个，"
+            f"批次关联 {removed_bindings} 个，失败 {errors} 项"
+        )
+        self.owner._log(
+            f"[刷新地址] 移除账号：账号记录={removed_accounts}/{len(results)}，生成链接={removed_files}，"
+            f"批次关联={removed_bindings}，失败={errors}"
+        )
+        reload_accounts = getattr(self.owner, "_load_accounts", None)
+        if callable(reload_accounts):
+            reload_accounts()
+
+    def _clear_accounts(self) -> None:
+        if not messagebox.askyesno("清空列表", "确定清空弹窗内账号列表吗？不会删除直登链接库。", parent=self):
+            return
+        self.accounts = []
+        self.checked_names.clear()
+        self._save_accounts()
+        self._refresh_table()
+
+    def _import_file(self) -> None:
+        path = filedialog.askopenfilename(
+            title="导入账号文件",
+            filetypes=[("账号文件", "*.csv *.txt *.xlsx"), ("CSV", "*.csv"), ("文本", "*.txt"), ("Excel", "*.xlsx"), ("所有文件", "*.*")],
+            parent=self,
+        )
+        if not path:
+            return
+        try:
+            imported = import_accounts_from_file(path, channel=self.channel_var.get())
+        except Exception as exc:
+            messagebox.showerror("导入账号", str(exc), parent=self)
+            return
+        self._merge_imported_accounts(imported.accounts)
+        self.status_var.set(f"导入 {len(imported.accounts)} 个，失败 {len(imported.failures)} 行")
+        if imported.failures:
+            self.owner._log(f"[刷新地址] 导入账号失败行数={len(imported.failures)}，未写入账号密码。")
+
+    def _import_clipboard(self) -> None:
+        try:
+            text = self.clipboard_get()
+            imported = import_accounts_from_text(text, channel=self.channel_var.get())
+        except Exception as exc:
+            messagebox.showerror("剪贴板导入", str(exc), parent=self)
+            return
+        self._merge_imported_accounts(imported.accounts)
+        self.status_var.set(f"剪贴板导入 {len(imported.accounts)} 个，失败 {len(imported.failures)} 行")
+
+    def _merge_imported_accounts(self, accounts: list[RefreshAccount]) -> None:
+        self.accounts = merge_accounts_by_name([*self.accounts, *accounts])
+        self.checked_names.update(account.name for account in accounts)
+        self._save_accounts()
+        self._refresh_table()
+
+    def _test_selected(self) -> None:
+        selected = self._selected_accounts()
+        if not selected:
+            messagebox.showwarning("测试选中账号", "请先勾选或选择账号。", parent=self)
+            return
+        self._start_refresh(selected[:1])
+
+    def _refresh_selected(self) -> None:
+        selected = self._selected_accounts()
+        if not selected:
+            messagebox.showwarning("刷新选中", "请先勾选或选择账号。", parent=self)
+            return
+        self._start_refresh(selected)
+
+    def _refresh_all(self) -> None:
+        self._start_refresh(list(self.accounts))
+
+    def _start_refresh(self, accounts: list[RefreshAccount]) -> None:
+        if self.worker_thread and self.worker_thread.is_alive():
+            messagebox.showwarning("刷新地址", "已有刷新任务正在运行。", parent=self)
+            return
+        enabled_accounts = [account for account in accounts if account.enabled]
+        if not enabled_accounts:
+            messagebox.showwarning("刷新地址", "没有启用的账号可刷新。", parent=self)
+            return
+        try:
+            import requests  # noqa: F401
+        except Exception:
+            messagebox.showerror("刷新地址", "当前项目解释器缺少 requests，批量刷新已停止，不会自动打开 Playwright 浏览器。", parent=self)
+            return
+        self._save_accounts()
+        self.stop_event.clear()
+        self._set_busy(True)
+        for account in enabled_accounts:
+            self._set_account_status(account.name, "刷新中", "")
+        self._save_sync_bookmark_preference()
+        bookmark_context = _bookmark_write_context_from_owner(self.owner) if self.sync_bookmarks_var.get() else None
+        self.worker_thread = threading.Thread(
+            target=self._refresh_worker,
+            args=(enabled_accounts, bookmark_context),
+            daemon=True,
+        )
+        self.worker_thread.start()
+
+    def _refresh_worker(
+        self,
+        accounts: list[RefreshAccount],
+        bookmark_context: BookmarkWriteContext | None,
+    ) -> None:
+        try:
+            bookmark_updater = BookmarkUrlUpdater(
+                context=bookmark_context,
+                backups_dir=self.paths.backups_dir,
+                dry_run=bookmark_context is None,
+                log=lambda message: self._thread_log(message),
+            )
+            service = DirectLinkRefreshService(
+                data_dir=self.paths.data_dir,
+                login_capturer=_build_gui_refresh_login_capturer(
+                    self._capture_login_fields,
+                    self._thread_log,
+                    self._confirm_playwright_fallback,
+                ),
+                bookmark_updater=bookmark_updater,
+                log=lambda message: self._thread_log(message),
+                root_create_confirm=self._confirm_root_creation,
+                bookmark_plan_confirm=self._confirm_bookmark_plan,
+            )
+            summary = service.refresh_accounts(
+                accounts,
+                channel_name=self.channel_var.get(),
+                names={account.name for account in accounts},
+                retries=1,
+                stop_event=self.stop_event,
+                progress=lambda result: self.after(0, lambda result=result: self._apply_refresh_result(result)),
+            )
+            self.after(
+                0,
+                lambda: self._complete_refresh(summary, bookmark_updater),
+            )
+        except Exception as exc:
+            message = redact_sensitive_text(exc)
+            self.after(0, lambda message=message: messagebox.showerror("刷新地址", message, parent=self))
+        finally:
+            self.after(0, lambda: self._finish_refresh())
+
+    def _complete_refresh(self, summary, bookmark_updater: BookmarkUrlUpdater) -> None:
+        status = _format_refresh_summary(summary)
+        self.status_var.set(f"已停止 / {status}" if self.stop_event.is_set() else status)
+        _synchronize_refreshed_urls(self.owner, summary.results)
+        backup_path = bookmark_updater.backup_path
+        if backup_path is not None:
+            self.backup_var.set(f"收藏夹备份：{backup_path}")
+            self.owner._log(f"[刷新地址] 收藏夹备份：{backup_path}")
+        self._persist_resolved_root_identity(bookmark_updater.last_batch_result)
+        reload_accounts = getattr(self.owner, "_load_accounts", None)
+        if callable(reload_accounts):
+            reload_accounts()
+
+    def _capture_login_fields(
+        self,
+        account: RefreshAccount,
+        channel: ChannelConfig,
+        _stop_event: threading.Event | None = None,
+    ) -> DirectLoginFields:
+        settings = load_settings(self.owner.settings_path.get())
+        runner_stop_event = _stop_event or threading.Event()
+        runner = AccountRunner(
+            AccountConfig(
+                level="刷新地址",
+                bookmark_no=0,
+                game_window_no=0,
+                url=channel.web_login_url,
+                bookmark_title=account.name,
+            ),
+            settings,
+            runner_stop_event,
+            log=lambda message, account=account: self._thread_log(self._mask_account_message(message, account)),
+            update_status=lambda _account, status: self._thread_log(f"[刷新地址][{account.name}] status={status}"),
+        )
+        runner._prepare_playwright_runtime()
+        from playwright.sync_api import sync_playwright
+
+        playwright = None
+        browser = None
+        try:
+            playwright = sync_playwright().start()
+            browser = getattr(playwright, settings.browser).launch(
+                headless=False,
+                args=[
+                    f"--window-size={settings.window_width},{settings.window_height}",
+                    "--window-position=100,100",
+                ],
+            )
+            page = browser.new_page(viewport={"width": settings.window_width, "height": settings.window_height})
+            if runner_stop_event.is_set():
+                raise InterruptedError("用户停止")
+            self._thread_log(f"[刷新地址][{account.name}] 打开登录页 host={urlparse(channel.web_login_url).netloc}")
+            page.goto(channel.web_login_url, wait_until="domcontentloaded", timeout=settings.page_load_timeout_ms)
+            if not runner._detect_login_form(page):
+                raise LoginFailed("未检测到账号密码登录界面")
+            if runner_stop_event.is_set():
+                raise InterruptedError("用户停止")
+            with page.expect_response(lambda response: LOGIN_ENDPOINT in response.url, timeout=30000) as response_info:
+                runner._fill_and_submit_login(page, account.username, account.password)
+            response = response_info.value
+            fields = _extract_refresh_login_fields(_parse_refresh_json_or_jsonp(response.text()))
+            self._thread_log(
+                f"[刷新地址][{account.name}] 捕获 h5sdk/login "
+                f"uid_len={len(fields.uid)} uname_len={len(fields.uname)} "
+                f"token_len={len(fields.token)} time_len={len(fields.time)} sign_len={len(fields.sign)}"
+            )
+            return fields
+        finally:
+            if browser is not None:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+            if playwright is not None:
+                try:
+                    playwright.stop()
+                except Exception:
+                    pass
+
+    def _confirm_playwright_fallback(self, account_name: str) -> bool:
+        completed = threading.Event()
+        decision = {"value": False}
+        def ask() -> None:
+            decision["value"] = messagebox.askyesno(
+                "HTTP 登录失败",
+                f"账号 {account_name} 的 HTTP 登录失败。是否明确回退 Playwright 浏览器？",
+                parent=self,
+            )
+            completed.set()
+        self.after(0, ask)
+        while not completed.wait(0.1):
+            if self.stop_event.is_set():
+                return False
+        return bool(decision["value"])
+
+    def _ask_worker_yes_no(self, title: str, message: str) -> bool:
+        completed = threading.Event()
+        decision = {"value": False}
+        def ask() -> None:
+            decision["value"] = messagebox.askyesno(title, message, parent=self)
+            completed.set()
+        self.after(0, ask)
+        while not completed.wait(0.1):
+            if self.stop_event.is_set():
+                return False
+        return bool(decision["value"])
+
+    def _confirm_root_creation(self, root_name: str) -> bool:
+        return self._ask_worker_yes_no(
+            "创建收藏夹账号根目录",
+            f"未找到收藏夹账号根目录“{root_name}”。\n"
+            f"已确认父位置：{self.owner.bookmark_root_parent_path.get()}\n"
+            "是否在该位置创建目录并重新绑定？",
+        )
+
+    def _confirm_bookmark_plan(self, updated: int, created: int, conflicts: int, skipped: int) -> bool:
+        return self._ask_worker_yes_no(
+            "确认收藏夹整批计划",
+            f"更新 {updated}\n新增 {created}\n冲突 {conflicts}\n跳过 {skipped}\n\n是否执行一次整批写入？",
+        )
+
+    def _persist_resolved_root_identity(self, result) -> None:
+        if result is None or not getattr(result, "root_guid", "") or not getattr(result, "root_path", ""):
+            return
+        self.owner.bookmark_root_guid.set(result.root_guid)
+        self.owner.bookmark_root_path.set(result.root_path)
+        self.owner.bookmark_root_name.set(result.root_name)
+        self.owner.bookmark_root_display_name.set(result.root_name)
+        parent_path = result.root_path.rsplit("/children/", 1)[0] if "/children/" in result.root_path else ""
+        self.owner.bookmark_root_parent_path.set(parent_path)
+        self.owner._save_bookmark_settings(self.owner.bookmark_path.get())
+        self.bookmark_context_var.set(self._bookmark_context_label())
+
+    def _sync_existing_links_to_bookmarks(self) -> None:
+        if self.worker_thread and self.worker_thread.is_alive():
+            messagebox.showwarning("同步现有链接", "已有任务正在运行。", parent=self)
+            return
+        context = _bookmark_write_context_from_owner(self.owner)
+        if context is None:
+            messagebox.showerror("同步现有链接", "未配置可安全绑定的 Bookmarks 文件和父目录。", parent=self)
+            return
+        self.stop_event.clear()
+        self._set_busy(True)
+        self.worker_thread = threading.Thread(target=self._sync_existing_links_worker, args=(context,), daemon=True)
+        self.worker_thread.start()
+
+    def _sync_existing_links_worker(self, context: BookmarkWriteContext) -> None:
+        updater = BookmarkUrlUpdater(
+            context=context, backups_dir=self.paths.backups_dir, dry_run=False,
+            log=lambda message: self._thread_log(message),
+        )
+        try:
+            accounts = self.account_store.load()
+            links = DirectLinkStore(self.paths.direct_links_path)
+            if links.load_error is not None:
+                raise RuntimeError("现有直登链接库无法读取")
+            items = []
+            skipped = 0
+            for account in accounts:
+                record = links.links.get(account.name, {})
+                direct_url = str(record.get("direct_url") or "") if isinstance(record, dict) else ""
+                if not direct_url or not str(account.bookmark_path or "").strip():
+                    skipped += 1
+                    continue
+                items.append(BookmarkBatchItem(stable_refresh_account_key(account), account.bookmark_path, direct_url))
+            result = updater.apply_batch(
+                items,
+                root_create_confirm=self._confirm_root_creation,
+                plan_confirm=lambda u, c, k, s: self._confirm_bookmark_plan(u, c, k, s + skipped),
+            )
+            updated_accounts = [replace(account, last_status=result.status) for account in accounts]
+            self.account_store.save(updated_accounts)
+            self.after(0, lambda: self._complete_existing_link_sync(result, updater))
+        except Exception as exc:
+            message = redact_sensitive_text(exc)
+            self.after(0, lambda: messagebox.showerror("同步现有链接", message, parent=self))
+        finally:
+            self.after(0, self._finish_refresh)
+
+    def _complete_existing_link_sync(self, result, updater: BookmarkUrlUpdater) -> None:
+        self.status_var.set(result.message)
+        self._persist_resolved_root_identity(updater.last_batch_result)
+        if updater.backup_path is not None:
+            self.backup_var.set(f"收藏夹备份：{updater.backup_path}")
+        self.owner._log(f"[同步现有链接] {result.message}")
+
+    def _thread_log(self, message: object) -> None:
+        self.after(0, lambda: self.owner._log(f"[刷新地址] {redact_sensitive_text(message)}"))
+
+    def _mask_account_message(self, message: object, account: RefreshAccount) -> str:
+        text = str(message if message is not None else "")
+        username = str(account.username or "")
+        password = str(account.password or "")
+        if username:
+            text = text.replace(username, "***ACCOUNT***")
+        if password:
+            text = text.replace(password, "***PASSWORD***")
+        return redact_sensitive_text(text)
+
+    def _apply_refresh_result(self, result) -> None:
+        self._set_account_status(result.name, result.status, result.message)
+        self.accounts = self.account_store.load()
+        self._refresh_table()
+
+    def _set_account_status(self, name: str, status: str, message: str) -> None:
+        self.message_by_name[name] = redact_sensitive_text(message)
+        self.accounts = [replace(account, last_status=status) if account.name == name else account for account in self.accounts]
+        account = self._account_by_name(name)
+        if account is not None and self.tree.exists(name):
+            tag = _refresh_status_tag(status)
+            self.tree.item(name, values=self._row_values(account), tags=(tag,))
+
+    def _set_busy(self, busy: bool) -> None:
+        state = tk.DISABLED if busy else tk.NORMAL
+        for child in self.winfo_children():
+            self._set_children_state(child, state)
+
+    def _set_children_state(self, widget: object, state: str) -> None:
+        for child in getattr(widget, "winfo_children", lambda: [])():
+            try:
+                if isinstance(child, ttk.Button) and str(child.cget("text")) not in {"停止刷新", "关闭"}:
+                    child.configure(state=state)
+            except Exception:
+                pass
+            self._set_children_state(child, state)
+
+    def _finish_refresh(self) -> None:
+        self.accounts = self.account_store.load()
+        self._refresh_table()
+        self._set_busy(False)
+        if self._close_when_idle:
+            self._save_accounts()
+            self.destroy()
+
+    def _stop_refresh(self) -> None:
+        self.stop_event.set()
+        self.status_var.set("正在停止刷新...")
+        for account in self.accounts:
+            if str(account.last_status) in {"刷新中", "running"}:
+                self._set_account_status(account.name, "stopping", "正在停止")
+
+    def _close(self) -> None:
+        if self.worker_thread and self.worker_thread.is_alive():
+            self._close_when_idle = True
+            self._stop_refresh()
+            self.status_var.set("正在停止刷新，任务结束后关闭窗口...")
+            return
+        self._save_accounts()
+        self.destroy()
+
+
 _TK_BASE = TkinterDnD.Tk if TkinterDnD is not None else tk.Tk
+
+
+class LoginAccountManagerDialog(tk.Toplevel):
+    columns = ("order", "name", "group", "bookmark_path", "link_status", "direct_url", "included")
+
+    def __init__(self, owner: "LauncherApp") -> None:
+        super().__init__(owner)
+        self.owner = owner
+        self.paths = ensure_refresh_data_dir()
+        self.roster_store = LoginAccountRosterStore(self.paths.login_accounts_path)
+        self.rows = []
+        self.link_records: dict[str, dict[str, object]] = {}
+        self.status_filter_var = tk.StringVar(value="全部")
+        self.group_filter_var = tk.StringVar(value="全部分组")
+        self.title("直登账号管理")
+        self.geometry("1040x560")
+        self.minsize(900, 480)
+        self.transient(owner)
+        self._build_widgets()
+        self._reload()
+        _position_dialog_relative_to_owner(self, owner)
+
+    def _build_widgets(self) -> None:
+        root = ttk.Frame(self, padding=10)
+        root.pack(fill=tk.BOTH, expand=True)
+        filter_row = ttk.Frame(root)
+        filter_row.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(filter_row, text="状态筛选").pack(side=tk.LEFT, padx=(0, 6))
+        self.status_filter_box = ttk.Combobox(
+            filter_row, textvariable=self.status_filter_var, state="readonly", width=12,
+            values=("全部", "已参与", "未参与", "链接缺失", "链接过期"),
+        )
+        self.status_filter_box.pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(filter_row, text="分组筛选").pack(side=tk.LEFT, padx=(0, 6))
+        self.group_filter_box = ttk.Combobox(
+            filter_row, textvariable=self.group_filter_var, state="readonly", width=16,
+        )
+        self.group_filter_box.pack(side=tk.LEFT)
+        for box in (self.status_filter_box, self.group_filter_box):
+            box.bind("<<ComboboxSelected>>", lambda _event: self._refresh_table())
+        ttk.Label(
+            filter_row,
+            text="账号来源仅为“刷新地址”账号库；移出登录列表不会删除账号或链接。",
+            foreground="#666666",
+        ).pack(side=tk.LEFT, padx=(16, 0))
+
+        table_frame = ttk.Frame(root)
+        table_frame.pack(fill=tk.BOTH, expand=True)
+        self.tree = ttk.Treeview(table_frame, columns=self.columns, show="headings", selectmode="extended")
+        headings = {
+            "order": "登录顺序",
+            "name": "名称",
+            "group": "分组",
+            "bookmark_path": "收藏夹路径",
+            "link_status": "直登状态",
+            "direct_url": "直登链接",
+            "included": "上号状态",
+        }
+        widths = {"order": 72, "name": 110, "group": 100, "bookmark_path": 210, "link_status": 90, "direct_url": 300, "included": 90}
+        for column in self.columns:
+            self.tree.heading(column, text=headings[column])
+            self.tree.column(column, width=widths[column], anchor=tk.CENTER if column in {"order", "link_status", "included"} else tk.W)
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar = ttk.Scrollbar(table_frame, command=self.tree.yview)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.tree.configure(yscrollcommand=scrollbar.set)
+
+        actions = ttk.Frame(root)
+        actions.pack(fill=tk.X, pady=(8, 0))
+        for text, command in (
+            ("上移", lambda: self._move_selected(-1)),
+            ("下移", lambda: self._move_selected(1)),
+            ("选中账号加入上号列表", lambda: self._set_selected_included(True)),
+            ("选中账号移出上号列表", lambda: self._set_selected_included(False)),
+            ("当前筛选全部加入", lambda: self._set_filtered_included(True)),
+            ("当前筛选全部移出", lambda: self._set_filtered_included(False)),
+            ("关闭", self._close),
+        ):
+            ttk.Button(actions, text=text, command=command).pack(side=tk.LEFT, padx=(0, 6))
+
+    def _reload(self) -> None:
+        refresh_store = AccountsStore(self.paths.accounts_path)
+        refresh_accounts = refresh_store.load()
+        self.rows = self.roster_store.reconcile(refresh_accounts)
+        self.link_records = DirectLinkStore(self.paths.direct_links_path).links
+        groups = []
+        for row in self.rows:
+            group = logical_group_from_bookmark_path(row.account.bookmark_path)
+            if group not in groups:
+                groups.append(group)
+        self.group_filter_box["values"] = ("全部分组", *groups)
+        if self.group_filter_var.get() not in self.group_filter_box["values"]:
+            self.group_filter_var.set("全部分组")
+        self._refresh_table()
+
+    def _filtered_rows(self):
+        value = self.status_filter_var.get()
+        group = self.group_filter_var.get()
+        rows = list(self.rows)
+        if value == "已参与":
+            rows = [row for row in rows if row.included]
+        elif value == "未参与":
+            rows = [row for row in rows if not row.included]
+        elif value == "链接缺失":
+            rows = [row for row in rows if not str(self.link_records.get(row.account.name, {}).get("direct_url") or "")]
+        elif value == "链接过期":
+            rows = [row for row in rows if self._link_status(row) == "过期"]
+        if group != "全部分组":
+            rows = [row for row in rows if logical_group_from_bookmark_path(row.account.bookmark_path) == group]
+        return rows
+
+    def _link_status(self, row) -> str:
+        record = self.link_records.get(row.account.name, {})
+        direct_url = str(record.get("direct_url") or "")
+        if not direct_url:
+            return "缺失"
+        expire_hint = str(record.get("expire_hint") or "").strip()
+        if expire_hint:
+            try:
+                expires_at = datetime.fromisoformat(expire_hint.replace("Z", "+00:00"))
+                current = datetime.now(expires_at.tzinfo) if expires_at.tzinfo is not None else datetime.now()
+                if expires_at <= current:
+                    return "过期"
+            except ValueError:
+                pass
+        return "可用"
+
+    def _refresh_table(self) -> None:
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        for row in self._filtered_rows():
+            record = self.link_records.get(row.account.name, {})
+            direct_url = str(record.get("direct_url") or "")
+            status = self._link_status(row)
+            self.tree.insert(
+                "",
+                tk.END,
+                iid=row.key,
+                values=(
+                    row.order_index + 1,
+                    row.account.name,
+                    logical_group_from_bookmark_path(row.account.bookmark_path),
+                    row.account.bookmark_path,
+                    status,
+                    mask_sensitive_text(direct_url),
+                    "已参与" if row.included else "未参与",
+                ),
+            )
+
+    def _selected_key(self) -> str:
+        selection = self.tree.selection()
+        return str(selection[0]) if selection else ""
+
+    def _move_selected(self, direction: int) -> None:
+        key = self._selected_key()
+        if not key:
+            messagebox.showwarning("账号管理", "请先选择账号。", parent=self)
+            return
+        self.roster_store.move(key, direction)
+        self._reload()
+        if self.tree.exists(key):
+            self.tree.selection_set(key)
+
+    def _set_selected_included(self, included: bool) -> None:
+        keys = [str(key) for key in self.tree.selection()]
+        if not keys:
+            messagebox.showwarning("账号管理", "请先选择账号。", parent=self)
+            return
+        self.roster_store.set_included_many(keys, included)
+        self._reload()
+        existing = [key for key in keys if self.tree.exists(key)]
+        if existing:
+            self.tree.selection_set(existing)
+
+    def _set_filtered_included(self, included: bool) -> None:
+        keys = [row.key for row in self._filtered_rows()]
+        if not keys:
+            messagebox.showinfo("账号管理", "当前筛选没有可处理账号。", parent=self)
+            return
+        action = "加入" if included else "移出"
+        if not messagebox.askyesno("账号管理", f"确认将当前筛选的 {len(keys)} 个账号全部{action}上号列表？", parent=self):
+            return
+        self.roster_store.set_included_many(keys, included)
+        self._reload()
+        self.owner._log(f"[账号管理] 当前筛选批量{action}完成 count={len(keys)}")
+
+    def _close(self) -> None:
+        self.owner._load_accounts()
+        self.destroy()
 
 
 class LauncherApp(_TK_BASE):
@@ -557,7 +2129,9 @@ class LauncherApp(_TK_BASE):
         self.settings_path = tk.StringVar(value=str(self.user_data_init_result.settings_path))
         self.bookmark_path = tk.StringVar(value="")
         self.bookmark_root_name = tk.StringVar(value="账号")
+        self.bookmark_root_guid = tk.StringVar(value="")
         self.bookmark_root_path = tk.StringVar(value="")
+        self.bookmark_root_parent_path = tk.StringVar(value="")
         self.bookmark_root_display_name = tk.StringVar(value="")
         self.bookmark_file_candidate_var = tk.StringVar(value="")
         self.bookmark_root_candidate_var = tk.StringVar(value="")
@@ -565,18 +2139,16 @@ class LauncherApp(_TK_BASE):
         self.bookmark_root_candidates = []
         self.bookmark_file_candidate_by_label: dict[str, object] = {}
         self.bookmark_root_candidate_by_label: dict[str, object] = {}
-        self.advanced_config_visible = tk.BooleanVar(value=False)
         self.level_var = tk.StringVar(value="第一层")
         self.account_var = tk.StringVar(value="")
         self.max_workers_var = tk.IntVar(value=4)
         self.batch_verify_rounds_var = tk.IntVar(value=3)
         self.notice_outside_x_var = tk.DoubleVar(value=0.08)
         self.notice_outside_y_var = tk.DoubleVar(value=0.08)
-        self.method_var = tk.StringVar(value="method1")
         self.run_mode_var = tk.StringVar(value=RUN_MODE_CLIENT_DIRECT_LABEL)
         self.run_mode_hint_var = tk.StringVar(value="")
         self.account_source_summary_var = tk.StringVar(
-            value="当前模式：账号密码登录模式，使用账号密码配置，通过原方式二流程登录。"
+            value="刷新地址账号库尚未加载"
         )
         self.client_direct_auto_enter_var = tk.BooleanVar(value=True)
         self.client_direct_concurrency_var = tk.IntVar(value=CLIENT_DIRECT_CONCURRENCY_MIN)
@@ -586,9 +2158,10 @@ class LauncherApp(_TK_BASE):
         self.custom_speed_panel_enabled_var = tk.BooleanVar(value=True)
         self.speed_panel_debug_var = tk.BooleanVar(value=False)
         self.speed_panel_remove_original_toggle_var = tk.BooleanVar(value=True)
-        self.block_browser_context_menu_var = tk.BooleanVar(value=True)
+        self.block_browser_context_menu_var = tk.BooleanVar(value=False)
         self.speed_engine_var = tk.StringVar(value="timer_hook")
         self.default_speed_rate_var = tk.StringVar(value="1.0")
+        self.speed_rate_hotkeys: list[dict[str, object]] = []
         self.speed_hook_stage_var = tk.StringVar(value="after_game_ready")
         self.speed_panel_position_var = tk.StringVar(value="左上角")
         self.client_direct_port_range_var = tk.StringVar(value="9222 ~ 9222")
@@ -600,9 +2173,12 @@ class LauncherApp(_TK_BASE):
         self.client_direct_batch_display_id_map: dict[str, str] = {}
         self.client_speed_control_rate_var = tk.StringVar(value="1.0")
         self.client_speed_control_scope_var = tk.StringVar(value=CLIENT_SPEED_SCOPE_CURRENT_BATCH)
-        self.client_speed_control_status_var = tk.StringVar(value="成功 0 / 失败 0 / 跳过 0")
-        self.csv_path = tk.StringVar(value="")
-        self.level_count_vars = {level: tk.IntVar(value=8) for level in LEVELS}
+        self.client_speed_control_status_var = tk.StringVar(value="成功 0 / 失败 0 / 跳过 0 / 停止 0")
+        self._speed_hotkey_listener = WindowsSpeedHotkey(
+            self._on_speed_rate_hotkey,
+            log=lambda message: self._queue_log(f"[加速器快捷键] {message}"),
+        )
+        self._speed_hotkey_toggle_lock = threading.Lock()
         self.wm_game_path_var = tk.StringVar(value="")
         self.wm_game_status_var = tk.StringVar(value=_format_game_program_status(""))
         self.wm_game_hint_var = tk.StringVar(value=_game_program_hint_text())
@@ -625,22 +2201,18 @@ class LauncherApp(_TK_BASE):
         self.wm_fixed_mode_settings = FixedModeSettings()
         self.wm_row_count_mode_settings = RowCountModeSettings()
         self.wm_current_tile_mode_key = TILE_MODE_FIXED
-        self.csv_accounts: list[CSVAccount] = []
-        self.csv_status_by_key: dict[str, str] = {}
-        self.csv_passport_by_key: dict[str, str] = {}
-        self.csv_timing_by_key: dict[str, str] = {}
 
         self._apply_settings_defaults()
         self._build_widgets()
         self._load_window_manager_settings()
         self._load_client_direct_sessions()
+        self._register_saved_speed_rate_hotkeys()
         self._log_bookmark_startup_state()
-        self._auto_load_csv()
+        self._load_accounts()
         self.after(100, self._drain_ui_queue)
         self._load_default_config_if_present()
         self._log_admin_status_warning()
         self._log_startup_dm_environment()
-        self._log_background_capability_summary()
         self._log_user_data_startup_state()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(300, self._enable_game_path_drag_drop)
@@ -657,6 +2229,12 @@ class LauncherApp(_TK_BASE):
         for message in getattr(self, "_user_data_startup_logs", []) or []:
             self._log(message)
 
+    def _log_or_defer_startup(self, message: str) -> None:
+        if hasattr(self, "log_text"):
+            self._log(message)
+        else:
+            self._user_data_startup_logs.append(str(message))
+
     def _apply_settings_defaults(self) -> None:
         try:
             settings = load_settings(self.settings_path.get())
@@ -669,7 +2247,9 @@ class LauncherApp(_TK_BASE):
             if selection.candidate is not None:
                 self.bookmark_path.set(selection.candidate.path)
         self.bookmark_root_name.set(settings.bookmark_root_name)
+        self.bookmark_root_guid.set(settings.bookmark_root_guid)
         self.bookmark_root_path.set(settings.bookmark_root_path)
+        self.bookmark_root_parent_path.set(settings.bookmark_root_parent_path)
         self.bookmark_root_display_name.set(settings.bookmark_root_display_name)
         self.max_workers_var.set(settings.max_workers)
         self.notice_outside_x_var.set(settings.notice_close_outside_ratio[0])
@@ -678,9 +2258,20 @@ class LauncherApp(_TK_BASE):
         self.custom_speed_panel_enabled_var.set(bool(settings.custom_speed_panel_enabled))
         self.speed_panel_debug_var.set(bool(getattr(settings, "speed_panel_debug", False)))
         self.speed_panel_remove_original_toggle_var.set(bool(getattr(settings, "speed_panel_remove_original_toggle", True)))
-        self.block_browser_context_menu_var.set(bool(getattr(settings, "block_browser_context_menu", True)))
+        self.block_browser_context_menu_var.set(False)
         self.speed_engine_var.set(str(settings.speed_engine or "timer_hook"))
         self.default_speed_rate_var.set(str(float(settings.default_speed_rate or 1.0)))
+        raw_hotkeys = getattr(settings, "speed_rate_hotkeys", [])
+        try:
+            self.speed_rate_hotkeys = [
+                {"rate": item.rate, "hotkey": item.spec.text}
+                for item in normalize_speed_hotkey_bindings(raw_hotkeys)
+            ]
+        except ValueError as exc:
+            self.speed_rate_hotkeys = []
+            self._log_or_defer_startup(f"[加速器快捷键] 已忽略无效的多倍率快捷键配置：{mask_sensitive_text(exc)}")
+        if str(getattr(settings, "speed_panel_hotkey", "") or "").strip() and not self.speed_rate_hotkeys:
+            self._log_or_defer_startup("[加速器快捷键] 检测到旧 speed_panel_hotkey；为避免隐藏触发，未注册旧组合，请在“快捷键设置”中重新配置。")
         self.speed_hook_stage_var.set(str(settings.speed_hook_stage or "after_game_ready"))
         self.speed_panel_position_var.set("左上角")
 
@@ -747,7 +2338,9 @@ class LauncherApp(_TK_BASE):
             data["bookmark_browser"] = info.browser
             data["bookmark_profile"] = info.profile
             data["bookmark_root_name"] = self.bookmark_root_name.get().strip() or data.get("bookmark_root_name", "账号")
+            data["bookmark_root_guid"] = self.bookmark_root_guid.get().strip()
             data["bookmark_root_path"] = self.bookmark_root_path.get().strip()
+            data["bookmark_root_parent_path"] = self.bookmark_root_parent_path.get().strip()
             data["bookmark_root_display_name"] = self.bookmark_root_display_name.get().strip()
             path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
             self._log(
@@ -770,8 +2363,8 @@ class LauncherApp(_TK_BASE):
         self.wm_game_path_row = ttk.Frame(window_frame)
         self.wm_game_path_row.grid(row=0, column=0, columnspan=2, sticky="ew", padx=4, pady=(0, 4))
         self.wm_game_path_row.columnconfigure(1, weight=1)
-        ttk.Label(self.wm_game_path_row, text="游戏程序：", width=12, anchor="e").grid(
-            row=0, column=0, sticky="e", padx=(0, 8)
+        ttk.Label(self.wm_game_path_row, text="游戏程序：", width=10, anchor="w").grid(
+            row=0, column=0, sticky="w", padx=(0, 4)
         )
         self.wm_game_path_box = ttk.Frame(self.wm_game_path_row)
         self.wm_game_path_box.grid(row=0, column=1, sticky="ew")
@@ -784,82 +2377,26 @@ class LauncherApp(_TK_BASE):
             width=18,
             command=self._pick_game_path,
         ).grid(row=0, column=2, sticky="ew", padx=(8, 0))
-
-        self.wm_hint_frame = ttk.Frame(window_frame)
-        self.wm_hint_frame.grid(row=1, column=0, columnspan=2, sticky="ew", padx=4, pady=(0, 4))
-        self.wm_hint_frame.columnconfigure(1, weight=1)
-        ttk.Label(self.wm_hint_frame, text="提示：", width=12, anchor="e").grid(row=0, column=0, sticky="e", padx=(0, 8))
-        self.wm_game_hint_label = ttk.Label(
-            self.wm_hint_frame,
-            textvariable=self.wm_game_hint_var,
-            foreground="#006666",
-        )
-        self.wm_game_hint_label.grid(row=0, column=1, sticky="w")
-        self.wm_game_status_label = ttk.Label(
-            self.wm_hint_frame,
-            textvariable=self.wm_game_status_var,
-            foreground="#666666",
-        )
-        self.wm_game_status_label.grid(row=0, column=2, sticky="w", padx=(24, 0))
+        ttk.Label(self.wm_game_path_row, text="标题模板").grid(row=0, column=3, padx=(12, 4))
+        ttk.Entry(self.wm_game_path_row, textvariable=self.wm_title_template_var, width=22).grid(row=0, column=4)
+        ttk.Checkbutton(self.wm_game_path_row, text="自动编号标题", variable=self.wm_auto_rename_after_tile_var).grid(row=0, column=5, padx=(8, 0))
+        ttk.Checkbutton(self.wm_game_path_row, text="禁止超宽", variable=self.wm_prevent_overflow_var).grid(row=0, column=6, padx=(8, 0))
 
         self.wm_compact_frame = ttk.Frame(window_frame)
-        self.wm_compact_frame.grid(row=2, column=0, columnspan=2, sticky="ew", padx=4, pady=(0, 0))
+        self.wm_compact_frame.grid(row=1, column=0, columnspan=2, sticky="ew", padx=4)
         self.wm_compact_frame.columnconfigure(0, weight=1)
-        self.wm_compact_frame.columnconfigure(1, weight=1)
-
-        self.wm_legacy_launch_frame = ttk.Frame(self.wm_compact_frame)
-        self.wm_legacy_launch_frame.grid(row=1, column=1, sticky="ew", padx=(16, 0), pady=(0, 4))
-        ttk.Label(self.wm_legacy_launch_frame, text="旧启动项：", width=12, anchor="e").grid(
-            row=0, column=0, sticky="e", padx=(0, 8)
-        )
-        self.wm_launch_count_label = ttk.Label(self.wm_legacy_launch_frame, text="打开数量")
-        self.wm_launch_count_label.grid(row=0, column=1, sticky="e", padx=(0, 4))
-        self.wm_launch_count_spin = ttk.Spinbox(
-            self.wm_legacy_launch_frame,
-            from_=1,
-            to=99,
-            increment=1,
-            textvariable=self.wm_launch_count_var,
-            width=6,
-        )
-        self.wm_launch_count_spin.grid(row=0, column=2, sticky="w", padx=(0, 16))
-        self.wm_launch_interval_label = ttk.Label(self.wm_legacy_launch_frame, text="启动间隔(ms)")
-        self.wm_launch_interval_label.grid(row=0, column=3, sticky="e", padx=(0, 4))
-        self.wm_launch_interval_spin = ttk.Spinbox(
-            self.wm_legacy_launch_frame,
-            from_=0,
-            to=60000,
-            increment=100,
-            textvariable=self.wm_launch_interval_var,
-            width=6,
-        )
-        self.wm_launch_interval_spin.grid(row=0, column=4, sticky="w", padx=(0, 16))
-        self.wm_auto_tile_after_launch_check = ttk.Checkbutton(
-            self.wm_legacy_launch_frame,
-            text="启动后自动排列",
-            variable=self.wm_auto_tile_after_launch_var,
-        )
-        self.wm_auto_tile_after_launch_check.grid(row=0, column=5, sticky="w")
-        self.wm_legacy_launch_grid_widgets = (
-            self.wm_legacy_launch_frame,
-        )
 
         self.wm_layout_frame = ttk.Frame(self.wm_compact_frame)
-        self.wm_layout_frame.grid(row=0, column=0, rowspan=2, sticky="nw", pady=(0, 2))
-        self.wm_layout_frame.columnconfigure(1, minsize=88)
-        self.wm_layout_frame.columnconfigure(3, minsize=88)
-        ttk.Label(self.wm_layout_frame, text="布局参数：", width=12, anchor="e").grid(
-            row=0, column=0, rowspan=4, sticky="ne", padx=(0, 8), pady=3
-        )
-        ttk.Label(self.wm_layout_frame, text="排列方式").grid(row=0, column=1, sticky="w", padx=(0, 4), pady=2)
+        self.wm_layout_frame.grid(row=0, column=0, sticky="ew")
+        ttk.Label(self.wm_layout_frame, text="排列方式", width=10, anchor="w").pack(side=tk.LEFT, padx=(0, 4))
         self.wm_tile_mode_combo = ttk.Combobox(
             self.wm_layout_frame,
             textvariable=self.wm_tile_mode_var,
             values=(WM_TILE_MODE_FIXED, WM_TILE_MODE_ROW_COUNT),
             state="readonly",
-            width=14,
+            width=10,
         )
-        self.wm_tile_mode_combo.grid(row=0, column=2, sticky="w", padx=(0, 24), pady=2)
+        self.wm_tile_mode_combo.pack(side=tk.LEFT, padx=(0, 8))
         self.wm_tile_mode_combo.bind("<<ComboboxSelected>>", lambda _: self._wm_on_tile_mode_changed())
         self.wm_fixed_param_widgets = []
         self.wm_row_param_widgets = []
@@ -869,112 +2406,29 @@ class LauncherApp(_TK_BASE):
             return widget
 
         fixed_specs = (
-            (0, 3, "每行数量", "spin", self.wm_per_row_var, 1, 99),
-            (1, 1, "窗口宽度", "entry", self.wm_window_width_var, None, None),
-            (1, 3, "窗口高度", "entry", self.wm_window_height_var, None, None),
-            (2, 1, "起点X", "spin", self.wm_start_x_var, -5000, 5000),
-            (2, 3, "起点Y", "spin", self.wm_start_y_var, -5000, 5000),
-            (3, 1, "横向偏移", "spin", self.wm_offset_x_var, -5000, 5000),
-            (3, 3, "纵向偏移", "spin", self.wm_offset_y_var, -5000, 5000),
+            ("每行数量", "spin", self.wm_per_row_var, 1, 99),
+            ("窗口宽度", "entry", self.wm_window_width_var, None, None),
+            ("窗口高度", "entry", self.wm_window_height_var, None, None),
+            ("起点X", "spin", self.wm_start_x_var, -5000, 5000),
+            ("起点Y", "spin", self.wm_start_y_var, -5000, 5000),
+            ("横向偏移", "spin", self.wm_offset_x_var, -5000, 5000),
+            ("纵向偏移", "spin", self.wm_offset_y_var, -5000, 5000),
         )
-        for row, label_column, label, kind, variable, min_value, max_value in fixed_specs:
-            input_column = label_column + 1
-            label_widget = add_widget(
-                ttk.Label(self.wm_layout_frame, text=label),
-                row,
-                label_column,
-                sticky="w",
-                padx=(0, 4),
-                pady=1,
-            )
+        for label, kind, variable, min_value, max_value in fixed_specs:
+            label_widget = ttk.Label(self.wm_layout_frame, text=label)
+            label_widget.pack(side=tk.LEFT, padx=(0, 3))
             if kind == "entry":
-                input_widget = add_widget(
-                    ttk.Entry(self.wm_layout_frame, textvariable=variable, width=7),
-                    row,
-                    input_column,
-                    sticky="w",
-                    padx=(0, 12),
-                    pady=1,
-                )
+                input_widget = ttk.Entry(self.wm_layout_frame, textvariable=variable, width=5)
             else:
-                input_widget = add_widget(
-                    ttk.Spinbox(self.wm_layout_frame, from_=min_value, to=max_value, increment=1,
-                                textvariable=variable, width=6),
-                    row,
-                    input_column,
-                    sticky="w",
-                    padx=(0, 12),
-                    pady=1,
-                )
+                input_widget = ttk.Spinbox(self.wm_layout_frame, from_=min_value, to=max_value, increment=1,
+                                           textvariable=variable, width=5)
+            input_widget.pack(side=tk.LEFT, padx=(0, 7))
             self.wm_fixed_param_widgets.extend((label_widget, input_widget))
-
-        self.wm_title_frame = ttk.Frame(self.wm_compact_frame)
-        self.wm_title_frame.grid(row=0, column=1, sticky="new", padx=(16, 0), pady=(0, 4))
-        self.wm_title_frame.columnconfigure(3, weight=1)
-        ttk.Label(self.wm_title_frame, text="标题设置：", width=12, anchor="e").grid(
-            row=0, column=0, sticky="e", padx=(0, 8)
-        )
-        ttk.Checkbutton(
-            self.wm_title_frame,
-            text="排列后自动编号标题",
-            variable=self.wm_auto_rename_after_tile_var,
-        ).grid(row=0, column=1, sticky="w", padx=(0, 20))
-        ttk.Label(self.wm_title_frame, text="标题模板").grid(row=0, column=2, sticky="e", padx=(0, 4))
-        ttk.Entry(self.wm_title_frame, textvariable=self.wm_title_template_var, width=28).grid(
-            row=0, column=3, sticky="w", padx=(0, 8)
-        )
-        ttk.Button(self.wm_title_frame, text="重命名", width=8, command=self._wm_rename_windows).grid(
-            row=0, column=4, sticky="w"
-        )
-        ttk.Checkbutton(
-            self.wm_title_frame,
-            text="禁止超出屏幕宽度",
-            variable=self.wm_prevent_overflow_var,
-        ).grid(row=1, column=1, columnspan=3, sticky="w", pady=(4, 0))
-
-        window_action_row = ttk.Frame(self.wm_compact_frame)
-        window_action_row.grid(row=2, column=0, columnspan=2, sticky="w", pady=(2, 0))
-        ttk.Label(window_action_row, text="窗口操作：", width=12, anchor="e").pack(side=tk.LEFT, padx=(0, 8))
-        self.wm_launch_btn = ttk.Button(window_action_row, text="批量启动窗口", width=18,
-                                        command=self._wm_launch_windows)
-        self.wm_launch_btn.pack(side=tk.LEFT, padx=(0, 8))
-        self.wm_identify_btn = ttk.Button(window_action_row, text="识别窗口", width=18,
-                                          command=self._wm_identify_windows)
-        self.wm_identify_btn.pack(side=tk.LEFT, padx=(0, 8))
-        self.wm_tile_btn = ttk.Button(window_action_row, text="排列窗口", width=18,
-                                      command=self._wm_tile_windows)
-        self.wm_tile_btn.pack(side=tk.LEFT, padx=(0, 8))
-        self.wm_refresh_slots_btn = ttk.Button(window_action_row, text="刷新槽位映射", width=18,
-                                               command=self._wm_refresh_window_slots)
-        self.wm_refresh_slots_btn.pack(side=tk.LEFT, padx=(0, 8))
-        self.wm_regenerate_slots_btn = ttk.Button(window_action_row, text="重新生成槽位", width=18,
-                                                  command=self._wm_regenerate_slots)
-        self.wm_regenerate_slots_btn.pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Label(window_action_row, text="目标槽位").pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Spinbox(window_action_row, from_=1, to=99, increment=1,
-                    textvariable=self.wm_repair_slot_var, width=5).pack(side=tk.LEFT, padx=(0, 6))
-        self.wm_repair_slot_btn = ttk.Button(window_action_row, text="修复窗口", width=12,
-                                             command=self._wm_repair_window_slot)
-        self.wm_repair_slot_btn.pack(side=tk.LEFT, padx=(0, 8))
-        tk.Button(window_action_row, text="关闭窗口", width=18, fg="#cc0000",
-                  command=self._wm_close_windows, font=("", 9, "bold")).pack(side=tk.LEFT, padx=(0, 8))
 
         # ===== 2. 工作模式 =====
         work_mode_frame = ttk.LabelFrame(root, text="工作模式", padding=4)
         work_mode_frame.pack(fill=tk.X, pady=(0, 6))
         ttk.Label(work_mode_frame, text="工作模式").pack(side=tk.LEFT, padx=(4, 8))
-        self.run_mode_account_password_btn = tk.Radiobutton(
-            work_mode_frame,
-            text=RUN_MODE_ACCOUNT_PASSWORD_LABEL,
-            variable=self.run_mode_var,
-            value=RUN_MODE_ACCOUNT_PASSWORD_LABEL,
-            indicatoron=False,
-            width=18,
-            padx=10,
-            pady=4,
-            command=self._on_account_password_run_mode_changed,
-        )
-        self.run_mode_account_password_btn.pack(side=tk.LEFT, padx=(0, 8))
         self.run_mode_client_btn = tk.Radiobutton(
             work_mode_frame,
             text=RUN_MODE_CLIENT_DIRECT_LABEL,
@@ -987,222 +2441,23 @@ class LauncherApp(_TK_BASE):
             command=self._on_run_mode_changed,
         )
         self.run_mode_client_btn.pack(side=tk.LEFT, padx=(0, 8))
-        self.run_mode_foreground_btn = tk.Radiobutton(
-            work_mode_frame,
-            text="旧版兼容模式",
-            variable=self.run_mode_var,
-            value=RUN_MODE_FOREGROUND_LABEL,
-            indicatoron=False,
-            width=18,
-            padx=10,
-            pady=4,
-            command=self._on_legacy_compat_run_mode_changed,
-        )
-        self.run_mode_foreground_btn.pack(side=tk.LEFT, padx=(0, 12))
-        self.run_mode_foreground_btn.pack_forget()
         ttk.Label(work_mode_frame, textvariable=self.run_mode_hint_var, foreground="#996600").pack(side=tk.LEFT)
 
-        # ===== 3. 读取收藏夹 / 账号配置 =====
-        config_frame = ttk.LabelFrame(root, text="读取收藏夹 / 账号配置", padding=4)
-        config_frame.pack(fill=tk.X, pady=(0, 6))
-        config_frame.columnconfigure(1, weight=1)
+        # ===== 3. 账号配置与快捷键 =====
+        account_config_frame = ttk.LabelFrame(root, text="账号配置", padding=4)
+        account_config_frame.pack(fill=tk.X, pady=(0, 6))
 
-        account_password_summary_text = "当前模式：账号密码登录模式，使用账号密码配置，通过原方式二流程登录。"
-        try:
-            self.account_source_summary_var.set(account_password_summary_text)
-        except Exception:
-            pass
-        self.account_source_summary_row = ttk.Frame(config_frame)
-        self.account_source_summary_row.grid(row=0, column=0, columnspan=5, sticky="w", pady=(0, 6))
-        ttk.Label(
-            self.account_source_summary_row,
-            textvariable=self.account_source_summary_var,
-            foreground="#666666",
-        ).pack(side=tk.LEFT, padx=(4, 8))
-
-        self.method_row = ttk.Frame(config_frame)
-        self.method_row.grid(row=0, column=0, columnspan=5, sticky="w", pady=(0, 6))
-        ttk.Label(self.method_row, text="上号方式").pack(side=tk.LEFT, padx=(4, 8))
-        ttk.Radiobutton(self.method_row, text="旧版通行证上号（兼容）", variable=self.method_var, value="method1",
-                        command=self._on_method_changed).pack(side=tk.LEFT, padx=(0, 24))
-        ttk.Radiobutton(self.method_row, text="账号密码登录模式", variable=self.method_var, value="method2",
-                        command=self._on_method_changed).pack(side=tk.LEFT)
-        self.method_row.grid_remove()
-
-        self._method1_row1 = ttk.Label(config_frame, text="浏览器收藏夹", width=12, anchor="e")
-        self._method1_row1.grid(row=1, column=0, sticky="e", padx=(4, 6), pady=3)
-        self._method1_btn_auto_bookmark = ttk.Button(
-            config_frame,
-            text="自动查找收藏夹",
-            command=self._auto_find_bookmarks,
+        account_row = ttk.Frame(account_config_frame)
+        account_row.pack(fill=tk.X, pady=3)
+        ttk.Label(account_row, text="账号来源：刷新地址账号库").pack(side=tk.LEFT, padx=(4, 12))
+        ttk.Button(account_row, text="账号管理", width=12, command=self._open_login_account_manager).pack(
+            side=tk.LEFT, padx=(0, 6)
         )
-        self._method1_btn_auto_bookmark.grid(row=1, column=1, sticky="w", padx=4, pady=3)
-        self._method1_btn_load = ttk.Button(config_frame, text="读取账号", command=self._load_accounts)
-        self._method1_btn_load.grid(row=1, column=2, sticky="w", padx=4, pady=3)
-
-        self._method1_row2a = ttk.Label(config_frame, text="收藏候选", width=12, anchor="e")
-        self._method1_row2a.grid(row=2, column=0, sticky="e", padx=(4, 6), pady=3)
-        self._method1_bookmark_candidate_combo = ttk.Combobox(
-            config_frame,
-            textvariable=self.bookmark_file_candidate_var,
-            state="readonly",
-            values=(),
+        self.refresh_address_btn = ttk.Button(
+            account_row, text="刷新地址", width=12, command=self._open_refresh_address_dialog
         )
-        self._method1_bookmark_candidate_combo.grid(row=2, column=1, columnspan=4, sticky="ew", padx=4, pady=3)
-        self._method1_bookmark_candidate_combo.bind("<<ComboboxSelected>>", lambda _: self._on_bookmark_candidate_selected())
-
-        self._method1_row3a = ttk.Label(config_frame, text="账号目录", width=12, anchor="e")
-        self._method1_row3a.grid(row=3, column=0, sticky="e", padx=(4, 6), pady=3)
-        self._method1_root_combo = ttk.Combobox(
-            config_frame,
-            textvariable=self.bookmark_root_candidate_var,
-            state="readonly",
-            values=(),
-        )
-        self._method1_root_combo.grid(row=3, column=1, columnspan=4, sticky="ew", padx=4, pady=3)
-        self._method1_root_combo.bind("<<ComboboxSelected>>", lambda _: self._on_bookmark_root_candidate_selected())
-
-        self._method1_advanced_toggle_btn = ttk.Button(
-            config_frame,
-            text="显示高级配置",
-            command=self._toggle_advanced_config,
-        )
-        self._method1_advanced_toggle_btn.grid(row=4, column=1, sticky="w", padx=4, pady=(4, 3))
-
-        self._method1_advanced_frame = ttk.LabelFrame(config_frame, text="高级配置", padding=4)
-        self._method1_advanced_frame.grid(row=5, column=0, columnspan=5, sticky="ew", padx=4, pady=(0, 4))
-        self._method1_advanced_frame.columnconfigure(1, weight=1)
-
-        self._method1_bookmark_path_label = ttk.Label(
-            self._method1_advanced_frame, text="收藏文件路径", width=14, anchor="e"
-        )
-        self._method1_bookmark_path_label.grid(row=0, column=0, sticky="e", padx=(4, 6), pady=3)
-        self._method1_bookmark_entry = ttk.Entry(self._method1_advanced_frame, textvariable=self.bookmark_path)
-        self._method1_bookmark_entry.grid(row=0, column=1, sticky="ew", padx=4, pady=3)
-        self._method1_btn_pick = ttk.Button(
-            self._method1_advanced_frame,
-            text="手动选择 Bookmarks",
-            command=self._pick_bookmark_file,
-        )
-        self._method1_btn_pick.grid(row=0, column=2, padx=4, pady=3)
-
-        self._method1_root_path_label = ttk.Label(
-            self._method1_advanced_frame, text="bookmark_root_path", width=14, anchor="e"
-        )
-        self._method1_root_path_label.grid(row=1, column=0, sticky="e", padx=(4, 6), pady=3)
-        self._method1_root_path_entry = ttk.Entry(self._method1_advanced_frame, textvariable=self.bookmark_root_path)
-        self._method1_root_path_entry.grid(row=1, column=1, columnspan=2, sticky="ew", padx=4, pady=3)
-
-        self._method1_root_name_label = ttk.Label(
-            self._method1_advanced_frame, text="兼容目录名", width=14, anchor="e"
-        )
-        self._method1_root_name_label.grid(row=2, column=0, sticky="e", padx=(4, 6), pady=3)
-        self._method1_root_name_entry = ttk.Entry(self._method1_advanced_frame, textvariable=self.bookmark_root_name)
-        self._method1_root_name_entry.grid(row=2, column=1, columnspan=2, sticky="ew", padx=4, pady=3)
-
-        self._method1_row4a = ttk.Label(self._method1_advanced_frame, text="自动化设置", width=14, anchor="e")
-        self._method1_row4a.grid(row=3, column=0, sticky="e", padx=(4, 6), pady=3)
-        self._method1_settings_entry = ttk.Entry(self._method1_advanced_frame, textvariable=self.settings_path)
-        self._method1_settings_entry.grid(row=3, column=1, sticky="ew", padx=4, pady=3)
-        self._method1_btn_settings = ttk.Button(
-            self._method1_advanced_frame, text="选择", width=8, command=self._pick_settings
-        )
-        self._method1_btn_settings.grid(row=3, column=2, padx=4, pady=3)
-
-        self._method1_level_count_label = ttk.Label(
-            self._method1_advanced_frame, text="每层数量", width=14, anchor="e"
-        )
-        self._method1_level_count_label.grid(row=4, column=0, sticky="e", padx=(4, 6), pady=3)
-        self._method1_level_count_frame = ttk.Frame(self._method1_advanced_frame)
-        self._method1_level_count_frame.grid(row=4, column=1, columnspan=2, sticky="w", padx=4, pady=3)
-        for level in LEVELS:
-            ttk.Label(self._method1_level_count_frame, text=level).pack(side=tk.LEFT, padx=(0, 4))
-            ttk.Spinbox(
-                self._method1_level_count_frame,
-                from_=0,
-                to=99,
-                increment=1,
-                textvariable=self.level_count_vars[level],
-                width=5,
-            ).pack(side=tk.LEFT, padx=(0, 12))
-        self._client_direct_port_settings_label = ttk.Label(
-            self._method1_advanced_frame, text="端口设置", width=14, anchor="e"
-        )
-        self._client_direct_port_settings_label.grid(row=5, column=0, sticky="e", padx=(4, 6), pady=3)
-        self._client_direct_port_settings_frame = ttk.Frame(self._method1_advanced_frame)
-        self._client_direct_port_settings_frame.grid(row=5, column=1, columnspan=2, sticky="w", padx=4, pady=3)
-        ttk.Label(self._client_direct_port_settings_frame, text="默认端口起点").pack(side=tk.LEFT, padx=(0, 4))
-        self.client_direct_base_port_spin = ttk.Spinbox(
-            self._client_direct_port_settings_frame,
-            from_=1024,
-            to=65500,
-            increment=1,
-            textvariable=self.client_direct_base_port_var,
-            width=7,
-            command=self._sync_client_direct_port_range,
-        )
-        self.client_direct_base_port_spin.pack(side=tk.LEFT)
-        ttk.Label(self._client_direct_port_settings_frame, text="自动寻找连续可用端口").pack(
-            side=tk.LEFT, padx=(10, 0)
-        )
-
-        self._client_speed_panel_label = ttk.Label(
-            self._method1_advanced_frame, text="加速面板", width=14, anchor="e"
-        )
-        self._client_speed_panel_label.grid(row=6, column=0, sticky="e", padx=(4, 6), pady=3)
-        self._client_speed_panel_frame = ttk.Frame(self._method1_advanced_frame)
-        self._client_speed_panel_frame.grid(row=6, column=1, columnspan=2, sticky="w", padx=4, pady=3)
-        ttk.Checkbutton(
-            self._client_speed_panel_frame,
-            text="替换网页加速浮层",
-            variable=self.auto_replace_speed_panel_var,
-        ).pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Checkbutton(
-            self._client_speed_panel_frame,
-            text="显示自定义变速器",
-            variable=self.custom_speed_panel_enabled_var,
-        ).pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Checkbutton(
-            self._client_speed_panel_frame,
-            text="原浮层诊断日志",
-            variable=self.speed_panel_debug_var,
-        ).pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Checkbutton(
-            self._client_speed_panel_frame,
-            text="删除原入口按钮",
-            variable=self.speed_panel_remove_original_toggle_var,
-        ).pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Checkbutton(
-            self._client_speed_panel_frame,
-            text="拦截右键菜单",
-            variable=self.block_browser_context_menu_var,
-        ).pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Label(self._client_speed_panel_frame, text="默认倍率").pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Entry(self._client_speed_panel_frame, textvariable=self.default_speed_rate_var, width=6).pack(
-            side=tk.LEFT, padx=(0, 10)
-        )
-        ttk.Label(self._client_speed_panel_frame, text="位置").pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Combobox(
-            self._client_speed_panel_frame,
-            textvariable=self.speed_panel_position_var,
-            values=("左上角",),
-            width=8,
-            state="readonly",
-        ).pack(side=tk.LEFT)
-        self._method1_advanced_frame.grid_remove()
-
-        self._method2_row1 = ttk.Label(config_frame, text="CSV文件", width=12, anchor="e")
-        self._method2_csv_entry = ttk.Entry(config_frame, textvariable=self.csv_path)
-        self._method2_btn_pick = ttk.Button(config_frame, text="选择", width=8, command=self._pick_csv_file)
-        self._method2_btn_import = ttk.Button(config_frame, text="导入CSV", command=self._import_csv)
-        self._method2_row1.grid(row=1, column=0, sticky="e", padx=(4, 6), pady=3)
-        self._method2_csv_entry.grid(row=1, column=1, sticky="ew", padx=4, pady=3)
-        self._method2_btn_pick.grid(row=1, column=2, padx=4, pady=3)
-        self._method2_btn_import.grid(row=1, column=3, padx=4, pady=3)
-        self._method2_row1.grid_remove()
-        self._method2_csv_entry.grid_remove()
-        self._method2_btn_pick.grid_remove()
-        self._method2_btn_import.grid_remove()
+        self.refresh_address_btn.pack(side=tk.LEFT, padx=(0, 18))
+        ttk.Label(account_row, textvariable=self.account_source_summary_var, foreground="#666666").pack(side=tk.LEFT)
 
         # ===== 4. 运行 =====
         run_frame = ttk.LabelFrame(root, text="当前模式运行区", padding=4)
@@ -1315,7 +2570,7 @@ class LauncherApp(_TK_BASE):
             ("一键准备并登录", 16, self._prepare_arrange_login_client_direct_current_scope, 0, 1),
             ("追加准备", 12, self._append_client_direct_current_scope, 0, 2),
             ("排列本批客户端", 16, self._arrange_prepared_client_direct_current_scope, 0, 3),
-            ("执行客户端登录", 16, self._login_prepared_client_direct_current_scope, 0, 4),
+            ("执行登录并进入游戏", 18, self._login_prepared_client_direct_current_scope, 0, 4),
         )
         for text, width, command, row, column in client_direct_buttons:
             ttk.Button(self.client_direct_action_row_1, text=text, width=width, command=command).grid(
@@ -1370,6 +2625,12 @@ class LauncherApp(_TK_BASE):
                 width=5,
                 command=lambda value=preset: self._apply_client_speed_control(rate_override=float(value)),
             ).pack(side=tk.LEFT, padx=(0, 3))
+        ttk.Button(
+            self.client_speed_control_row,
+            text="快捷键设置",
+            width=12,
+            command=self._open_speed_hotkey_settings,
+        ).pack(side=tk.LEFT, padx=(5, 3))
         ttk.Label(self.client_speed_control_row, text="作用范围").pack(side=tk.LEFT, padx=(8, 4))
         ttk.Combobox(
             self.client_speed_control_row,
@@ -1383,25 +2644,6 @@ class LauncherApp(_TK_BASE):
             textvariable=self.client_speed_control_status_var,
             foreground="#006666",
         ).pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-        self.foreground_run_frame = ttk.LabelFrame(run_frame, text="前台辅助模式", padding=4)
-        self.foreground_run_frame.pack(fill=tk.X, pady=(0, 4))
-        foreground_param_row = ttk.Frame(self.foreground_run_frame)
-        foreground_param_row.pack(fill=tk.X, pady=(0, 6))
-        ttk.Label(foreground_param_row, text="并发").pack(side=tk.LEFT, padx=(2, 4))
-        ttk.Label(foreground_param_row, text="1", relief="sunken", width=4, anchor="center", padding=2).pack(side=tk.LEFT)
-        ttk.Label(foreground_param_row, text="重试次数").pack(side=tk.LEFT, padx=(16, 4))
-        ttk.Spinbox(foreground_param_row, from_=1, to=9, textvariable=self.batch_verify_rounds_var,
-                    width=5).pack(side=tk.LEFT)
-
-        foreground_action_row = ttk.Frame(self.foreground_run_frame)
-        foreground_action_row.pack(fill=tk.X)
-        ttk.Button(foreground_action_row, text="单账号运行", width=14, command=self._run_selected_account).pack(side=tk.LEFT, padx=2)
-        ttk.Button(foreground_action_row, text="当前层串行", width=14, command=self._run_level_serial).pack(side=tk.LEFT, padx=2)
-        ttk.Button(foreground_action_row, text="全部串行", width=14, command=self._run_all_serial).pack(side=tk.LEFT, padx=2)
-        self.stop_btn = tk.Button(foreground_action_row, text="停止任务", width=12, fg="#cc0000",
-                                   command=self._stop_tasks, font=("", 9, "bold"))
-        self.stop_btn.pack(side=tk.LEFT, padx=2)
 
         self._content_area = ttk.Frame(root)
         self._content_area.pack(fill=tk.BOTH, expand=True)
@@ -1425,37 +2667,6 @@ class LauncherApp(_TK_BASE):
         self.tree.tag_configure("failed", foreground="#cc0000")
         self.tree.tag_configure("retry", foreground="#cc6600")
         self.tree.tag_configure("skip", foreground="#888888")
-
-        # 账号列表（方式二）
-        self._table_frame_m2 = ttk.LabelFrame(self._content_area, text="CSV账号列表（方式二）", padding=2)
-        csv_columns = ("name", "url", "username", "password_status", "window", "passport", "status", "timing")
-        self.csv_tree = ttk.Treeview(self._table_frame_m2, columns=csv_columns, show="headings", height=10)
-        self.csv_tree.heading("name", text="名称")
-        self.csv_tree.heading("url", text="链接")
-        self.csv_tree.heading("username", text="账号")
-        self.csv_tree.heading("password_status", text="密码")
-        self.csv_tree.heading("window", text="窗口号")
-        self.csv_tree.heading("passport", text="本次通行证")
-        self.csv_tree.heading("status", text="状态")
-        self.csv_tree.heading("timing", text="耗时")
-        self.csv_tree.column("name", width=100)
-        self.csv_tree.column("url", width=280)
-        self.csv_tree.column("username", width=100, anchor=tk.CENTER)
-        self.csv_tree.column("password_status", width=60, anchor=tk.CENTER)
-        self.csv_tree.column("window", width=60, anchor=tk.CENTER)
-        self.csv_tree.column("passport", width=110, anchor=tk.CENTER)
-        self.csv_tree.column("status", width=100, anchor=tk.CENTER)
-        self.csv_tree.column("timing", width=70, anchor=tk.CENTER)
-        self.csv_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        csv_scrollbar = ttk.Scrollbar(self._table_frame_m2, command=self.csv_tree.yview)
-        csv_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.csv_tree.configure(yscrollcommand=csv_scrollbar.set)
-
-        self.csv_tree.tag_configure("running", foreground="#0066cc")
-        self.csv_tree.tag_configure("success", foreground="#008800")
-        self.csv_tree.tag_configure("failed", foreground="#cc0000")
-        self.csv_tree.tag_configure("retry", foreground="#cc6600")
-        self.csv_tree.tag_configure("skip", foreground="#888888")
 
         # 初始显示方式一表格
         self._table_frame_m1.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
@@ -1547,205 +2758,93 @@ class LauncherApp(_TK_BASE):
         except Exception as exc:
             messagebox.showwarning("清空日志", f"清空日志失败：{exc}")
 
-    def _toggle_advanced_config(self) -> None:
-        self.advanced_config_visible.set(not self.advanced_config_visible.get())
-        self._sync_advanced_config_visibility()
-
-    def _sync_advanced_config_visibility(self) -> None:
-        if not hasattr(self, "_method1_advanced_frame"):
-            return
-        visible = bool(self.advanced_config_visible.get()) and self._account_source_uses_bookmarks()
-        if visible:
-            self._method1_advanced_frame.grid()
-            self._method1_advanced_toggle_btn.configure(text="隐藏高级配置")
-        else:
-            self._method1_advanced_frame.grid_remove()
-            self._method1_advanced_toggle_btn.configure(text="显示高级配置")
-        foreground_btn = getattr(self, "run_mode_foreground_btn", None)
-        if foreground_btn is not None:
-            current_run_mode = ""
-            try:
-                current_run_mode = str(self.run_mode_var.get() or "")
-            except Exception:
-                current_run_mode = ""
-            if visible or current_run_mode == RUN_MODE_FOREGROUND_LABEL:
-                foreground_btn.pack(side=tk.LEFT, padx=(0, 12))
-            else:
-                foreground_btn.pack_forget()
-
-    def _on_account_password_run_mode_changed(self) -> None:
-        try:
-            self.method_var.set("method2")
-        except Exception:
-            pass
-        self._on_run_mode_changed()
-
-    def _on_legacy_compat_run_mode_changed(self) -> None:
-        try:
-            self.method_var.set("method1")
-        except Exception:
-            pass
-        self._on_run_mode_changed()
-
     def _on_run_mode_changed(self) -> None:
-        if self._is_background_run_mode():
-            self.run_mode_hint_var.set(RUN_MODE_BACKGROUND_HINT)
-            self._status_mid.set(f"当前模式：{RUN_MODE_BACKGROUND_LABEL}")
-            self._log(f"已选择{RUN_MODE_BACKGROUND_LABEL}：{RUN_MODE_BACKGROUND_HINT}。")
-        elif self._is_client_direct_run_mode():
-            self.run_mode_hint_var.set(RUN_MODE_CLIENT_DIRECT_HINT)
-            self._status_mid.set(f"当前模式：{RUN_MODE_CLIENT_DIRECT_LABEL}")
-            auto_text = "自动进入游戏" if self._client_direct_auto_enter_game() else "停在公告/进入游戏前"
-            self._log(f"已选择{RUN_MODE_CLIENT_DIRECT_LABEL}：{RUN_MODE_CLIENT_DIRECT_HINT}，{auto_text}。")
-        else:
-            self.run_mode_hint_var.set("")
-            label = RUN_MODE_ACCOUNT_PASSWORD_LABEL if self.method_var.get() == "method2" else "旧版兼容模式"
-            self._status_mid.set(f"当前模式：{label}")
-            self._log(f"已选择{label}。")
+        self.run_mode_var.set(RUN_MODE_CLIENT_DIRECT_LABEL)
+        self.run_mode_hint_var.set(RUN_MODE_CLIENT_DIRECT_HINT)
+        self._status_mid.set(f"当前模式：{RUN_MODE_CLIENT_DIRECT_LABEL}")
+        auto_text = "自动进入游戏" if self._client_direct_auto_enter_game() else "停在公告/进入游戏前"
+        self._log(f"已选择{RUN_MODE_CLIENT_DIRECT_LABEL}：{RUN_MODE_CLIENT_DIRECT_HINT}，{auto_text}。")
         self._sync_work_mode_visibility()
         self._sync_account_source_controls()
         self._sync_client_direct_controls()
         self._sync_work_mode_buttons()
 
-    def _is_background_run_mode(self) -> bool:
-        return _run_mode_key_for_owner(self) == "background"
+    def _open_refresh_address_dialog(self) -> None:
+        dialog = getattr(self, "_refresh_address_dialog", None)
+        try:
+            if dialog is not None and bool(dialog.winfo_exists()):
+                dialog.lift()
+                dialog.focus_set()
+                return
+        except Exception:
+            pass
+        self._refresh_address_dialog = RefreshAddressDialog(self)
+        self._log(f"[刷新地址] 已打开弹窗，数据目录：{default_refresh_data_dir()}")
+
+    def _open_login_account_manager(self) -> None:
+        dialog = getattr(self, "_login_account_manager_dialog", None)
+        try:
+            if dialog is not None and bool(dialog.winfo_exists()):
+                dialog.lift()
+                dialog.focus_set()
+                return
+        except Exception:
+            pass
+        self._login_account_manager_dialog = LoginAccountManagerDialog(self)
+        self._log("[账号管理] 已打开直登账号管理。")
+
+    def _client_direct_account_with_local_link(self, account: AccountConfig) -> AccountConfig:
+        try:
+            resolved = resolve_client_direct_url_for_account(account, ensure_refresh_data_dir().direct_links_path)
+        except Exception as exc:
+            self._log(f"[客户端直登] 读取本地直登链接库失败：{mask_sensitive_text(redact_sensitive_text(exc))}")
+            return account
+        if resolved.status == "found":
+            self._log(f"[客户端直登] {account.display_name} 使用本地直登链接库：name={resolved.name}")
+            return replace(account, url=resolved.direct_url)
+        if resolved.status == "expired" and resolved.direct_url:
+            self._log(f"[客户端直登] {account.display_name} {resolved.message}：name={resolved.name}，允许继续尝试。")
+            return replace(account, url=resolved.direct_url)
+        self._log(f"[客户端直登] {account.display_name} {resolved.message}；将保留当前收藏夹链接。")
+        return account
+
+    def _client_direct_accounts_with_local_links(self, accounts: list[AccountConfig]) -> list[AccountConfig]:
+        return [LauncherApp._client_direct_account_with_local_link(self, account) for account in accounts]
 
     def _is_client_direct_run_mode(self) -> bool:
-        return _run_mode_key_for_owner(self) == "client_direct"
+        return True
 
     def _sync_client_direct_controls(self) -> None:
         check = getattr(self, "client_direct_auto_enter_check", None)
-        spin = getattr(self, "client_direct_base_port_spin", None)
-        if self._is_client_direct_run_mode():
-            if check is not None:
-                check.state(["!disabled"])
-            if spin is not None:
-                spin.state(["!disabled"])
-        else:
-            if check is not None:
-                check.state(["disabled"])
-            if spin is not None:
-                spin.state(["disabled"])
+        if check is not None:
+            check.state(["!disabled"])
         self._sync_client_direct_port_range()
 
     def _sync_work_mode_visibility(self) -> None:
-        client_direct = self._is_client_direct_run_mode()
         client_frame = getattr(self, "client_direct_run_frame", None)
-        foreground_frame = getattr(self, "foreground_run_frame", None)
         if client_frame is not None:
-            if client_direct:
-                client_frame.pack(fill=tk.X, pady=(0, 4))
-            else:
-                client_frame.pack_forget()
+            client_frame.pack(fill=tk.X, pady=(0, 4))
+        foreground_frame = getattr(self, "foreground_run_frame", None)
         if foreground_frame is not None:
-            if client_direct:
-                foreground_frame.pack_forget()
-            else:
-                foreground_frame.pack(fill=tk.X, pady=(0, 4))
-
+            foreground_frame.pack_forget()
         for widget in getattr(self, "wm_legacy_launch_grid_widgets", ()):
-            if client_direct:
-                widget.grid_remove()
-            else:
-                widget.grid()
+            widget.grid_remove()
         launch_btn = getattr(self, "wm_launch_btn", None)
         if launch_btn is not None:
-            if client_direct:
-                launch_btn.pack_forget()
-            else:
-                try:
-                    launch_btn.pack(side=tk.LEFT, padx=(4, 10), before=self.wm_identify_btn)
-                except Exception:
-                    launch_btn.pack(side=tk.LEFT, padx=(4, 10))
+            launch_btn.pack_forget()
 
     def _sync_work_mode_buttons(self) -> None:
-        client_direct = self._is_client_direct_run_mode()
-        account_password = (not client_direct) and self.method_var.get() == "method2"
-        legacy_compat = (not client_direct) and not account_password
-        pairs = (
-            (getattr(self, "run_mode_account_password_btn", None), account_password),
-            (getattr(self, "run_mode_client_btn", None), client_direct),
-            (getattr(self, "run_mode_foreground_btn", None), legacy_compat),
-        )
-        for button, selected in pairs:
-            if button is None:
-                continue
-            try:
-                button.configure(
-                    relief=tk.SUNKEN if selected else tk.RAISED,
-                    bg="#d9edf7" if selected else self.cget("bg"),
-                    activebackground="#d9edf7" if selected else self.cget("bg"),
-                )
-            except Exception:
-                pass
-
-    def _account_source_uses_bookmarks(self) -> bool:
-        return self._is_client_direct_run_mode() or self.method_var.get() == "method1"
+        button = getattr(self, "run_mode_client_btn", None)
+        if button is None:
+            return
+        try:
+            button.configure(relief=tk.SUNKEN, bg="#d9edf7", activebackground="#d9edf7")
+        except Exception:
+            pass
 
     def _sync_account_source_controls(self) -> None:
-        client_direct = self._is_client_direct_run_mode()
-        current_run_mode = ""
-        try:
-            current_run_mode = str(self.run_mode_var.get() or "")
-        except Exception:
-            current_run_mode = ""
-        advanced_var = getattr(self, "advanced_config_visible", None)
-        try:
-            advanced_visible = bool(advanced_var.get()) if advanced_var is not None else False
-        except Exception:
-            advanced_visible = False
-        show_legacy_method_row = (
-            not client_direct
-            and (
-                current_run_mode == RUN_MODE_FOREGROUND_LABEL
-                or advanced_visible
-            )
-        )
-        if not client_direct and not show_legacy_method_row and self.method_var.get() != "method2":
-            self.method_var.set("method2")
-        use_bookmarks = self._account_source_uses_bookmarks()
-        summary_row = getattr(self, "account_source_summary_row", None)
-        if summary_row is not None:
-            if show_legacy_method_row:
-                summary_row.grid_remove()
-            else:
-                if client_direct:
-                    self.account_source_summary_var.set("当前模式：客户端直登模式，使用收藏夹完整直登链接启动 X5Game。")
-                else:
-                    self.account_source_summary_var.set("当前模式：账号密码登录模式，使用账号密码配置，通过原方式二流程登录。")
-                summary_row.grid()
-        if hasattr(self, "method_row"):
-            if show_legacy_method_row:
-                self.method_row.grid()
-            else:
-                self.method_row.grid_remove()
-        for w in (
-            self._method1_row1,
-            self._method1_btn_auto_bookmark,
-            self._method1_btn_load,
-            self._method1_row2a,
-            self._method1_bookmark_candidate_combo,
-            self._method1_row3a,
-            self._method1_root_combo,
-            self._method1_advanced_toggle_btn,
-        ):
-            w.grid() if use_bookmarks else w.grid_remove()
-        if use_bookmarks:
-            self._sync_advanced_config_visibility()
-        else:
-            self._method1_advanced_frame.grid_remove()
-        for w in (self._method2_row1, self._method2_csv_entry, self._method2_btn_pick, self._method2_btn_import):
-            w.grid() if not use_bookmarks else w.grid_remove()
-        if use_bookmarks:
-            self._table_frame_m2.grid_remove()
-            self._table_frame_m1.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
-            self._refresh_account_choices()
-        else:
-            self._table_frame_m1.grid_remove()
-            self._table_frame_m2.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
         if hasattr(self, "group_settings_btn"):
-            self.group_settings_btn.configure(state=tk.NORMAL if use_bookmarks else tk.DISABLED)
-
+            self.group_settings_btn.configure(state=tk.NORMAL)
     def _client_direct_auto_enter_game(self) -> bool:
         var = getattr(self, "client_direct_auto_enter_var", None)
         if var is None:
@@ -1804,8 +2903,138 @@ class LauncherApp(_TK_BASE):
             "speed_panel_top": 12,
             "speed_panel_debug": _safe_bool_var(self, "speed_panel_debug_var", False),
             "speed_panel_remove_original_toggle": _safe_bool_var(self, "speed_panel_remove_original_toggle_var", True),
-            "block_browser_context_menu": _safe_bool_var(self, "block_browser_context_menu_var", True),
+            "block_browser_context_menu": False,
         }
+
+    def _save_speed_rate_hotkeys(self, rows: list[dict[str, object]]) -> None:
+        path = Path(self.settings_path.get())
+        data: dict[str, object] = {}
+        if path.exists():
+            loaded = json.loads(path.read_text(encoding="utf-8-sig"))
+            if isinstance(loaded, dict):
+                data = loaded
+        data["speed_rate_hotkeys"] = rows
+        data["speed_panel_hotkey"] = ""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _register_saved_speed_rate_hotkeys(self) -> None:
+        rows = list(getattr(self, "speed_rate_hotkeys", []) or [])
+        if not rows:
+            return
+        ok, message = self._speed_hotkey_listener.replace(rows)
+        self._log(f"[加速器快捷键] {message}")
+        if not ok:
+            self.after(0, lambda: messagebox.showerror("加速器快捷键", message))
+
+    def _open_speed_hotkey_settings(self) -> None:
+        dialog = tk.Toplevel(self)
+        dialog.withdraw()
+        dialog.title("多倍率快捷键设置")
+        dialog.transient(self)
+        frame = ttk.Frame(dialog, padding=12)
+        frame.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(frame, text="目标倍率").grid(row=0, column=0, padx=5, pady=(0, 6))
+        ttk.Label(frame, text="修饰键").grid(row=0, column=1, padx=5, pady=(0, 6))
+        ttk.Label(frame, text="主键").grid(row=0, column=3, padx=5, pady=(0, 6))
+        defaults = list(getattr(self, "speed_rate_hotkeys", []) or [])
+        fallback = ((3.0, "Alt", "2"), (6.0, "Alt", "3"), (20.0, "Alt", "4"), (50.0, "Alt", "5"))
+        variables = []
+        modifiers = ("无", "Ctrl", "Alt", "Shift", "Ctrl+Alt", "Ctrl+Shift", "Alt+Shift", "Ctrl+Alt+Shift")
+        main_keys = tuple(chr(value) for value in range(ord("A"), ord("Z") + 1)) + tuple(str(value) for value in range(10)) + tuple(f"F{value}" for value in range(1, 13))
+        for index in range(4):
+            rate, modifier, main_key = fallback[index]
+            if index < len(defaults):
+                rate = float(defaults[index]["rate"])
+                parts = str(defaults[index]["hotkey"]).split("+")
+                main_key = parts[-1]
+                modifier = "+".join(parts[:-1]) or "无"
+            rate_var, modifier_var, main_var = tk.StringVar(value=str(rate)), tk.StringVar(value=modifier), tk.StringVar(value=main_key)
+            variables.append((rate_var, modifier_var, main_var))
+            ttk.Entry(frame, textvariable=rate_var, width=10).grid(row=index + 1, column=0, padx=5, pady=4)
+            ttk.Combobox(frame, textvariable=modifier_var, values=modifiers, width=16, state="readonly").grid(row=index + 1, column=1, padx=5, pady=4)
+            ttk.Label(frame, text="+").grid(row=index + 1, column=2, padx=2, pady=4)
+            ttk.Combobox(frame, textvariable=main_var, values=main_keys, width=8, state="normal").grid(row=index + 1, column=3, padx=5, pady=4)
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=5, column=0, columnspan=4, sticky="e", pady=(12, 0))
+        ttk.Button(buttons, text="确定", command=lambda: LauncherApp._confirm_speed_hotkey_settings(self, dialog, variables)).pack(side=tk.LEFT, padx=4)
+        ttk.Button(buttons, text="取消", command=dialog.destroy).pack(side=tk.LEFT, padx=4)
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        _position_dialog_relative_to_owner(dialog, self)
+        dialog.deiconify()
+        dialog.lift()
+        dialog.focus_set()
+        dialog.grab_set()
+        dialog.wait_window()
+
+    def _confirm_speed_hotkey_settings(self, dialog, variables) -> bool:
+        try:
+            rows = [
+                {"rate": float(rate_var.get()), "hotkey": compose_speed_hotkey(modifier_var.get(), main_var.get())}
+                for rate_var, modifier_var, main_var in variables
+            ]
+            normalized = normalize_speed_hotkey_bindings(rows)
+            rows = [{"rate": item.rate, "hotkey": item.spec.text} for item in normalized]
+        except (TypeError, ValueError) as exc:
+            messagebox.showerror("多倍率快捷键设置", str(exc), parent=dialog)
+            return False
+        old_rows = list(getattr(self, "speed_rate_hotkeys", []) or [])
+        ok, message = self._speed_hotkey_listener.replace(rows)
+        if not ok:
+            self._log(f"[加速器快捷键] {message}")
+            messagebox.showerror("多倍率快捷键设置", message, parent=dialog)
+            return False
+        try:
+            LauncherApp._save_speed_rate_hotkeys(self, rows)
+        except Exception as exc:
+            rollback_ok, rollback_message = self._speed_hotkey_listener.replace(old_rows)
+            message = f"保存配置失败：{mask_sensitive_text(exc)}；" + ("已恢复旧快捷键" if rollback_ok else f"旧快捷键恢复失败：{rollback_message}")
+            self._log(f"[加速器快捷键] {message}")
+            messagebox.showerror("多倍率快捷键设置", message, parent=dialog)
+            return False
+        self.speed_rate_hotkeys = rows
+        self._log(f"[加速器快捷键] {message}，已保存并立即生效。")
+        dialog.destroy()
+        return True
+
+    def _on_speed_rate_hotkey(self, rate: float) -> None:
+        threading.Thread(target=LauncherApp._speed_rate_hotkey_worker, args=(self, float(rate)), daemon=True).start()
+
+    def _speed_rate_hotkey_worker(self, configured_rate: float) -> None:
+        lock = getattr(self, "_speed_hotkey_toggle_lock", None)
+        if lock is None or not lock.acquire(blocking=False):
+            return
+        try:
+            scope_var = getattr(self, "client_speed_control_scope_var", None)
+            scope = str(scope_var.get() if scope_var is not None else CLIENT_SPEED_SCOPE_CURRENT_BATCH)
+            candidates = LauncherApp._client_speed_control_scope_bindings(self, scope)
+            matches_by_runtime = {
+                (
+                    int(getattr(binding, "pid", 0) or 0),
+                    int(getattr(binding, "hwnd", 0) or 0),
+                    int(getattr(binding, "cdp_port", 0) or 0),
+                ): binding
+                for binding in candidates
+            }
+            matches = list(matches_by_runtime.values())
+            target_rate = 1.0 if matches and all(abs(float(getattr(binding, "speed_rate", 1.0) or 1.0) - float(configured_rate)) < 1e-9 for binding in matches) else float(configured_rate)
+            config = ClientSpeedPanelConfig(**LauncherApp._client_speed_panel_options(self))
+            self._queue_log(f"[加速器快捷键] 范围={scope}，目标={len(matches)}，倍率={target_rate}。")
+            summary = run_speed_control_batch(
+                matches, float(target_rate),
+                stop_event=getattr(self, "stop_event", None),
+                skip_reason=lambda binding: LauncherApp._client_speed_control_skip_reason(self, binding),
+                apply_binding=lambda binding, value: LauncherApp._apply_client_speed_to_binding(self, binding, value, config),
+                log=self._queue_log,
+            )
+            if summary.success and hasattr(self, "client_batch_store"):
+                self.client_batch_store.save()
+            self._queue_log(
+                f"[加速器快捷键] 完成：成功={summary.success}，失败={summary.failed}，"
+                f"跳过={summary.skipped}，倍率={target_rate}。"
+            )
+        finally:
+            lock.release()
 
     def _client_speed_control_rate(self, rate_override: float | None = None) -> float | None:
         if rate_override is not None:
@@ -1867,7 +3096,17 @@ class LauncherApp(_TK_BASE):
         status = str(getattr(binding, "window_status", "") or binding.status or "")
         if int(binding.cdp_port or 0) <= 0:
             return "cdp_unavailable"
-        if status in {"pid_missing", "pid_not_x5game", "binding_invalid", "cdp_owner_mismatch", "cdp_unavailable", "hwnd_invalid"}:
+        if status in {
+            "pid_missing",
+            "pid_not_x5game",
+            "binding_invalid",
+            "cdp_owner_mismatch",
+            "cdp_unavailable",
+            "hwnd_invalid",
+            "scan_missing",
+            "未找到",
+            "已失联",
+        }:
             return status
         pid = int(binding.pid or 0)
         if pid <= 0:
@@ -1884,68 +3123,106 @@ class LauncherApp(_TK_BASE):
         return ""
 
     def _apply_client_speed_control(self, *, rate_override: float | None = None) -> None:
+        worker_thread = getattr(self, "worker_thread", None)
+        if worker_thread is not None and worker_thread.is_alive():
+            messagebox.showwarning("任务运行中", "已有任务正在运行，请先停止或等待完成。")
+            return
         rate = LauncherApp._client_speed_control_rate(self, rate_override)
         if rate is None:
             return
         scope_var = getattr(self, "client_speed_control_scope_var", None)
         scope = str(scope_var.get() if scope_var is not None else CLIENT_SPEED_SCOPE_CURRENT_BATCH)
         bindings = LauncherApp._client_speed_control_scope_bindings(self, scope)
-        success_count = 0
-        fail_count = 0
-        skipped_count = 0
-        for binding in bindings:
-            reason = LauncherApp._client_speed_control_skip_reason(self, binding)
-            if reason:
-                skipped_count += 1
-                self._log(f"[加速总控] 跳过 {binding.account_name or binding.account_id}：{reason}")
-                continue
+        config = ClientSpeedPanelConfig(**LauncherApp._client_speed_panel_options(self))
+        stop_event = getattr(self, "stop_event", None)
+        if stop_event is None:
+            stop_event = threading.Event()
+            self.stop_event = stop_event
+        stop_event.clear()
+        self._preserve_background_windows = True
+        status_var = getattr(self, "client_speed_control_status_var", None)
+        if status_var is not None:
             try:
-                apply_func = getattr(self, "_apply_client_speed_to_binding")
-                apply_func(binding, rate)
-                binding.speed_rate = float(rate)
-                binding.window_status = "restored"
-                success_count += 1
-            except Exception as exc:
-                fail_count += 1
-                self._log(
-                    f"[加速总控] 失败 {binding.account_name or binding.account_id}："
-                    f"{mask_sensitive_text(exc)}"
-                )
-        if hasattr(self, "client_batch_store"):
-            try:
-                self.client_batch_store.save()
+                status_var.set(f"执行中 0/{len(bindings)}")
             except Exception:
                 pass
-        status_text = f"成功 {success_count} / 失败 {fail_count} / 跳过 {skipped_count}"
+        self._log(f"[加速总控] 已启动后台任务：范围={scope}，目标={len(bindings)}，倍率={rate}。")
+        self.worker_thread = threading.Thread(
+            target=LauncherApp._client_speed_control_worker,
+            args=(self, list(bindings), float(rate), config),
+            daemon=True,
+        )
+        self.worker_thread.start()
+
+    def _client_speed_control_worker(
+        self,
+        bindings: list[ClientBatchBinding],
+        rate: float,
+        config: ClientSpeedPanelConfig,
+    ) -> None:
+        try:
+            summary = run_speed_control_batch(
+                bindings,
+                float(rate),
+                stop_event=getattr(self, "stop_event", None),
+                skip_reason=lambda binding: LauncherApp._client_speed_control_skip_reason(self, binding),
+                apply_binding=lambda binding, value: LauncherApp._apply_client_speed_to_binding(
+                    self,
+                    binding,
+                    value,
+                    config,
+                ),
+                log=self._queue_log,
+            )
+            if summary.success and hasattr(self, "client_batch_store"):
+                try:
+                    self.client_batch_store.save()
+                except Exception as exc:
+                    self._queue_log(f"[加速总控] 保存成功倍率失败：{mask_sensitive_text(exc)}")
+            self._queue_log(
+                f"[加速总控] 目标{summary.total}，成功{summary.success}，失败{summary.failed}，"
+                f"跳过{summary.skipped}，停止{summary.stopped}。"
+            )
+            self._update_status_bar(
+                "加速总控已停止" if summary.stopped else f"加速总控完成：成功{summary.success}，失败{summary.failed}"
+            )
+        except Exception as exc:
+            summary = SpeedControlSummary(total=len(bindings), failed=len(bindings))
+            self._queue_log(f"[加速总控] 后台任务失败：{mask_sensitive_text(exc)}")
+        finish = lambda: LauncherApp._finish_client_speed_control(self, summary)
+        try:
+            self.after(0, finish)
+        except Exception:
+            finish()
+
+    def _finish_client_speed_control(self, summary: SpeedControlSummary) -> None:
+        status_text = (
+            f"成功 {summary.success} / 失败 {summary.failed} / "
+            f"跳过 {summary.skipped} / 停止 {summary.stopped}"
+        )
         status_var = getattr(self, "client_speed_control_status_var", None)
         if status_var is not None:
             try:
                 status_var.set(status_text)
             except Exception:
                 pass
-        self._log(
-            f"[加速总控] 目标{len(bindings)}，成功{success_count}，失败{fail_count}，跳过{skipped_count}。"
-        )
         sync = getattr(self, "_sync_client_direct_batch_status", None)
         if callable(sync):
             sync()
+        self.worker_thread = None
 
-    def _apply_client_speed_to_binding(self, binding: ClientBatchBinding, rate: float) -> None:
-        port = int(binding.cdp_port or 0)
-        targets = wait_for_cdp_targets(port, timeout=3.0)
-        target = select_page_target(targets)
-        cdp = RawCdpClient(str(target["webSocketDebuggerUrl"]))
-        try:
-            cdp.connect()
-            cdp.enable_default_domains()
-            apply_speed_rate_to_cdp(
-                cdp,
-                float(rate),
-                ClientSpeedPanelConfig(**LauncherApp._client_speed_panel_options(self)),
-                log=self._log,
-            )
-        finally:
-            cdp.close()
+    def _apply_client_speed_to_binding(
+        self,
+        binding: ClientBatchBinding,
+        rate: float,
+        config: ClientSpeedPanelConfig,
+    ) -> SpeedApplyResult:
+        return apply_speed_rate_to_binding(
+            binding,
+            float(rate),
+            config,
+            log=self._queue_log,
+        )
 
     def _sync_client_direct_port_range(self) -> None:
         var = getattr(self, "client_direct_port_range_var", None)
@@ -1989,26 +3266,6 @@ class LauncherApp(_TK_BASE):
             return True
         self._log(f"[客户端批次] 用户取消创建新批次：保留旧批次={batch.batch_name}，未启动客户端。")
         return False
-
-    def _block_background_unsupported_action(self, action_name: str) -> bool:
-        if not self._is_background_run_mode():
-            return False
-        if action_name in ("单账号运行", "当前层串行", "全部串行"):
-            return False
-        message = "后台模式当前支持方式一单账号、当前层串行、全部串行；方式二未接入"
-        self._log(f"阻止{action_name}：{message}")
-        messagebox.showwarning("后台模式限制", message)
-        return True
-
-    def _block_client_direct_unsupported_action(self, action_name: str) -> bool:
-        if _run_mode_key_for_owner(self) != "client_direct":
-            return False
-        if action_name in ("单账号运行", "当前层串行", "全部串行"):
-            return False
-        message = "客户端直登模式当前仅支持方式一单账号、当前层串行和全部串行；方式二暂未接入"
-        self._log(f"阻止{action_name}：{message}")
-        messagebox.showwarning("客户端直登限制", message)
-        return True
 
     def _set_game_program_path(self, path: str) -> None:
         entry_value, status_text = _game_program_display_values(path)
@@ -2138,8 +3395,6 @@ class LauncherApp(_TK_BASE):
         if self._wm_mode_key_from_label() == TILE_MODE_ROW_COUNT:
             self.wm_launch_count_var.set(self.wm_row_count_mode_settings.launch_count)
             self.wm_per_row_var.set(self.wm_row_count_mode_settings.per_row)
-            for widget in self.wm_fixed_param_widgets:
-                widget.grid()
             return
 
         fixed = self.wm_fixed_mode_settings
@@ -2151,8 +3406,6 @@ class LauncherApp(_TK_BASE):
         self.wm_offset_x_var.set(fixed.offset_x)
         self.wm_offset_y_var.set(fixed.offset_y)
         self.wm_per_row_var.set(fixed.per_row)
-        for widget in self.wm_fixed_param_widgets:
-            widget.grid()
 
     def _wm_store_current_mode_values(self, mode_key: str | None = None) -> None:
         try:
@@ -3699,6 +4952,8 @@ Write-Output $count
         self.bookmark_root_candidate_by_label = {}
         self.bookmark_root_candidate_var.set("")
         self.bookmark_root_path.set("")
+        self.bookmark_root_guid.set("")
+        self.bookmark_root_parent_path.set("")
         self.bookmark_root_display_name.set("")
         if clear_legacy:
             self.bookmark_root_name.set("")
@@ -3745,8 +5000,7 @@ Write-Output $count
             for label, candidate in self.bookmark_root_candidate_by_label.items():
                 if candidate.root_path == saved_root_path:
                     self.bookmark_root_candidate_var.set(label)
-                    self.bookmark_root_display_name.set(candidate.display_name)
-                    self.bookmark_root_name.set(candidate.display_name.split(" / ")[-1].replace("（直接链接）", ""))
+                    self._apply_bookmark_root_candidate(candidate, save=True)
                     return
             self._log("保存的账号目录路径已不存在，请重新选择账号目录。")
             self.bookmark_root_path.set("")
@@ -3791,6 +5045,8 @@ Write-Output $count
 
     def _apply_bookmark_root_candidate(self, candidate, save: bool) -> None:
         self.bookmark_root_path.set(candidate.root_path)
+        self.bookmark_root_guid.set(str(getattr(candidate, "guid", "") or ""))
+        self.bookmark_root_parent_path.set(str(getattr(candidate, "parent_path", "") or ""))
         self.bookmark_root_display_name.set(candidate.display_name)
         self.bookmark_root_name.set(candidate.display_name.split(" / ")[-1].replace("（直接链接）", ""))
         if save:
@@ -3825,74 +5081,35 @@ Write-Output $count
             self.settings_path.set(path)
 
     def _load_default_config_if_present(self) -> None:
-        if self.bookmark_path.get() and Path(self.bookmark_path.get()).exists():
-            self._refresh_bookmark_root_candidates(auto_select=True)
-            self._load_accounts()
-        else:
-            current = self.bookmark_path.get().strip()
-            if current:
-                self._log(f"收藏夹路径不可读，未自动读取：{current}")
-            else:
-                self._log("未保存收藏夹路径，未自动读取。请手动选择 Bookmarks 文件后点击“读取收藏夹”。")
+        self._load_accounts()
 
     def _load_accounts(self) -> None:
         try:
+            paths = ensure_refresh_data_dir()
+            refresh_store = AccountsStore(paths.accounts_path)
+            refresh_accounts = refresh_store.load()
+            if refresh_store.load_error is not None:
+                raise RuntimeError("刷新地址账号库无法读取")
+            self.login_account_roster_store = LoginAccountRosterStore(paths.login_accounts_path)
+            rows = self.login_account_roster_store.reconcile(refresh_accounts)
+            links = DirectLinkStore(paths.direct_links_path)
             settings = load_settings(self.settings_path.get())
-            bookmark_file = self.bookmark_path.get() or settings.bookmark_file
-            root_name = self.bookmark_root_name.get().strip() or settings.bookmark_root_name
-            root_path = self.bookmark_root_path.get().strip() or settings.bookmark_root_path
-            if not bookmark_file:
-                raise ValueError(
-                    "未配置收藏夹路径。程序不会自动切换到 Chrome/Edge 候选，"
-                    f"请手动选择 Bookmarks 文件。候选：{self._bookmark_candidates_summary()}"
-                )
-            level_counts = self._current_level_counts()
-            self._log(f"准备读取收藏夹：{bookmark_file}")
-            root_candidate = self._selected_bookmark_root_candidate_for_load(bookmark_file, root_path)
-            if root_candidate is not None:
-                bookmark_file = root_candidate.bookmark_file
-                root_path = root_candidate.root_path
-                self.accounts = load_accounts_from_bookmark_root(
-                    bookmark_file,
-                    root_path,
-                    settings.level_names,
-                    level_counts=level_counts,
-                    account_group_settings=settings.account_group_settings,
-                    log=lambda message: self._log(f"收藏夹读取：{message}"),
-                )
-            elif self.bookmark_root_candidates:
-                raise ValueError("请先在账号目录下拉框中选择当前收藏夹对应的账号目录。")
-            else:
-                self.accounts = load_accounts_from_bookmarks(
-                    bookmark_file,
-                    root_name,
-                    settings.level_names,
-                    level_counts=level_counts,
-                    account_group_settings=settings.account_group_settings,
-                    log=lambda message: self._log(f"收藏夹读取：{message}"),
-                )
-            self._save_bookmark_settings(bookmark_file)
-            self.status_by_key = {account.key: "未开始" for account in self.accounts}
-            self.passport_by_key = {account.key: "" for account in self.accounts}
-            self.timing_by_key = {account.key: "" for account in self.accounts}
+            previous_status = dict(getattr(self, "status_by_key", {}) or {})
+            previous_passport = dict(getattr(self, "passport_by_key", {}) or {})
+            previous_timing = dict(getattr(self, "timing_by_key", {}) or {})
+            self.accounts = build_launcher_accounts(rows, links.links, settings.account_group_settings)
+            self.status_by_key = {account.key: previous_status.get(account.key, "未开始") for account in self.accounts}
+            self.passport_by_key = {account.key: previous_passport.get(account.key, "") for account in self.accounts}
+            self.timing_by_key = {account.key: previous_timing.get(account.key, "") for account in self.accounts}
             self._refresh_mode_account_scope()
-            self._log(f"已从收藏夹读取 {len(self.accounts)} 个账号链接。{self._account_count_summary()}")
+            self.account_source_summary_var.set(
+                f"账号库 {len(refresh_accounts)} 个 / 参与上号 {len(self.accounts)} 个"
+            )
+            self._log(f"已从刷新地址账号库加载 {len(self.accounts)} 个参与上号账号。{self._account_count_summary()}")
         except Exception as exc:
-            self._clear_loaded_accounts("读取收藏夹失败，账号列表已清空，请重新选择收藏夹和账号目录。")
-            messagebox.showerror("读取收藏夹失败", str(exc))
-            self._log(f"读取收藏夹失败: {exc}")
-            bookmark_file = self.bookmark_path.get().strip()
-            if bookmark_file:
-                top_level = list_bookmark_top_level_dirs(bookmark_file)
-                top_level_text = "，".join(top_level) if top_level else "未检测到一级目录"
-                self._log(f"读取失败时的 Bookmarks 路径：{bookmark_file}")
-                self._log(f"检测到的一级目录：{top_level_text}")
-
-    def _current_level_counts(self) -> dict[str, int]:
-        counts: dict[str, int] = {}
-        for level in LEVELS:
-            counts[level] = int(self.level_count_vars[level].get())
-        return counts
+            self._clear_loaded_accounts("刷新地址账号库读取失败，账号列表已清空。")
+            self.account_source_summary_var.set("刷新地址账号库读取失败")
+            self._log(f"读取刷新地址账号库失败: {mask_sensitive_text(str(exc))}")
 
     def _account_count_summary(self, accounts: list[AccountConfig] | None = None) -> str:
         source = accounts if accounts is not None else self.accounts
@@ -3917,12 +5134,9 @@ Write-Output $count
         return "、".join(group_names) if group_names else "无"
 
     def _open_account_group_settings(self) -> None:
-        if self.method_var.get() != "method1":
-            messagebox.showinfo("分组设置", "全部串行分组设置仅用于方式一收藏夹账号。")
-            return
         group_counts = self._account_group_counts(self.accounts)
         if not group_counts:
-            messagebox.showwarning("无账号分组", "请先读取收藏夹，再设置全部串行分组。")
+            messagebox.showwarning("无账号分组", "刷新地址账号库中没有参与上号的账号。")
             return
 
         include_by_group = {
@@ -4165,93 +5379,6 @@ Write-Output $count
         messagebox.showwarning("运行前预检失败", message)
         return False
 
-    # ===== 方式二：CSV 导入 =====
-
-    def _on_method_changed(self) -> None:
-        self._sync_account_source_controls()
-        self._sync_work_mode_buttons()
-
-    def _pick_csv_file(self) -> None:
-        path = filedialog.askopenfilename(
-            title="选择CSV文件",
-            filetypes=[("CSV文件", "*.csv"), ("所有文件", "*.*")],
-        )
-        if path:
-            self.csv_path.set(path)
-
-    def _import_csv(self) -> None:
-        path = self.csv_path.get().strip()
-        if not path:
-            messagebox.showwarning("提示", "请先选择CSV文件")
-            return
-        accounts, error = load_csv_accounts(path)
-        if error:
-            messagebox.showerror("导入失败", error)
-            self._log(f"CSV导入失败: {error}")
-            return
-        self.csv_accounts = accounts
-        self.csv_status_by_key = {a.key: a.status for a in accounts}
-        self.csv_passport_by_key = {a.key: a.passport for a in accounts}
-        self._refresh_csv_table()
-        valid_count = sum(1 for a in accounts if "配置缺失" not in a.status)
-        self._log(f"已从CSV导入 {len(accounts)} 个账号（有效 {valid_count} 个）。")
-        # 记住CSV路径，下次启动自动加载
-        self._save_csv_path_memory(path)
-
-    def _save_csv_path_memory(self, path: str) -> None:
-        """保存CSV路径到记忆文件，下次启动自动加载"""
-        try:
-            memory_file = Path(getattr(self, "user_data_dir", project_root())) / "csv_last_path.txt"
-            memory_file.parent.mkdir(parents=True, exist_ok=True)
-            memory_file.write_text(path, encoding="utf-8")
-        except Exception:
-            pass
-
-    def _auto_load_csv(self) -> None:
-        """启动时自动加载上次导入的CSV"""
-        try:
-            memory_file = Path(getattr(self, "user_data_dir", project_root())) / "csv_last_path.txt"
-            if not memory_file.exists():
-                return
-            path = memory_file.read_text(encoding="utf-8").strip()
-            if not path or not Path(path).exists():
-                return
-            self.csv_path.set(path)
-            # 直接调用导入（绕过路径空检查）
-            accounts, error = load_csv_accounts(path)
-            if error:
-                self._log(f"自动加载CSV失败: {error}")
-                return
-            self.csv_accounts = accounts
-            self.csv_status_by_key = {a.key: a.status for a in accounts}
-            self.csv_passport_by_key = {a.key: a.passport for a in accounts}
-            self._refresh_csv_table()
-            valid_count = sum(1 for a in accounts if "配置缺失" not in a.status)
-            self._log(f"已自动加载上次CSV: {len(accounts)} 个账号（有效 {valid_count} 个）")
-        except Exception:
-            pass
-
-    def _refresh_csv_table(self) -> None:
-        for item in self.csv_tree.get_children():
-            self.csv_tree.delete(item)
-        for acc in self.csv_accounts:
-            pwd_display = "已填写" if acc.password else "未填写"
-            self.csv_tree.insert(
-                "",
-                tk.END,
-                iid=acc.key,
-                values=(
-                    acc.name,
-                    acc.url,
-                    acc.username,
-                    pwd_display,
-                    acc.game_window_no,
-                    self.csv_passport_by_key.get(acc.key, acc.passport),
-                    self.csv_status_by_key.get(acc.key, acc.status),
-                    self.csv_timing_by_key.get(acc.key, ""),
-                ),
-            )
-
     def _refresh_table(self) -> None:
         for item in self.tree.get_children():
             self.tree.delete(item)
@@ -4262,6 +5389,7 @@ Write-Output $count
                 iid=account.key,
                 values=_account_table_values(
                     account,
+                    window_title=_bound_window_title(self, account),
                     passport=self.passport_by_key.get(account.key, ""),
                     status=self.status_by_key.get(account.key, "未开始"),
                     timing=self.timing_by_key.get(account.key, ""),
@@ -4272,173 +5400,6 @@ Write-Output $count
         choices = [account.display_name for account in self._filtered_accounts_for_ui()]
         self.account_box["values"] = choices
         self.account_var.set(choices[0] if choices else "")
-
-    def _run_selected(self) -> None:
-        account = self._selected_account()
-        if account is None:
-            messagebox.showwarning("未选择账号", "请先读取配置并选择一个账号。")
-            return
-        if not self._validate_accounts_for_current_mode([account]):
-            return
-        self._start_run([account])
-
-    def _run_selected_account(self) -> None:
-        if self.method_var.get() == "method2":
-            if LauncherApp._block_client_direct_unsupported_action(self, "方式二"):
-                return
-            if self._block_background_unsupported_action("方式二"):
-                return
-            self._run_method2_single()
-            return
-        account = self._selected_account()
-        if account is None:
-            messagebox.showwarning("未选择账号", "请先在表格或下拉框中选择一个账号。")
-            return
-        self._log(
-            f"单账号运行前校验：排列方式={self.wm_tile_mode_var.get()}，"
-            f"层级={self.level_var.get()}，账号={account.display_name}，窗口号={account.game_window_no}"
-        )
-        if _run_mode_key_from_label(self.run_mode_var.get()) == "client_direct":
-            auto_text = "自动进入游戏" if LauncherApp._client_direct_auto_enter_game(self) else "不自动进入游戏"
-            self._log(f"{RUN_MODE_CLIENT_DIRECT_LABEL}：启动方式一单账号客户端直登，{auto_text}。")
-            self._start_client_direct_single_run(account)
-            return
-        if not self._precheck_serial_run([account], "单账号运行"):
-            return
-        if not self._validate_accounts_for_current_mode([account]):
-            return
-        self._log(
-            f"单账号运行: {account.display_name}。"
-            f"OCR → 打开游戏页 → 关闭公告 → 通行证 → 输入 → 确认。"
-        )
-        if _run_mode_key_from_label(self.run_mode_var.get()) == "background":
-            self._log(
-                f"{RUN_MODE_BACKGROUND_LABEL}：启动方式一单账号实验流程。"
-            )
-            self._start_background_single_run(account)
-            return
-        self._start_serial_run([account], batch_fast=False)
-
-    def _run_level_serial(self) -> None:
-        if self.method_var.get() == "method2":
-            if LauncherApp._block_client_direct_unsupported_action(self, "方式二"):
-                return
-            if self._block_background_unsupported_action("方式二"):
-                return
-            messagebox.showinfo("提示", "方式二没有层级概念，请使用\"单账号运行\"或\"全部串行\"。")
-            return
-        if LauncherApp._block_client_direct_unsupported_action(self, "当前层串行"):
-            return
-        background_mode = _run_mode_key_for_owner(self) == "background"
-        level = self.level_var.get()
-        accounts = self._filtered_accounts_for_ui()
-        if not accounts:
-            if level == "全部":
-                message = "当前没有勾选参与全部串行的账号。"
-            else:
-                message = f"当前层 {level} 没有账号。"
-            self._log(f"阻止当前层串行：{message}")
-            messagebox.showwarning("无账号", message)
-            return
-        if level == "全部":
-            self._log("当前层串行范围确认：层级=全部，运行当前列表中已勾选参与全部串行的账号。")
-        else:
-            self._log(f"当前层串行范围确认：只运行当前层级【{level}】，不读取全部串行勾选状态。")
-        if _run_mode_key_for_owner(self) == "client_direct":
-            self._log(
-                f"客户端当前层串行: {level}，共 {len(accounts)} 个账号，并发=1，"
-                f"从 CDP 端口 {CLIENT_DIRECT_CDP_PORT} 开始逐个分配。"
-            )
-            self._start_client_direct_serial_run(accounts, run_label="客户端当前层串行")
-            return
-        if not self._precheck_serial_run(accounts, "当前层串行"):
-            return
-        if not self._validate_accounts_for_current_mode(accounts):
-            return
-        if background_mode:
-            self._log(f"后台当前层串行: {level}，共 {len(accounts)} 个账号，并发={BACKGROUND_SERIAL_CONCURRENCY}，逐个调用后台单账号流程。")
-            self._start_background_serial_run(accounts, run_label="后台当前层串行")
-            return
-        self._log(f"当前层串行: {level}，共 {len(accounts)} 个账号，批量快速登录 + 统一校验。")
-        self._start_serial_run(accounts, batch_fast=True)
-
-    def _run_all_serial(self) -> None:
-        if self.method_var.get() == "method2":
-            if LauncherApp._block_client_direct_unsupported_action(self, "方式二"):
-                return
-            if self._block_background_unsupported_action("方式二"):
-                return
-            self._run_method2_all()
-            return
-        if LauncherApp._block_client_direct_unsupported_action(self, "全部串行"):
-            return
-        run_mode_key = _run_mode_key_for_owner(self)
-        background_mode = run_mode_key == "background"
-        client_direct_mode = run_mode_key == "client_direct"
-        selected_level = self.level_var.get()
-        if not background_mode and selected_level != "全部":
-            message = (
-                f"当前层级是【{selected_level}】。\n"
-                "“全部串行”将运行所有已启用分组，不是只运行当前层级。\n"
-                f"如果只想运行【{selected_level}】，请点击“当前层串行”。\n"
-                "如需运行全部启用分组，请先切换层级为“全部”。"
-            )
-            self._log(
-                f"阻止全部串行：当前层级={selected_level}。"
-                "全部串行只代表运行 include_in_all=true 的所有分组。"
-            )
-            messagebox.showwarning("全部串行范围确认", message)
-            return
-        all_accounts = self._mode_allowed_accounts()
-        if not all_accounts:
-            messagebox.showwarning("无账号", "请先读取收藏夹。")
-            return
-        accounts = [account for account in all_accounts if account.include_in_all] if background_mode else self._filtered_accounts_for_ui()
-        skipped_accounts = [account for account in all_accounts if not account.include_in_all]
-        if background_mode:
-            self._log("后台全部串行范围确认：使用层级=全部的 include_in_all=true 过滤逻辑。")
-        if client_direct_mode:
-            self._log("客户端全部串行范围确认：使用层级=全部的 include_in_all=true 过滤逻辑。")
-        if accounts:
-            self._log("本次全部串行将执行：")
-            for group_name, count in self._account_group_counts(accounts):
-                self._log(f"{group_name} {count} 个")
-        if skipped_accounts:
-            self._log("本次全部串行将跳过：")
-            for group_name, count in self._account_group_counts(skipped_accounts):
-                self._log(f"{group_name} {count} 个")
-        if not accounts:
-            message = "未配置任何参与全部串行的分组，请先打开“全部串行分组设置”。"
-            self._log(f"阻止全部串行：{message}")
-            messagebox.showwarning("全部串行未配置", message)
-            return
-        invalid_accounts = [account for account in accounts if not account.include_in_all]
-        if invalid_accounts:
-            invalid_summary = self._account_count_summary(invalid_accounts)
-            message = "检测到未启用分组混入全部串行，已阻止运行。"
-            self._log(f"阻止全部串行：{message}{invalid_summary}")
-            messagebox.showwarning("全部串行分组异常", message)
-            return
-        if client_direct_mode:
-            self._log(
-                f"客户端全部串行: 共 {len(accounts)} 个账号，并发=1，"
-                f"从 CDP 端口 {CLIENT_DIRECT_CDP_PORT} 开始逐个分配。{self._account_count_summary(accounts)}"
-            )
-            self._start_client_direct_serial_run(accounts, run_label="客户端全部串行")
-            return
-        if not self._precheck_serial_run(accounts, "全部串行"):
-            return
-        if not self._validate_accounts_for_current_mode(accounts):
-            return
-        if background_mode:
-            self._log(
-                f"后台全部串行: 共 {len(accounts)} 个账号，并发={BACKGROUND_SERIAL_CONCURRENCY}，"
-                f"逐个调用后台单账号流程。{self._account_count_summary(accounts)}"
-            )
-            self._start_background_serial_run(accounts, run_label="后台全部串行")
-            return
-        self._log(f"全部串行: 共 {len(accounts)} 个账号，批量快速登录 + 统一校验。{self._account_count_summary(accounts)}")
-        self._start_serial_run(accounts, batch_fast=True)
 
     def _client_direct_current_scope_accounts(self, action_name: str) -> list[AccountConfig] | None:
         if _run_mode_key_for_owner(self) != "client_direct":
@@ -4453,7 +5414,7 @@ Write-Output $count
             self._log(f"阻止{action_name}：{message}")
             messagebox.showwarning(action_name, message)
             return None
-        return accounts
+        return LauncherApp._client_direct_accounts_with_local_links(self, accounts)
 
     def _load_client_direct_sessions(self) -> None:
         try:
@@ -4569,10 +5530,17 @@ Write-Output $count
         return f"{base}~{base}"
 
     def _client_direct_batch_counts(self, batch) -> dict[str, int]:
-        closed_statuses = {"pid_missing", "客户端已关闭", "closed", "已关闭"}
-        cdp_statuses = {"cdp_unavailable", "CDP不可用"}
+        closed_statuses = {"pid_missing", "scan_missing", "未找到", "已失联", "客户端已关闭", "closed", "已关闭"}
+        cdp_statuses = {"cdp_port_missing", "cdp_unavailable", "CDP不可用"}
         hwnd_statuses = {"hwnd_invalid", "窗口已失效"}
-        binding_invalid_statuses = {"pid_not_x5game", "binding_invalid", "cdp_owner_mismatch"}
+        binding_invalid_statuses = {
+            "pid_not_x5game",
+            "binding_invalid",
+            "hwnd_pid_mismatch",
+            "cdp_owner_unverified",
+            "cdp_owner_mismatch",
+            "cdp_owner_conflict",
+        }
         counts = {
             "bound": len(batch.bindings),
             "closed": 0,
@@ -4653,9 +5621,20 @@ Write-Output $count
         return ClientDirectRunRecord(
             account_id=binding.account_id,
             account_name=binding.account_name,
+            account_key=binding.account_key,
+            refresh_account_name=binding.refresh_account_name,
+            bookmark_path=binding.bookmark_path,
+            slot_index=binding.slot_index,
+            identity_status=binding.identity_status,
+            link_status=binding.link_status,
+            window_status=binding.window_status,
             pid=int(binding.pid or 0),
             hwnd=int(binding.hwnd or 0),
+            title=str(getattr(binding, "title", "") or ""),
             cdp_port=int(binding.cdp_port or 0),
+            cdp_owner_pid=int(getattr(binding, "cdp_owner_pid", 0) or 0),
+            cdp_ownership_status=str(getattr(binding, "cdp_ownership_status", "") or ""),
+            speed_rate=float(getattr(binding, "speed_rate", 1.0) or 1.0),
             login_url=binding.login_url,
             status=binding.status,
             error_message=binding.error_message,
@@ -4665,9 +5644,20 @@ Write-Output $count
         return ClientBatchBinding(
             account_id=record.account_id,
             account_name=record.account_name,
+            account_key=record.account_key or record.account_id,
+            refresh_account_name=record.refresh_account_name,
+            bookmark_path=record.bookmark_path,
+            slot_index=record.slot_index,
+            identity_status=record.identity_status or "resolved",
+            link_status=record.link_status,
+            window_status=record.window_status,
             pid=int(record.pid or 0),
             hwnd=int(record.hwnd or 0),
+            title=str(getattr(record, "title", "") or ""),
             cdp_port=int(record.cdp_port or 0),
+            cdp_owner_pid=int(getattr(record, "cdp_owner_pid", 0) or 0),
+            cdp_ownership_status=str(getattr(record, "cdp_ownership_status", "") or ""),
+            speed_rate=float(getattr(record, "speed_rate", 1.0) or 1.0),
             login_url=record.login_url,
             status=record.status,
             error_message=record.error_message,
@@ -4694,6 +5684,9 @@ Write-Output $count
             LauncherApp._batch_binding_from_record(self, record)
             for record in self.client_direct_bindings.values()
         ]
+        for index, binding in enumerate(batch_bindings, start=1):
+            if int(binding.slot_index or 0) <= 0:
+                binding.slot_index = index
         self.client_batch_store.replace_current_bindings(batch_bindings)
         self.client_batch_store.save()
         if sync_ui:
@@ -4736,11 +5729,22 @@ Write-Output $count
             except Exception:
                 return []
         LauncherApp._ensure_client_direct_selected_batch_current(self)
+        batch = self.client_batch_store.current_batch()
+        try:
+            candidates = list(self._filtered_accounts_for_ui())
+        except Exception:
+            candidates = []
+        resolution = _resolve_client_direct_batch_accounts(self, batch, candidates)
+        if resolution.status != "resolved":
+            self._client_direct_identity_error = resolution.message
+            logger = getattr(self, "_log", None)
+            if callable(logger):
+                logger(f"[客户端直登] 账号身份解析失败：{resolution.message}")
+            return []
+        self._client_direct_identity_error = ""
+        self.client_batch_store.save()
         LauncherApp._restore_client_direct_bindings_from_active_batch(self)
-        return [
-            LauncherApp._account_for_client_direct_record(self, record)
-            for record in self.client_direct_bindings.values()
-        ]
+        return resolution.accounts
 
     def _client_direct_scope_label(self) -> str:
         level = self.level_var.get()
@@ -4872,6 +5876,7 @@ Write-Output $count
         if not started:
             return
         self._client_direct_one_click_accounts = list(accounts)
+        self._client_direct_one_click_auto_enter_game = bool(auto_enter)
         after = getattr(self, "after", None)
         if callable(after):
             after(500, self._continue_client_direct_one_click_after_prepare)
@@ -4884,11 +5889,14 @@ Write-Output $count
         accounts = list(getattr(self, "_client_direct_one_click_accounts", []) or [])
         if not accounts:
             return
-        successful = [
-            account for account in accounts
-            if account.key in self.client_direct_bindings
-            and self.client_direct_bindings[account.key].status == "客户端已启动/待登录"
-        ]
+        successful = []
+        for account in accounts:
+            record = self.client_direct_bindings.get(account.key)
+            if record is not None and LauncherApp._client_direct_binding_ready_for_arrange(self, record):
+                successful.append(account)
+            elif record is not None and record.status == "客户端已启动/待登录":
+                record.status = "binding_invalid"
+                record.error_message = "准备完成后的 binding 复核失败"
         if not successful:
             messagebox.showwarning("一键准备并登录", "准备阶段没有成功启动的客户端，已停止后续排列和登录。")
             return
@@ -4911,10 +5919,28 @@ Write-Output $count
             ):
                 self._log("[一键准备并登录] 准备部分失败，用户取消后续排列和登录。")
                 return
-        arranged = LauncherApp._arrange_prepared_client_direct_current_scope(self, successful)
+        arranged = LauncherApp._arrange_prepared_client_direct_current_scope(self, accounts)
         if arranged is False:
             return
-        LauncherApp._login_prepared_client_direct_current_scope(self, successful)
+        login_accounts = [
+            account
+            for account in successful
+            if LauncherApp._client_direct_binding_ready_for_arrange(
+                self,
+                self.client_direct_bindings.get(account.key),
+            )
+        ]
+        skipped_after_arrange = len(successful) - len(login_accounts)
+        if skipped_after_arrange:
+            self._log(f"[一键准备并登录] 排列后 binding 再次失效，已从登录集合剔除 {skipped_after_arrange} 个。")
+        if not login_accounts:
+            messagebox.showwarning("一键准备并登录", "排列后没有仍然有效的客户端 binding，已停止登录。")
+            return
+        LauncherApp._login_prepared_client_direct_current_scope(
+            self,
+            login_accounts,
+            auto_enter_game=bool(getattr(self, "_client_direct_one_click_auto_enter_game", True)),
+        )
 
     def _arrange_prepared_client_direct_current_scope(self, accounts_override: list[AccountConfig] | None = None) -> bool:
         accounts = accounts_override if accounts_override is not None else LauncherApp._client_direct_accounts_from_active_batch(self)
@@ -4949,6 +5975,7 @@ Write-Output $count
                 windows,
                 tile_mode,
                 tile_config,
+                layout_window_count=len(accounts),
                 log=lambda message: self._log(f"排列本批客户端：{message}"),
             )
         except Exception as exc:
@@ -4989,7 +6016,12 @@ Write-Output $count
         self._log(f"排列本批客户端完成：成功 {success_count}，失败 {fail_count}。")
         return True
 
-    def _login_prepared_client_direct_current_scope(self, accounts_override: list[AccountConfig] | None = None) -> None:
+    def _login_prepared_client_direct_current_scope(
+        self,
+        accounts_override: list[AccountConfig] | None = None,
+        *,
+        auto_enter_game: bool = True,
+    ) -> None:
         scope_label = "本次准备账号"
         if accounts_override is not None:
             accounts = accounts_override
@@ -5005,12 +6037,16 @@ Write-Output $count
             level = self.client_batch_store.current_batch().scope
         else:
             level = self.level_var.get()
-        auto_text = "自动进入游戏" if LauncherApp._client_direct_auto_enter_game(self) else "不自动进入游戏"
+        auto_text = "进入游戏" if auto_enter_game else "停在公告/进入游戏前"
         concurrency = LauncherApp._client_direct_concurrency(self)
         self._log(f"[客户端直登] 登录范围={scope_label}，本次登录账号数={len(accounts)}。")
         self._log("[客户端直登] 登录账号：" + "、".join(str(getattr(account, "game_window_no", "") or account.display_name) for account in accounts))
         self._log(f"执行客户端登录：层级={level}，账号数={len(accounts)}，并发={concurrency}，{auto_text}。")
-        self._start_client_direct_prepared_login_run(accounts, run_label="客户端当前层登录")
+        self._start_client_direct_prepared_login_run(
+            accounts,
+            run_label="客户端当前层登录",
+            auto_enter_game=bool(auto_enter_game),
+        )
 
     def _client_direct_login_scope(self) -> str:
         var = getattr(self, "client_direct_login_scope_var", None)
@@ -5053,11 +6089,15 @@ Write-Output $count
                 for account in accounts
                 if str(getattr(records.get(account.key), "status", "") or "").strip() in CLIENT_DIRECT_LOGIN_FAILED_STATUSES
             ]
-        return [
-            account
-            for account in accounts
-            if str(getattr(records.get(account.key), "status", "") or "").strip() in CLIENT_DIRECT_LOGIN_PENDING_STATUSES
-        ]
+        pending: list[AccountConfig] = []
+        for account in accounts:
+            record = records.get(account.key)
+            status = str(getattr(record, "status", "") or "").strip()
+            if status in {"客户端登录成功", "已登录", "登录成功"}:
+                continue
+            if LauncherApp._client_direct_binding_ready_for_arrange(self, record):
+                pending.append(account)
+        return pending
 
     def _client_direct_pid_exists(self, pid: int) -> bool:
         try:
@@ -5191,20 +6231,89 @@ Write-Output $count
             + "、".join(batch.batch_name for batch in removed)
         )
 
-    def _client_direct_candidate_ports_for_local_scan(self, windows: list[GameWindow]) -> list[int]:
-        ports: list[int] = []
+    def _scan_client_direct_historical_hwnd(
+        self,
+        hwnd: int,
+        *,
+        listener_snapshot=None,
+        process_parent_snapshot=None,
+    ) -> LocalClientScan | None:
+        clean_hwnd = int(hwnd or 0)
+        if clean_hwnd <= 0:
+            return None
         try:
-            for batch in getattr(self.client_batch_store, "batches", []) or []:
-                batch_ports = [int(binding.cdp_port or 0) for binding in batch.bindings if int(binding.cdp_port or 0) > 0]
-                ports.extend(batch_ports)
-                base_port = int(batch.base_port or (min(batch_ports) if batch_ports else CLIENT_DIRECT_CDP_PORT))
-                count = max(len(getattr(batch, "bindings", []) or []), 9)
-                ports.extend(base_port + offset for offset in range(count))
-            if not ports:
-                ports.extend(CLIENT_DIRECT_CDP_PORT + offset for offset in range(max(len(windows), 1)))
+            if not bool(user32.IsWindow(clean_hwnd)):
+                return None
         except Exception:
-            ports.extend(CLIENT_DIRECT_CDP_PORT + offset for offset in range(max(len(windows), 1)))
-        return [port for port in dict.fromkeys(ports) if int(port or 0) > 0]
+            return None
+        try:
+            pid = int(get_window_process_id(clean_hwnd) or 0)
+        except Exception:
+            pid = 0
+        if pid <= 0:
+            return None
+        try:
+            process_path = get_process_path_by_pid(pid)
+        except Exception:
+            process_path = ""
+        try:
+            is_x5game = Path(process_path).name.lower() == "x5game.exe"
+        except Exception:
+            is_x5game = False
+        try:
+            rect = get_window_rect(clean_hwnd)
+        except Exception:
+            rect = WindowRect(0, 0, 0, 0)
+        try:
+            import ctypes
+
+            title_length = int(user32.GetWindowTextLengthW(clean_hwnd) or 0)
+            title_buffer = ctypes.create_unicode_buffer(max(2, title_length + 1))
+            user32.GetWindowTextW(clean_hwnd, title_buffer, len(title_buffer))
+            title = str(title_buffer.value or "")
+        except Exception:
+            title = ""
+        ownership_kwargs = {}
+        if listener_snapshot is not None and process_parent_snapshot is not None:
+            ownership_kwargs = {
+                "tcp_listeners": lambda snapshot=listener_snapshot: snapshot,
+                "process_parents": lambda snapshot=process_parent_snapshot: snapshot,
+            }
+        try:
+            ownership = discover_window_cdp_endpoint(clean_hwnd, pid, **ownership_kwargs)
+        except Exception:
+            ownership = None
+        matched_port = int(getattr(ownership, "port", 0) or 0)
+        ownership_status = str(getattr(ownership, "status", "cdp_owner_unverified") or "cdp_owner_unverified")
+        owner_pid = int(getattr(ownership, "owner_pid", 0) or 0)
+        target_info: dict[str, str] = {}
+        if ownership_status == "verified" and matched_port > 0:
+            try:
+                target = select_page_target(wait_for_cdp_targets(matched_port, timeout=0.8))
+                target_info = {
+                    "url": str(target.get("url") or ""),
+                    "title": str(target.get("title") or ""),
+                }
+            except Exception:
+                ownership_status = "cdp_unavailable"
+        return LocalClientScan(
+            pid=pid,
+            hwnd=clean_hwnd,
+            title=title,
+            window_left=int(getattr(rect, "left", 0) or 0),
+            window_top=int(getattr(rect, "top", 0) or 0),
+            window_width=int(getattr(rect, "width", 0) or 0),
+            window_height=int(getattr(rect, "height", 0) or 0),
+            process_path=process_path,
+            cdp_port=matched_port,
+            cdp_owner_pid=owner_pid,
+            cdp_ownership_status=ownership_status,
+            cdp_available=ownership_status == "verified",
+            cdp_port_inferred=False,
+            page_url=str(target_info.get("url") or ""),
+            page_title=str(target_info.get("title") or ""),
+            is_x5game=is_x5game,
+        )
 
     def _scan_local_client_direct_clients(self) -> list[LocalClientScan]:
         try:
@@ -5221,22 +6330,16 @@ Write-Output $count
             self._log(f"[识别本地客户端] 扫描窗口失败：{mask_sensitive_text(str(exc))}")
             return []
 
-        candidate_ports = LauncherApp._client_direct_candidate_ports_for_local_scan(self, windows)
-        available_targets: dict[int, dict[str, str]] = {}
-        for port in candidate_ports:
-            try:
-                targets = wait_for_cdp_targets(int(port), timeout=0.8)
-                target = select_page_target(targets)
-                available_targets[int(port)] = {
-                    "url": str(target.get("url") or ""),
-                    "title": str(target.get("title") or ""),
-                }
-            except Exception:
-                continue
+        try:
+            listener_snapshot = list_tcp_listeners_by_port()
+            process_parent_snapshot = list_process_parents()
+        except Exception as exc:
+            self._log(f"[CDP归属] 读取端口/进程快照失败：{mask_sensitive_text(str(exc))}")
+            listener_snapshot = None
+            process_parent_snapshot = None
 
-        used_ports: set[int] = set()
         scans: list[LocalClientScan] = []
-        for index, window in enumerate(windows):
+        for window in windows:
             hwnd = int(window.hwnd or 0)
             try:
                 pid = int(get_window_process_id(hwnd) or 0)
@@ -5257,31 +6360,29 @@ Write-Output $count
                 except Exception:
                     rect = WindowRect(0, 0, 0, 0)
 
-            matched_port = 0
-            cdp_port_inferred = False
             try:
-                for batch in getattr(self.client_batch_store, "batches", []) or []:
-                    for binding in batch.bindings:
-                        port = int(binding.cdp_port or 0)
-                        if port <= 0 or port in used_ports:
-                            continue
-                        if int(binding.pid or 0) == pid or int(binding.hwnd or 0) == hwnd:
-                            matched_port = port
-                            break
-                    if matched_port > 0:
-                        break
+                ownership_kwargs = {}
+                if listener_snapshot is not None and process_parent_snapshot is not None:
+                    ownership_kwargs = {
+                        "tcp_listeners": lambda snapshot=listener_snapshot: snapshot,
+                        "process_parents": lambda snapshot=process_parent_snapshot: snapshot,
+                    }
+                ownership = discover_window_cdp_endpoint(hwnd, pid, **ownership_kwargs)
             except Exception:
-                matched_port = 0
-            if matched_port <= 0 and index < len(candidate_ports):
-                matched_port = int(candidate_ports[index])
-                cdp_port_inferred = True
-            if matched_port in used_ports:
-                matched_port = 0
-                cdp_port_inferred = False
-            if matched_port > 0:
-                used_ports.add(matched_port)
-
-            target_info = available_targets.get(matched_port, {})
+                ownership = None
+            matched_port = int(getattr(ownership, "port", 0) or 0)
+            ownership_status = str(getattr(ownership, "status", "cdp_owner_unverified") or "cdp_owner_unverified")
+            owner_pid = int(getattr(ownership, "owner_pid", 0) or 0)
+            target_info: dict[str, str] = {}
+            if ownership_status == "verified" and matched_port > 0:
+                try:
+                    target = select_page_target(wait_for_cdp_targets(matched_port, timeout=0.8))
+                    target_info = {
+                        "url": str(target.get("url") or ""),
+                        "title": str(target.get("title") or ""),
+                    }
+                except Exception:
+                    ownership_status = "cdp_unavailable"
             scans.append(
                 LocalClientScan(
                     pid=pid,
@@ -5293,13 +6394,25 @@ Write-Output $count
                     window_height=int(getattr(rect, "height", 0) or 0),
                     process_path=process_path,
                     cdp_port=matched_port,
-                    cdp_available=matched_port in available_targets,
-                    cdp_port_inferred=cdp_port_inferred,
+                    cdp_owner_pid=owner_pid,
+                    cdp_ownership_status=ownership_status,
+                    cdp_available=ownership_status == "verified",
+                    cdp_port_inferred=False,
                     page_url=str(target_info.get("url") or ""),
                     page_title=str(target_info.get("title") or ""),
                     is_x5game=is_x5game,
                 )
             )
+        port_counts: dict[int, int] = {}
+        for scan in scans:
+            if scan.cdp_ownership_status == "verified" and int(scan.cdp_port or 0) > 0:
+                port_counts[int(scan.cdp_port)] = port_counts.get(int(scan.cdp_port), 0) + 1
+        scans = [
+            replace(scan, cdp_port=0, cdp_available=False, cdp_ownership_status="cdp_owner_conflict")
+            if int(scan.cdp_port or 0) > 0 and port_counts.get(int(scan.cdp_port), 0) > 1
+            else scan
+            for scan in scans
+        ]
         return scans
 
     def _identify_local_client_direct_clients(self) -> None:
@@ -5311,6 +6424,12 @@ Write-Output $count
         LauncherApp._sync_client_direct_batch_status(self)
         for note in result.get("notes", []) or []:
             self._log(f"[识别本地客户端] {note}")
+        for index, scan in enumerate(scans, start=1):
+            self._log(
+                f"[CDP归属] 窗口{index} hwnd={int(scan.hwnd or 0)} pid={int(scan.pid or 0)} "
+                f"port={int(scan.cdp_port or 0)} owner_pid={int(getattr(scan, 'cdp_owner_pid', 0) or 0)} "
+                f"status={str(getattr(scan, 'cdp_ownership_status', '') or '')}"
+            )
         self._log(
             f"[识别本地客户端] 扫描到 {result['scanned']} 个 X5Game，"
             f"恢复历史批次 {result['restored_batches']} 个，"
@@ -5352,17 +6471,96 @@ Write-Output $count
             f"绑定数量={counts['bound']} 端口范围={port_range}"
         )
         pre_repair_state = {
-            binding.account_id: (binding.status, binding.error_message)
+            binding.account_id: (
+                binding.status,
+                binding.display_status,
+                binding.login_status,
+                binding.error_message,
+            )
             for binding in batch.bindings
         }
+        historical_scan_cache: dict[int, LocalClientScan | None] = {}
+        historical_probe_hits: set[int] = set()
+        historical_binding_by_hwnd = {
+            int(binding.hwnd): binding
+            for binding in batch.bindings
+            if int(binding.hwnd or 0) > 0
+        }
+        historical_snapshot_state = {
+            "loaded": False,
+            "listeners": None,
+            "parents": None,
+        }
+
+        def scan_historical_hwnd(hwnd: int) -> LocalClientScan | None:
+            clean_hwnd = int(hwnd or 0)
+            if clean_hwnd in historical_scan_cache:
+                return historical_scan_cache[clean_hwnd]
+            if not historical_snapshot_state["loaded"]:
+                historical_snapshot_state["loaded"] = True
+                try:
+                    historical_snapshot_state["listeners"] = list_tcp_listeners_by_port()
+                    historical_snapshot_state["parents"] = list_process_parents()
+                except Exception as exc:
+                    self._log(f"[修复本批窗口] 历史 HWND 回查读取端口/进程快照失败：{mask_sensitive_text(str(exc))}")
+            scan = LauncherApp._scan_client_direct_historical_hwnd(
+                self,
+                clean_hwnd,
+                listener_snapshot=historical_snapshot_state["listeners"],
+                process_parent_snapshot=historical_snapshot_state["parents"],
+            )
+            historical_scan_cache[clean_hwnd] = scan
+            if scan is not None:
+                historical_probe_hits.add(clean_hwnd)
+                old_binding = historical_binding_by_hwnd.get(clean_hwnd)
+                old_pid = int(getattr(old_binding, "pid", 0) or 0)
+                exe_name = Path(str(scan.process_path or "")).name or "unknown"
+                self._log(
+                    f"[修复本批窗口] 历史 HWND 回查 hwnd={clean_hwnd} old_pid={old_pid} "
+                    f"current_pid={int(scan.pid or 0)} exe={exe_name} port={int(scan.cdp_port or 0)} "
+                    f"owner_status={scan.cdp_ownership_status or 'unknown'}"
+                )
+            else:
+                self._log(f"[修复本批窗口] 历史 HWND 回查 hwnd={clean_hwnd} 无有效窗口。")
+            return scan
+
         probe = RepairProbe(
             pid_exists=lambda pid: LauncherApp._client_direct_pid_exists(self, pid),
             process_is_x5game=lambda pid: LauncherApp._client_direct_process_is_x5game(self, pid),
             cdp_available=lambda port: LauncherApp._client_direct_cdp_available(self, port),
             hwnd_for_pid=lambda pid: wait_for_client_hwnd_by_pid(pid, timeout=0.5),
+            scan_for_hwnd=scan_historical_hwnd,
         )
-        results = self.client_batch_store.repair_current_batch_windows(probe=probe)
-        missing_bindings = [binding for binding in batch.bindings if binding.status == "pid_missing"]
+        current_scans = LauncherApp._scan_local_client_direct_clients(self)
+        if len(current_scans) != len(batch.bindings):
+            self._log(
+                f"[修复本批窗口] 当前扫描 {len(current_scans)} 个，"
+                f"历史绑定 {len(batch.bindings)} 个。"
+            )
+        results = self.client_batch_store.repair_current_batch_windows(probe=probe, local_scans=current_scans)
+        historical_recovered_count = sum(
+            1
+            for binding in batch.bindings
+            if int(binding.hwnd or 0) in historical_probe_hits and results.get(binding.account_id) == "repaired"
+        )
+        if historical_recovered_count:
+            self._log(
+                f"[修复本批窗口] 常规扫描未匹配后，历史 HWND 回查 {historical_recovered_count} 个，"
+                "已重新校验并更新真实 PID/CDP 绑定。"
+            )
+        recently_closed = getattr(self, "_recently_closed_client_bindings", {})
+        missing_bindings = []
+        for binding in batch.bindings:
+            if binding.status == "pid_missing":
+                missing_bindings.append(binding)
+                continue
+            marker = recently_closed.get((str(batch.batch_id), str(binding.account_id)))
+            if binding.status != "pid_not_x5game" or not marker:
+                continue
+            if LauncherApp._client_direct_recently_closed_safe_to_reopen(self, binding, marker):
+                binding.status = "pid_missing"
+                missing_bindings.append(binding)
+                self._log(f"[修复本批窗口] 刚关闭 binding 已确认 HWND/CDP 失效，安全转入补开：{binding.account_name}")
         reopened_ids: set[str] = set()
         if missing_bindings:
             reopened_ids = LauncherApp._repair_client_direct_missing_processes(self, batch, missing_bindings)
@@ -5377,26 +6575,63 @@ Write-Output $count
                 f"修复本批窗口：{binding.account_name} status={binding.status} "
                 f"pid={binding.pid} hwnd={binding.hwnd} port={binding.cdp_port}"
             )
-        self._log(f"修复本批窗口完成：{len(results)} 个绑定。")
+        ready_count = sum(1 for binding in batch.bindings if str(getattr(binding, "window_status", "")) == "restored")
+        abnormal_count = max(0, len(batch.bindings) - ready_count)
+        self._log(
+            f"修复本批窗口完成：常规扫描 {len(current_scans)} 个，历史 HWND 回查 {historical_recovered_count} 个，"
+            f"历史绑定 {len(batch.bindings)} 个，就绪={ready_count}，异常={abnormal_count}，绑定总数={len(results)}。"
+        )
+
+    def _client_direct_recently_closed_safe_to_reopen(self, binding, marker) -> bool:
+        try:
+            old_pid, closed_at = marker
+            if int(old_pid) != int(binding.pid or 0) or time.monotonic() - float(closed_at) > 30:
+                return False
+            hwnd = int(binding.hwnd or 0)
+            hwnd_invalid = hwnd <= 0 or not bool(user32.IsWindow(hwnd))
+            port = int(binding.cdp_port or 0)
+            cdp_gone = port <= 0 or not LauncherApp._client_direct_cdp_available(self, port)
+            return hwnd_invalid and cdp_gone
+        except Exception:
+            return False
 
     def _client_direct_restore_repaired_business_statuses(
         self,
         batch,
-        pre_repair_state: dict[str, tuple[str, str]],
+        pre_repair_state: dict[str, tuple[str, str, str, str]],
         results: dict[str, str],
         reopened_ids: set[str],
     ) -> None:
+        preservable_statuses = set(BUSINESS_STATUS_VALUES) | {
+            "已排列",
+            "客户端已启动/待登录",
+            "已登录",
+            "登录成功",
+        }
         for binding in getattr(batch, "bindings", []) or []:
             account_id = str(binding.account_id)
             if account_id in reopened_ids:
                 continue
             if results.get(account_id) != "repaired":
                 continue
-            old_status, old_error_message = pre_repair_state.get(account_id, ("", ""))
-            if not old_status:
-                continue
-            binding.status = old_status
-            binding.error_message = old_error_message
+            old_status, old_display_status, old_login_status, old_error_message = pre_repair_state.get(
+                account_id,
+                ("", "", "", ""),
+            )
+            preserved_status = next(
+                (
+                    value
+                    for value in (old_status, old_display_status, old_login_status)
+                    if value in preservable_statuses
+                ),
+                "",
+            )
+            if preserved_status:
+                binding.status = preserved_status
+                binding.error_message = old_error_message if preserved_status == old_status else ""
+            else:
+                binding.status = "客户端已就绪"
+                binding.error_message = ""
 
     def _repair_client_direct_missing_processes(self, batch, missing_bindings: list[ClientBatchBinding]) -> set[str]:
         lines = "\n".join(
@@ -5486,8 +6721,6 @@ Write-Output $count
                 continue
             if value > 0:
                 return value - 1
-            if value == 0:
-                return 0
         for index, item in enumerate(getattr(batch, "bindings", []) or []):
             if str(getattr(item, "account_id", "")) == str(binding.account_id):
                 return index
@@ -5623,257 +6856,23 @@ Write-Output $count
         for pid in pids:
             _sp.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, text=True)
             self._log(f"关闭本批客户端：已请求关闭 pid={pid}")
+        deadline = time.monotonic() + 5.0
+        pending = set(pids)
+        while pending and time.monotonic() < deadline:
+            pending = {pid for pid in pending if LauncherApp._client_direct_pid_exists(self, pid)}
+            if pending:
+                time.sleep(0.1)
+        closed_at = time.monotonic()
+        recent = getattr(self, "_recently_closed_client_bindings", {})
         for binding in batch.bindings:
             binding.status = "closed"
+            recent[(str(batch.batch_id), str(binding.account_id))] = (int(binding.pid or 0), closed_at)
+        self._recently_closed_client_bindings = recent
+        if pending:
+            self._log(f"关闭本批客户端：等待退出超时 pid数量={len(pending)}，修复时将继续执行 HWND/CDP 安全复核。")
         self.client_batch_store.save()
         LauncherApp._restore_client_direct_bindings_from_active_batch(self)
         LauncherApp._sync_client_direct_batch_status(self)
-
-    # ===== 方式二运行 =====
-
-    def _run_method2_single(self) -> None:
-        """方式二：单账号运行（选中的CSV账号）"""
-        if self._block_background_unsupported_action("方式二"):
-            return
-        if not self.csv_accounts:
-            messagebox.showwarning("无账号", "请先导入CSV文件。")
-            return
-        acc = self._selected_csv_account()
-        if acc is None:
-            messagebox.showwarning("未选择账号", "请先在CSV表格中选择一个账号。")
-            return
-        if "配置缺失" in acc.status:
-            messagebox.showwarning("配置缺失", f"账号 {acc.name} 配置不完整，无法执行。")
-            return
-        self._log(f"[方式二] 单账号运行: {acc.display_name}")
-        self._start_method2_serial([acc])
-
-    def _run_method2_all(self) -> None:
-        """方式二：CSV列表全部串行"""
-        if self._block_background_unsupported_action("方式二"):
-            return
-        valid = [a for a in self.csv_accounts if "配置缺失" not in a.status]
-        if not valid:
-            messagebox.showwarning("无有效账号", "CSV中没有有效的账号。")
-            return
-        self._log(f"[方式二] 全部串行: 共 {len(valid)} 个账号，批量快速登录 + 统一校验。")
-        self._start_method2_serial(valid)
-
-    def _selected_csv_account(self) -> CSVAccount | None:
-        sel = self.csv_tree.selection()
-        if not sel:
-            return None
-        key = sel[0]
-        for a in self.csv_accounts:
-            if a.key == key:
-                return a
-        return None
-
-    def _start_method2_serial(self, accounts: list[CSVAccount]) -> None:
-        """在后台线程执行方式二账号列表：快速提交 + 统一校验 + 失败重登。"""
-        if self.worker_thread is not None and self.worker_thread.is_alive():
-            messagebox.showwarning("任务进行中", "当前有任务正在执行。")
-            return
-        self._preserve_background_windows = False
-        self._setup_log_file()
-        self.stop_event.clear()
-        self.csv_passport_by_key.clear()
-        self.csv_timing_by_key.clear()
-        for a in accounts:
-            self.csv_status_by_key[a.key] = "未开始"
-        self._refresh_csv_table()
-        verify_rounds = self._batch_verify_rounds()
-
-        def _run():
-            import time as _time
-            try:
-                settings = load_settings(self.settings_path.get())
-            except Exception as exc:
-                self._queue_log(f"[方式二] 读取设置失败: {exc}")
-                return
-            from .config import AccountConfig as _AC
-            import subprocess as _sp
-            total = len(accounts)
-            start_time = _time.time()
-            self._queue_log("[方式二] 批量快速登录模式：先提交全部CSV账号，再统一校验，失败账号才重登。")
-            self._queue_log(f"[方式二] 重新次数：{verify_rounds}。只要全部成功就提前结束。")
-            self._queue_log(f"[方式二] 第一轮登录账号数量：{total}")
-
-            pending = list(accounts)
-            success_by_key: dict[str, CSVAccount] = {}
-            final_failed: list[CSVAccount] = []
-
-            def make_runner(acc: CSVAccount) -> AccountRunner:
-                return AccountRunner(
-                    account=_AC(level="方式二", bookmark_no=0, game_window_no=acc.game_window_no, url=acc.url),
-                    settings=settings,
-                    stop_event=self.stop_event,
-                    log=self._queue_log,
-                    update_status=lambda a, s, _acc=acc: self._queue_status_csv(_acc, s),
-                    passport_found=lambda a, p, _acc=acc: self._queue_passport_csv(_acc, p),
-                )
-
-            for round_index in range(1, verify_rounds + 1):
-                if self.stop_event.is_set():
-                    break
-                if round_index == 1:
-                    self._queue_log(f"[方式二] 第 {round_index} 轮：批量快速提交 {len(pending)} 个账号。")
-                else:
-                    self._queue_log(f"[方式二] 第 {round_index} 轮：只重登失败账号 {len(pending)} 个。")
-
-                submit_failed: list[CSVAccount] = []
-                submitted: list[CSVAccount] = []
-                already_logged_in: list[CSVAccount] = []
-
-                for i, acc in enumerate(pending, start=1):
-                    if self.stop_event.is_set():
-                        break
-                    status = "登录中" if round_index == 1 else "重登中"
-                    self._queue_status_csv(acc, status)
-                    self._queue_log(f"[方式二 第{round_index}轮 {i}/{len(pending)}] {status}: {acc.display_name}")
-
-                    runner = make_runner(acc)
-                    result = runner.run_method2(acc, verify_after_submit=False)
-                    if runner.last_timings.get("总计"):
-                        self._queue_timing_csv(acc, runner.last_timings["总计"])
-                    if self.stop_event.is_set():
-                        self._queue_status_csv(acc, "已停止")
-                        self._queue_log("[方式二] 任务已停止，不会继续执行后续账号。")
-                        _sp.run(["taskkill", "/f", "/im", "chromium.exe"], capture_output=True, creationflags=_sp.CREATE_NO_WINDOW)
-                        break
-
-                    submit_result = str(runner.last_fast_submit_result or "")
-                    if submit_result == "already_logged_in":
-                        already_logged_in.append(acc)
-                        success_by_key[acc.key] = acc
-                        self._queue_status_csv(acc, "已登录")
-                        self._queue_log(f"[窗口{acc.game_window_no}] 已登录，跳过提交，直接计入成功。")
-                    elif result and submit_result == "submitted":
-                        submitted.append(acc)
-                        self._queue_status_csv(acc, "待复核")
-                        self._queue_log(f"[窗口{acc.game_window_no}] 方式二提交完成，等待统一校验。")
-                    elif result:
-                        submitted.append(acc)
-                        self._queue_status_csv(acc, "待复核")
-                        self._queue_log(
-                            f"[窗口{acc.game_window_no}] 方式二提交结果缺少分类，按 submitted 加入待复核。"
-                        )
-                    else:
-                        submit_failed.append(acc)
-                        self._queue_status_csv(acc, "失败")
-                        self._queue_log(f"[窗口{acc.game_window_no}] 方式二提交失败，加入重登列表。")
-                    _sp.run(["taskkill", "/f", "/im", "chromium.exe"], capture_output=True, creationflags=_sp.CREATE_NO_WINDOW)
-
-                if self.stop_event.is_set():
-                    break
-
-                failed_this_round = list(submit_failed)
-                self._queue_log(
-                    f"[方式二] 开始统一校验：submitted={len(submitted)}, "
-                    f"already_logged_in={len(already_logged_in)}, failed={len(submit_failed)}"
-                )
-
-                verify_success_count = 0
-                for i, acc in enumerate(submitted, start=1):
-                    if self.stop_event.is_set():
-                        break
-                    self._queue_status_csv(acc, "校验中")
-                    self._queue_log(f"[方式二 第{round_index}次校验 {i}/{len(submitted)}] 窗口{acc.game_window_no} {acc.display_name}")
-                    runner = make_runner(acc)
-                    state = runner.verify_login_result()
-                    if state == "logged_in":
-                        success_by_key[acc.key] = acc
-                        verify_success_count += 1
-                        self._queue_status_csv(acc, "成功")
-                        self._queue_log(f"[窗口{acc.game_window_no}] 统一校验成功。")
-                    else:
-                        failed_this_round.append(acc)
-                        self._queue_status_csv(acc, "失败")
-                        self._queue_log(f"[窗口{acc.game_window_no}] 统一校验失败：{state}，需要重登。")
-
-                if self.stop_event.is_set():
-                    break
-
-                self._queue_log(
-                    f"[方式二] 第 {round_index} 轮统一校验完成："
-                    f"成功{verify_success_count}，失败{len(failed_this_round)}，"
-                    f"已登录跳过{len(already_logged_in)}。"
-                )
-                if failed_this_round:
-                    self._queue_log("[方式二] 失败账号列表：" + "、".join(a.display_name for a in failed_this_round))
-                if len(success_by_key) >= total:
-                    final_failed = []
-                    self._queue_log("[方式二] 全部成功，提前结束，不再执行后续校验。")
-                    break
-                if round_index >= verify_rounds:
-                    final_failed = failed_this_round
-                    for acc in final_failed:
-                        self._queue_status_csv(acc, "最终失败")
-                    self._queue_log("[方式二] 达到重新次数仍失败，最终失败账号列表：" + "、".join(a.display_name for a in final_failed))
-                    break
-                pending = failed_this_round
-                self._queue_log(f"[方式二] 开始下一轮失败重登：{len(pending)} 个账号。")
-
-            elapsed = _time.time() - start_time
-            if self.stop_event.is_set():
-                self.ui_queue.put(("status_bar", "已停止"))
-                self._queue_log(f"[方式二] 任务已停止：总{total} 成功{len(success_by_key)} 失败{len(final_failed)} 耗时{elapsed:.0f}秒")
-                self._write_file_log(f"任务已停止：总{total} 成功{len(success_by_key)} 失败{len(final_failed)} 耗时{elapsed:.0f}秒")
-            else:
-                self.ui_queue.put(("status_bar", f"任务完成：成功{len(success_by_key)}，失败{len(final_failed)}"))
-                self._queue_log(f"[方式二] 任务完成：总{total} 成功{len(success_by_key)} 失败{len(final_failed)} 耗时{elapsed:.0f}秒")
-                self._write_file_log(f"任务完成：总{total} 成功{len(success_by_key)} 失败{len(final_failed)} 耗时{elapsed:.0f}秒")
-            self.worker_thread = None
-            if self._log_file:
-                self._log_file.close()
-                self._log_file = None
-
-        self.worker_thread = threading.Thread(target=_run, daemon=True)
-        self.worker_thread.start()
-
-    def _queue_status_csv(self, account: CSVAccount, status: str) -> None:
-        self.csv_status_by_key[account.key] = status
-        self.ui_queue.put(("csv_status", (account, status)))
-
-    def _set_csv_status(self, account: CSVAccount, status: str) -> None:
-        self.csv_status_by_key[account.key] = status
-        if self.csv_tree.exists(account.key):
-            values = list(self.csv_tree.item(account.key, "values"))
-            values[6] = status
-            tag = ""
-            if "成功" in status:
-                tag = "success"
-            elif "已登录" in status or "跳过" in status:
-                tag = "skip"
-            elif "失败" in status:
-                tag = "failed"
-            elif "重登" in status or "重试" in status:
-                tag = "retry"
-            elif status not in ("未开始",):
-                tag = "running"
-            self.csv_tree.item(account.key, values=values, tags=(tag,))
-
-    def _queue_passport_csv(self, account: CSVAccount, passport: str) -> None:
-        self.csv_passport_by_key[account.key] = passport
-        self.ui_queue.put(("csv_passport", (account, passport)))
-
-    def _set_csv_passport(self, account: CSVAccount, passport: str) -> None:
-        self.csv_passport_by_key[account.key] = passport
-        if self.csv_tree.exists(account.key):
-            values = list(self.csv_tree.item(account.key, "values"))
-            values[5] = passport
-            self.csv_tree.item(account.key, values=values)
-
-    def _queue_timing_csv(self, account: CSVAccount, seconds: float) -> None:
-        self.csv_timing_by_key[account.key] = f"{seconds:.1f}s"
-        self.ui_queue.put(("csv_timing", (account, f"{seconds:.1f}s")))
-
-    def _set_csv_timing(self, account: CSVAccount, timing: str) -> None:
-        self.csv_timing_by_key[account.key] = timing
-        if self.csv_tree.exists(account.key):
-            values = list(self.csv_tree.item(account.key, "values"))
-            values[7] = timing
-            self.csv_tree.item(account.key, values=values)
 
     def _run_first_account_dm_test(self) -> None:
         messagebox.showinfo("已暂停", "当前不执行大漠点击流程，只测试大漠环境是否可用。")
@@ -5929,15 +6928,6 @@ Write-Output $count
         except Exception as exc:
             self._log(f"启动环境检查失败: {exc}")
 
-    def _log_background_capability_summary(self) -> None:
-        report = build_background_capability_report()
-        self._log(report.frontend_summary)
-        try:
-            report_path = write_background_capability_report()
-            self._log(f"后台能力详细报告：{report_path}")
-        except Exception as exc:
-            self._log(f"后台能力详细报告写入失败：{exc}")
-
     def _log_admin_status_warning(self) -> None:
         try:
             import ctypes
@@ -5965,69 +6955,11 @@ Write-Output $count
             self.batch_verify_rounds_var.set(3)
             return 3
 
-    def _start_serial_run(self, accounts: list[AccountConfig], batch_fast: bool = False) -> None:
-        if self.worker_thread and self.worker_thread.is_alive():
-            messagebox.showwarning("任务运行中", "已有任务正在运行，请先停止或等待完成。")
-            return
-        self._preserve_background_windows = False
-        try:
-            settings = load_settings(self.settings_path.get())
-        except Exception as exc:
-            messagebox.showerror("读取自动化设置失败", str(exc))
-            return
-        settings = self._settings_with_notice_ratio(settings)
-
-        self.stop_event.clear()
-        for account in accounts:
-            self._set_status(account, "未开始")
-        verify_rounds = self._batch_verify_rounds()
-        self.worker_thread = threading.Thread(
-            target=self._serial_worker,
-            args=(accounts, settings, batch_fast, verify_rounds),
-            daemon=True,
-        )
-        self.worker_thread.start()
-
-    def _start_background_single_run(self, account: AccountConfig) -> None:
-        if self.worker_thread and self.worker_thread.is_alive():
-            messagebox.showwarning("任务运行中", "已有任务正在运行，请先停止或等待完成。")
-            return
-        dependency_check = check_background_runtime_dependencies()
-        if not dependency_check.ok:
-            modules = "、".join(dependency_check.missing_modules)
-            commands = "\n".join(dependency_check.install_commands)
-            message = f"当前 Python 环境缺少依赖：{modules}\n请执行：{commands}"
-            self._setup_log_file(cleanup_old=False)
-            self._set_status(account, "依赖缺失")
-            self._log("后台模式依赖预检失败。")
-            self._log(f"当前 Python 路径={dependency_check.python_executable}")
-            self._log(f"Python 位数={dependency_check.python_bits}")
-            self._log(f"缺失模块={modules}")
-            self._log(f"建议安装命令={commands}")
-            messagebox.showwarning("后台模式依赖缺失", message)
-            return
-        try:
-            settings = load_settings(self.settings_path.get())
-        except Exception as exc:
-            messagebox.showerror("读取自动化设置失败", str(exc))
-            return
-        settings = self._settings_with_notice_ratio(settings)
-
-        self._setup_log_file(cleanup_old=False)
-        self.stop_event.clear()
-        self._preserve_background_windows = True
-        self._set_status(account, "等待中")
-        self.worker_thread = threading.Thread(
-            target=self._background_single_worker,
-            args=(account, settings),
-            daemon=True,
-        )
-        self.worker_thread.start()
-
     def _start_client_direct_single_run(self, account: AccountConfig) -> None:
         if self.worker_thread and self.worker_thread.is_alive():
             messagebox.showwarning("任务运行中", "已有任务正在运行，请先停止或等待完成。")
             return
+        account = _inject_latest_client_direct_urls(self, [account])[0]
         if not is_complete_direct_login_url(account.url):
             self._setup_log_file(cleanup_old=False)
             self._set_status(account, "客户端直登失败")
@@ -6080,6 +7012,7 @@ Write-Output $count
         if self.worker_thread and self.worker_thread.is_alive():
             messagebox.showwarning("任务运行中", "已有任务正在运行，请先停止或等待完成。")
             return
+        accounts = _inject_latest_client_direct_urls(self, list(accounts))
         if not LauncherApp._precheck_client_direct_prepare_ports(self, accounts, append=False):
             for account in accounts:
                 self._set_status(account, "端口占用")
@@ -6137,6 +7070,7 @@ Write-Output $count
         if self.worker_thread and self.worker_thread.is_alive():
             messagebox.showwarning("任务运行中", "已有任务正在运行，请先停止或等待完成。")
             return False
+        accounts = _inject_latest_client_direct_urls(self, list(accounts))
         if not append and not LauncherApp._confirm_client_direct_new_batch_if_live(self, accounts, run_label):
             return False
         if not skip_port_precheck and not LauncherApp._precheck_client_direct_prepare_ports(self, accounts, append=append):
@@ -6185,10 +7119,17 @@ Write-Output $count
         self.worker_thread.start()
         return True
 
-    def _start_client_direct_prepared_login_run(self, accounts: list[AccountConfig], *, run_label: str) -> None:
+    def _start_client_direct_prepared_login_run(
+        self,
+        accounts: list[AccountConfig],
+        *,
+        run_label: str,
+        auto_enter_game: bool = True,
+    ) -> None:
         if self.worker_thread and self.worker_thread.is_alive():
             messagebox.showwarning("任务运行中", "已有任务正在运行，请先停止或等待完成。")
             return
+        accounts = _inject_latest_client_direct_urls(self, list(accounts))
         missing = [account for account in accounts if account.key not in self.client_direct_bindings]
         if missing:
             message = "当前层存在未准备的客户端，请先点击“准备客户端”。"
@@ -6199,7 +7140,6 @@ Write-Output $count
         self._setup_log_file(cleanup_old=False)
         self.stop_event.clear()
         self._preserve_background_windows = True
-        auto_enter_game = self._client_direct_auto_enter_game()
         concurrency = LauncherApp._client_direct_concurrency(self)
         self._log(f"[客户端直登] 本次并发数={concurrency}")
         self.worker_thread = threading.Thread(
@@ -6214,6 +7154,27 @@ Write-Output $count
             return False
         try:
             return bool(user32.IsWindow(int(hwnd)))
+        except Exception:
+            return False
+
+    def _client_direct_binding_ready_for_arrange(self, record: ClientDirectRunRecord | None) -> bool:
+        if record is None:
+            return False
+        pid = int(record.pid or 0)
+        hwnd = int(record.hwnd or 0)
+        port = int(record.cdp_port or 0)
+        if pid <= 0 or hwnd <= 0 or port <= 0:
+            return False
+        if str(record.cdp_ownership_status or "") != "verified":
+            return False
+        if not LauncherApp._client_direct_pid_exists(self, pid):
+            return False
+        if not LauncherApp._client_direct_process_is_x5game(self, pid):
+            return False
+        if not LauncherApp._client_direct_is_window_alive(self, hwnd):
+            return False
+        try:
+            return int(get_window_process_id(hwnd) or 0) == pid
         except Exception:
             return False
 
@@ -6265,12 +7226,17 @@ Write-Output $count
                 new_title = LauncherApp._client_direct_binding_title_from_template(title_template, index, record, account)
                 ok = bool(user32.SetWindowTextW(int(record.hwnd), new_title))
                 if ok:
+                    record.title = new_title
+                    self.client_direct_bindings[account.key] = record
                     self._log(f"排列本批客户端：重命名成功 account={account.key} hwnd={record.hwnd} title={new_title}")
                 else:
                     self._log(f"排列本批客户端：account={account.key} hwnd={record.hwnd} rename_failed reason=SetWindowTextW failed")
             except Exception as exc:
                 reason = mask_sensitive_text(str(exc))
                 self._log(f"排列本批客户端：account={account.key} hwnd={record.hwnd} rename_failed reason={reason}")
+        LauncherApp._save_client_direct_bindings_to_active_batch(self)
+        if hasattr(self, "tree"):
+            LauncherApp._refresh_table(self)
 
     def _client_direct_queue_progress_log(self, account: AccountConfig, message: str) -> None:
         masked = mask_sensitive_text(message)
@@ -6305,7 +7271,7 @@ Write-Output $count
             if record is None:
                 self._log(f"排列本批客户端：跳过 {account.display_name}，缺少准备阶段绑定")
                 continue
-            if not LauncherApp._client_direct_is_window_alive(self, int(record.hwnd or 0)):
+            if not LauncherApp._client_direct_binding_ready_for_arrange(self, record):
                 LauncherApp._client_direct_mark_window_invalid(self, account, record)
                 continue
             try:
@@ -6327,10 +7293,13 @@ Write-Output $count
         windows: list[GameWindow],
         tile_mode: str,
         tile_config: TileConfig | RowTileConfig,
+        layout_window_count: int | None,
         log,
     ):
+        slot_indexes = [max(0, int(window.number or index) - 1) for index, window in enumerate(windows, start=1)]
+        planned_count = max(int(layout_window_count or 0), max(slot_indexes, default=-1) + 1, len(windows))
         if tile_mode == WM_TILE_MODE_ROW_COUNT:
-            plan = calculate_row_tile_plan(len(windows), tile_config)
+            plan = calculate_row_tile_plan(planned_count, tile_config)
             work = plan.work_area
             log(
                 "按行数排列诊断："
@@ -6347,51 +7316,17 @@ Write-Output $count
             return tile_game_windows_by_row_count(
                 tile_config,
                 windows=windows,
+                slot_indexes=slot_indexes,
+                layout_window_count=planned_count,
                 title_template=_safe_wm_title_template(self),
             )
         return tile_game_windows(
             tile_config,
             windows=windows,
+            slot_indexes=slot_indexes,
+            layout_window_count=planned_count,
             title_template=_safe_wm_title_template(self),
         )
-
-    def _start_background_serial_run(self, accounts: list[AccountConfig], *, run_label: str) -> None:
-        if self.worker_thread and self.worker_thread.is_alive():
-            messagebox.showwarning("任务运行中", "已有任务正在运行，请先停止或等待完成。")
-            return
-        dependency_check = check_background_runtime_dependencies()
-        if not dependency_check.ok:
-            modules = "、".join(dependency_check.missing_modules)
-            commands = "\n".join(dependency_check.install_commands)
-            message = f"当前 Python 环境缺少依赖：{modules}\n请执行：{commands}"
-            self._setup_log_file(cleanup_old=False)
-            for account in accounts:
-                self._set_status(account, "依赖缺失")
-            self._log("后台串行依赖预检失败。")
-            self._log(f"当前 Python 路径={dependency_check.python_executable}")
-            self._log(f"Python 位数={dependency_check.python_bits}")
-            self._log(f"缺失模块={modules}")
-            self._log(f"建议安装命令={commands}")
-            messagebox.showwarning("后台模式依赖缺失", message)
-            return
-        try:
-            settings = load_settings(self.settings_path.get())
-        except Exception as exc:
-            messagebox.showerror("读取自动化设置失败", str(exc))
-            return
-        settings = self._settings_with_notice_ratio(settings)
-
-        self._setup_log_file(cleanup_old=False)
-        self.stop_event.clear()
-        self._preserve_background_windows = True
-        for account in accounts:
-            self._set_status(account, "等待中")
-        self.worker_thread = threading.Thread(
-            target=self._background_serial_worker,
-            args=(list(accounts), settings, run_label),
-            daemon=True,
-        )
-        self.worker_thread.start()
 
     def _update_client_direct_binding_from_result(
         self,
@@ -6408,12 +7343,24 @@ Write-Output $count
         reason = error_message
         if not reason and not getattr(result, "success", False):
             reason = mask_sensitive_text(getattr(result, "message", "") or "")
+        existing = self.client_direct_bindings.get(account.key)
+        ownership = getattr(result, "ownership", None)
         self.client_direct_bindings[account.key] = ClientDirectRunRecord(
             account_id=account.key,
             account_name=account.display_name,
+            account_key=account.key,
+            refresh_account_name=str(getattr(existing, "refresh_account_name", "") or account.bookmark_title or account.bookmark_no),
+            bookmark_path=str(getattr(existing, "bookmark_path", "") or ""),
+            slot_index=int(getattr(existing, "slot_index", 0) or 0),
+            identity_status=str(getattr(existing, "identity_status", "") or "resolved"),
+            link_status=str(getattr(existing, "link_status", "") or ""),
+            window_status=str(getattr(existing, "window_status", "") or ""),
             pid=int(getattr(binding, "pid", 0) or 0),
             hwnd=int(getattr(binding, "hwnd", 0) or 0),
             cdp_port=int(getattr(binding, "cdp_port", port) or port),
+            cdp_owner_pid=int(getattr(ownership, "owner_pid", 0) or getattr(existing, "cdp_owner_pid", 0) or 0),
+            cdp_ownership_status=str(getattr(ownership, "status", "") or getattr(existing, "cdp_ownership_status", "") or ""),
+            speed_rate=float(getattr(existing, "speed_rate", 1.0) or 1.0),
             login_url=account.url,
             status=status,
             error_message=reason,
@@ -6446,6 +7393,7 @@ Write-Output $count
         stopped_count = 0
         start_time = _time.time()
         concurrency = max(CLIENT_DIRECT_CONCURRENCY_MIN, min(CLIENT_DIRECT_CONCURRENCY_MAX, int(concurrency or 1)))
+        launch_throttle = _ClientLaunchThrottle()
         self._queue_log(f"[客户端直登] {run_label}开始：总{total}，并发={concurrency}，只启动客户端，不执行登录。")
         self._queue_log(f"[客户端直登] 本次并发数={concurrency}")
         self._update_status_bar(f"{run_label}运行中：0/{total}")
@@ -6490,6 +7438,12 @@ Write-Output $count
                 LauncherApp._save_client_direct_bindings_to_active_batch_threadsafe(self, sync_ui=False)
                 return "failed"
 
+            if not launch_throttle.wait(self.stop_event):
+                record.status = "已停止"
+                self._queue_status(account, "已停止")
+                LauncherApp._save_client_direct_bindings_to_active_batch_threadsafe(self, sync_ui=False)
+                return "stopped"
+
             result = prepare_client_direct_client(
                 ClientDirectLoginConfig(
                     account_id=account.key,
@@ -6510,7 +7464,21 @@ Write-Output $count
                 LauncherApp._save_client_direct_bindings_to_active_batch_threadsafe(self, sync_ui=False)
                 return "stopped"
 
-            if result.success:
+            ownership = getattr(result, "ownership", None)
+            prepared_binding = getattr(result, "binding", None)
+            binding_verified = bool(
+                getattr(result, "success", False)
+                and prepared_binding is not None
+                and int(getattr(prepared_binding, "pid", 0) or 0) > 0
+                and int(getattr(prepared_binding, "hwnd", 0) or 0) > 0
+                and int(getattr(prepared_binding, "cdp_port", 0) or 0) == port
+                and ownership is not None
+                and bool(getattr(ownership, "verified", False))
+                and int(getattr(ownership, "hwnd", 0) or 0) == int(getattr(prepared_binding, "hwnd", 0) or 0)
+                and int(getattr(ownership, "window_pid", 0) or 0) == int(getattr(prepared_binding, "pid", 0) or 0)
+                and int(getattr(ownership, "port", 0) or 0) == port
+            )
+            if binding_verified:
                 LauncherApp._update_client_direct_binding_from_result(self, account, result, port=port, status="客户端已启动/待登录")
                 binding = self.client_direct_bindings[account.key]
                 self._queue_status(account, "客户端已启动/待登录")
@@ -6520,7 +7488,10 @@ Write-Output $count
                 )
                 LauncherApp._save_client_direct_bindings_to_active_batch_threadsafe(self, sync_ui=False)
                 return "success"
-            reason = mask_sensitive_text(getattr(result, "message", "") or "未知错误")
+            reason = mask_sensitive_text(
+                getattr(result, "message", "")
+                or ("准备结果缺少有效 HWND/PID/CDP 归属" if getattr(result, "success", False) else "未知错误")
+            )
             LauncherApp._update_client_direct_binding_from_result(self, account, result, port=port, status="启动失败", error_message=reason)
             self._queue_status(account, "启动失败")
             self._queue_log(f"[客户端直登][{index + 1}/{total}] 启动失败：{reason}")
@@ -6583,12 +7554,38 @@ Write-Output $count
                 self._queue_status(account, "客户端直登失败")
                 self._queue_log(f"[客户端直登][{index + 1}/{total}] 客户端直登失败：缺少准备阶段绑定")
                 return "failed"
+            if record.link_status in {"link_missing", "link_conflict"}:
+                record.status = record.link_status
+                record.error_message = "最新直登链接缺失" if record.link_status == "link_missing" else "最新直登链接身份冲突"
+                self._queue_status(account, record.link_status)
+                self._queue_log(f"[客户端直登][{index + 1}/{total}] 已阻止登录：{record.link_status}")
+                LauncherApp._save_client_direct_bindings_to_active_batch_threadsafe(self, sync_ui=False)
+                return "failed"
+            if record.window_status == "cdp_unavailable":
+                record.status = "cdp_unavailable"
+                record.error_message = "客户端 CDP 当前不可用"
+                self._queue_status(account, "cdp_unavailable")
+                self._queue_log(f"[客户端直登][{index + 1}/{total}] 已阻止登录：cdp_unavailable")
+                LauncherApp._save_client_direct_bindings_to_active_batch_threadsafe(self, sync_ui=False)
+                return "failed"
             if not LauncherApp._client_direct_is_window_alive(self, int(record.hwnd or 0)):
                 record.status = "客户端已关闭"
                 record.error_message = "客户端窗口已关闭"
                 self.client_direct_bindings[account.key] = record
                 self._queue_status(account, "客户端已关闭")
                 self._queue_log(f"[客户端直登][{index + 1}/{total}] 客户端已关闭：{account.display_name} hwnd={record.hwnd}")
+                LauncherApp._save_client_direct_bindings_to_active_batch_threadsafe(self, sync_ui=False)
+                return "failed"
+
+            ownership = validate_window_cdp_endpoint(int(record.hwnd), int(record.pid), int(record.cdp_port))
+            record.cdp_owner_pid = int(ownership.owner_pid or 0)
+            record.cdp_ownership_status = ownership.status
+            self._queue_log(f"[客户端直登][{index + 1}/{total}][CDP归属] {ownership.safe_message()}")
+            if not ownership.verified:
+                record.status = ownership.status
+                record.error_message = f"登录前 binding 校验失败: {ownership.status}"
+                self._queue_status(account, ownership.status)
+                self._queue_log(f"[客户端直登][{index + 1}/{total}] 已阻止登录：{ownership.status}")
                 LauncherApp._save_client_direct_bindings_to_active_batch_threadsafe(self, sync_ui=False)
                 return "failed"
 
@@ -6605,13 +7602,16 @@ Write-Output $count
             )
 
             if not is_complete_direct_login_url(record.login_url):
-                record.status = "客户端直登失败"
+                record.status = "link_missing"
+                record.link_status = "link_missing"
                 record.error_message = "URL 不是完整客户端直登 URL"
-                self._queue_status(account, "客户端直登失败")
-                self._queue_log(f"[客户端直登][{index + 1}/{total}] 客户端直登失败：URL 不是完整客户端直登 URL")
+                self._queue_status(account, "link_missing")
+                self._queue_log(f"[客户端直登][{index + 1}/{total}] 已阻止登录：link_missing")
                 LauncherApp._save_client_direct_bindings_to_active_batch_threadsafe(self, sync_ui=False)
                 return "failed"
 
+            speed_options = LauncherApp._client_speed_panel_options(self)
+            speed_options["default_speed_rate"] = float(getattr(record, "speed_rate", 1.0) or 1.0)
             result = execute_prepared_client_direct_login(
                 PreparedClientDirectLoginConfig(
                     account_id=record.account_id,
@@ -6620,7 +7620,7 @@ Write-Output $count
                     cdp_port=port,
                     auto_enter_game=bool(auto_enter_game),
                     timeout=60.0,
-                    **LauncherApp._client_speed_panel_options(self),
+                    **speed_options,
                 ),
                 LauncherApp._client_direct_record_to_binding(self, record),
                 stop_event=self.stop_event,
@@ -6859,713 +7859,6 @@ Write-Output $count
         if hasattr(self, "worker_thread"):
             self.worker_thread = None
 
-    def _background_single_worker(self, account: AccountConfig, settings) -> None:
-        import time as _time
-
-        start_time = _time.time()
-        self._queue_log(f"{RUN_MODE_BACKGROUND_LABEL}：方式一单账号实验，仅运行 {account.display_name}")
-        self._queue_log("后台实验流程不调用 SetForegroundWindow，不使用全局鼠标/键盘。")
-        self._update_status_bar("后台模式运行中：1/1")
-        runner = BackgroundSingleAccountRunner(
-            account,
-            settings,
-            self.stop_event,
-            log=self._queue_log,
-            update_status=self._queue_status,
-            passport_found=self._queue_passport,
-        )
-        result = runner.run()
-        elapsed = _time.time() - start_time
-        self._queue_timing(account, elapsed)
-        result_status = str(getattr(result, "status", "") or "")
-        result_success = bool(getattr(result, "success", bool(result)) and getattr(result, "final_verified", bool(result)))
-        if self.stop_event.is_set() or result_status == "stopped":
-            self._update_status_bar("已停止")
-        elif result_success:
-            self._queue_log(f"[后台模式] 成功: {account.display_name}")
-            self._update_status_bar("后台模式完成：成功1，失败0")
-        elif result_status == "skipped_logged_in":
-            self._queue_log(f"[后台模式] 已进入游戏，跳过: {account.display_name}")
-            self._update_status_bar("后台模式完成：成功0，跳过1，失败0")
-        else:
-            self._queue_log(f"[后台模式] 失败: {account.display_name}")
-            self._update_status_bar("后台模式完成：成功0，失败1")
-        release_background_playwright_for_current_thread()
-
-    def _background_serial_worker(self, accounts: list[AccountConfig], settings, run_label: str) -> None:
-        import time as _time
-
-        total = len(accounts)
-        start_time = _time.time()
-        success_count = 0
-        skip_count = 0
-        fail_count = 0
-        stopped_count = 0
-        stopped_keys: set[str] = set()
-        latest_status: dict[str, str] = {}
-        passport_by_key: dict[str, str] = {}
-
-        def queue_status(account: AccountConfig, status: str) -> None:
-            latest_status[account.key] = status
-            self._queue_status(account, status)
-
-        def mark_stopped(account: AccountConfig) -> None:
-            nonlocal stopped_count
-            if account.key in stopped_keys:
-                return
-            stopped_keys.add(account.key)
-            stopped_count += 1
-            if latest_status.get(account.key) != "已停止":
-                latest_status[account.key] = "已停止"
-                self._queue_status(account, "已停止")
-
-        def passport_found(account: AccountConfig, passport: str) -> None:
-            passport_by_key[account.key] = passport
-            self._queue_passport(account, passport)
-
-        self._queue_log(
-            f"{run_label}开始：总{total}，并发={BACKGROUND_SERIAL_CONCURRENCY}，逐个调用 BackgroundSingleAccountRunner。"
-        )
-        self._queue_log("后台串行不前置窗口，不使用全局鼠标/键盘。")
-        self._update_status_bar(f"{run_label}运行中：0/{total}")
-
-        for index, account in enumerate(accounts, start=1):
-            if self.stop_event.is_set():
-                for remaining in accounts[index - 1 :]:
-                    mark_stopped(remaining)
-                break
-
-            self._queue_log(f"[后台串行][{index}/{total}] 窗口{account.game_window_no}：开始")
-            self._update_status_bar(f"{run_label}运行中：{index}/{total}")
-            account_started = _time.time()
-            runner = BackgroundSingleAccountRunner(
-                account,
-                settings,
-                self.stop_event,
-                log=self._queue_log_file,
-                update_status=queue_status,
-                passport_found=passport_found,
-            )
-            result = runner.run()
-            elapsed = _time.time() - account_started
-            self._queue_timing(account, elapsed)
-            result_status = str(getattr(result, "status", "") or "")
-            result_success = bool(getattr(result, "success", bool(result)) and getattr(result, "final_verified", bool(result)))
-
-            if self.stop_event.is_set() or result_status == "stopped":
-                mark_stopped(account)
-                for remaining in accounts[index:]:
-                    mark_stopped(remaining)
-                break
-
-            status = latest_status.get(account.key, "")
-            passport = passport_by_key.get(account.key, "")
-            if result_status == "skipped_logged_in" or status == "已进入游戏，跳过":
-                skip_count += 1
-                self._queue_log(f"[后台串行][{index}/{total}] 窗口{account.game_window_no}：已进入游戏，跳过")
-            elif result_success:
-                success_count += 1
-                if passport:
-                    self._queue_log(f"[后台串行][{index}/{total}] 窗口{account.game_window_no}：识别通行证 {passport}")
-                self._queue_log(f"[后台串行][{index}/{total}] 窗口{account.game_window_no}：成功")
-            else:
-                fail_count += 1
-                if latest_status.get(account.key) != "失败":
-                    queue_status(account, "失败")
-                self._queue_log(f"[后台串行][{index}/{total}] 窗口{account.game_window_no}：失败")
-
-        elapsed_total = _time.time() - start_time
-        if self.stop_event.is_set() or stopped_count:
-            self._queue_log("后台串行已停止。")
-            summary = (
-                f"{run_label}已停止：成功{success_count}，跳过{skip_count}，失败{fail_count}，"
-                f"已停止{stopped_count}，总耗时{elapsed_total:.0f}秒"
-            )
-            self._update_status_bar("已停止")
-        else:
-            summary = (
-                f"{run_label}完成：成功{success_count}，跳过{skip_count}，失败{fail_count}，"
-                f"已停止{stopped_count}，总耗时{elapsed_total:.0f}秒"
-            )
-            self._update_status_bar(f"{run_label}完成：成功{success_count}，跳过{skip_count}，失败{fail_count}")
-        self._queue_log(summary)
-        self._write_file_log(summary)
-        if self._log_file is not None:
-            self._log_file.close()
-            self._log_file = None
-        release_background_playwright_for_current_thread()
-        if hasattr(self, "worker_thread"):
-            self.worker_thread = None
-
-    def _serial_worker(self, accounts: list[AccountConfig], settings, batch_fast: bool = False, verify_rounds: int = 3) -> None:
-        self._setup_log_file()
-        self._queue_log(f"前台串行模式：共 {len(accounts)} 个账号，严格逐个执行。")
-        self._queue_log(f"当前版本：v{APP_VERSION}")
-        self._queue_log("注意：运行期间会短暂移动鼠标，请勿操作。")
-        import subprocess as _sp, json, tempfile, os, sys as _sys, time as _time
-
-        frozen = getattr(_sys, "frozen", False)
-        success_count = 0
-        fail_count = 0
-        start_time = _time.time()
-        self._update_status_bar(f"运行中：{len(accounts)} 账号")
-
-        if batch_fast:
-            self._serial_worker_batch_fast(accounts, settings, frozen, verify_rounds, start_time)
-            return
-
-        for i, account in enumerate(accounts, start=1):
-            if self.stop_event.is_set():
-                self._queue_log("任务已停止。")
-                self._update_status_bar("已停止")
-                break
-            self._queue_log(f"[{i}/{len(accounts)}] {account.display_name}")
-            self._update_status_bar(f"运行中：{i}/{len(accounts)}")
-
-            if frozen:
-                # exe 模式也使用子进程隔离，和源码模式保持一致，避免 Playwright/COM 状态留在 GUI 进程。
-                result = self._run_account_child_process(account, "full")
-                flow_result = bool(result.get("result"))
-                if self.stop_event.is_set():
-                    self._queue_status(account, "已停止")
-                    self._queue_log("任务已停止，不会继续执行后续账号。")
-                    _sp.run(["taskkill", "/f", "/im", "chromium.exe"], capture_output=True, creationflags=_sp.CREATE_NO_WINDOW)
-                    break
-                elif flow_result:
-                    success_count += 1
-                    self._queue_log(f"[{i}/{len(accounts)}] 成功: {account.display_name}")
-                else:
-                    fail_count += 1
-                    self._queue_log(f"[{i}/{len(accounts)}] 失败: {account.display_name}")
-                _sp.run(["taskkill", "/f", "/im", "chromium.exe"], capture_output=True, creationflags=_sp.CREATE_NO_WINDOW)
-            else:
-                # === 源码模式：子进程隔离 Playwright asyncio ===
-                cfg = {
-                    "level": account.level, "bookmark_no": account.bookmark_no,
-                    "game_window_no": account.game_window_no, "url": account.url,
-                    "settings_path": str(self.settings_path.get() or default_settings_path()),
-                }
-                cfg_file = Path(tempfile.gettempdir()) / f"douluo_acc_{account.game_window_no}.json"
-                cfg_file.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
-
-                project_root = str(app_root())
-                proc = _sp.Popen(
-                    ["python", "-X", "utf8", "-c", f"""
-import sys, json, threading
-sys.path.insert(0, r"{project_root}")
-from douluo_launcher.automation import AccountRunner
-from douluo_launcher.config import AccountConfig, load_settings
-from pathlib import Path
-
-cfg = json.loads(Path(r"{cfg_file}").read_text(encoding='utf-8'))
-settings = load_settings(Path(cfg["settings_path"]))
-account = AccountConfig(
-    level=cfg["level"], bookmark_no=cfg["bookmark_no"],
-    game_window_no=cfg["game_window_no"], url=cfg["url"]
-)
-stop = threading.Event()
-def log(msg):
-    try:
-        print("[W" + str(cfg["game_window_no"]) + "] " + str(msg), flush=True)
-    except Exception:
-        pass
-
-def status(acct, s):
-    try:
-        print("STATUS:" + str(s), flush=True)
-    except Exception:
-        pass
-
-def passport_found(acct, p):
-    try:
-        print("PASSPORT:" + str(p), flush=True)
-    except Exception:
-        pass
-
-runner = AccountRunner(account, settings, stop, log, status, passport_found=passport_found)
-flow_result = runner.run_game_flow()
-print("RESULT:" + str(flow_result), flush=True)
-print("TIMING:" + str(runner.last_timings.get("总计", 0)), flush=True)
-"""],
-                    stdout=_sp.PIPE, stderr=_sp.PIPE,
-                    text=True, encoding="utf-8", errors="replace",
-                    cwd=project_root,
-                    creationflags=_sp.CREATE_NO_WINDOW,
-                )
-                self._track_process(proc)
-                result_seen = False
-                try:
-                    for line in proc.stdout:
-                        if self.stop_event.is_set():
-                            if proc.poll() is None:
-                                proc.terminate()
-                            self._queue_log(f"[{account.display_name}] 已停止，当前账号子进程正在终止。")
-                            break
-                        line = line.strip()
-                        if not line:
-                            continue
-                        if line.startswith("PASSPORT:"):
-                            self._queue_passport(account, line[9:])
-                            self._write_file_log(line)
-                        elif line.startswith("TIMING:"):
-                            try:
-                                self._queue_timing(account, float(line[7:]))
-                            except ValueError:
-                                pass
-                            self._write_file_log(line)
-                        elif line.startswith("STATUS:"):
-                            self._queue_status(account, line[7:])
-                            self._queue_log(f"[{account.display_name}] → {line[7:]}")
-                            self._write_file_log(line)
-                        elif line.startswith("RESULT:True"):
-                            result_seen = True
-                            self._write_file_log(line)
-                        elif line.startswith("RESULT:"):
-                            self._write_file_log(line)
-                        else:
-                            self._write_file_log(line)
-                    if self.stop_event.is_set() and proc.poll() is None:
-                        proc.terminate()
-                    try:
-                        proc.wait(timeout=3 if self.stop_event.is_set() else 300)
-                    except Exception:
-                        proc.kill()
-                        try:
-                            proc.wait(timeout=3)
-                        except Exception:
-                            pass
-                        self._queue_log(f"[{account.display_name}] 已强制 kill 账号运行子进程 pid={proc.pid}。")
-                finally:
-                    self._untrack_process(proc)
-
-                stderr_output = proc.stderr.read()
-                for line in stderr_output.splitlines():
-                    line = line.strip()
-                    if line:
-                        self._write_file_log(f"[stderr] {line[:500]}")
-
-                if self.stop_event.is_set():
-                    self._queue_status(account, "已停止")
-                    self._queue_log("任务已停止，不会继续执行后续账号。")
-                    try: cfg_file.unlink()
-                    except Exception: pass
-                    break
-                elif result_seen:
-                    success_count += 1
-                    self._queue_log(f"[{i}/{len(accounts)}] 成功: {account.display_name}")
-                else:
-                    fail_count += 1
-                    self._queue_log(f"[{i}/{len(accounts)}] 失败: {account.display_name}")
-
-                try: cfg_file.unlink()
-                except Exception: pass
-                _sp.run(["taskkill", "/f", "/im", "chromium.exe"], capture_output=True, creationflags=_sp.CREATE_NO_WINDOW)
-
-        elapsed = _time.time() - start_time
-        log_path = str(self._log_file_path) if self._log_file_path else ""
-        if self.stop_event.is_set():
-            self._queue_log("--------- 任务已停止 ---------")
-            self._queue_log(f"总账号: {len(accounts)}  成功: {success_count}  失败: {fail_count}  耗时: {elapsed:.0f}秒")
-            self._update_status_bar("已停止")
-        else:
-            self._queue_log("--------- 任务完成 ---------")
-            self._queue_log(f"总账号: {len(accounts)}  成功: {success_count}  失败: {fail_count}  耗时: {elapsed:.0f}秒")
-            self._update_status_bar(f"任务完成：成功{success_count}，失败{fail_count}")
-        self._queue_log(f"详细日志: {log_path}")
-        if self._log_file is not None:
-            summary_label = "任务已停止" if self.stop_event.is_set() else "任务完成"
-            self._write_file_log(f"{summary_label}：总{len(accounts)} 成功{success_count} 失败{fail_count} 耗时{elapsed:.0f}秒")
-            self._log_file.close()
-            self._log_file = None
-
-    def _run_account_child_process(self, account: AccountConfig, action: str) -> dict[str, object]:
-        import subprocess as _sp, json, tempfile, sys as _sys
-
-        if getattr(_sys, "frozen", False):
-            temp_dir = Path(tempfile.gettempdir())
-            stem = f"douluo_acc_{account.game_window_no}_{action}_{int(time.time() * 1000)}"
-            cfg_file = temp_dir / f"{stem}.json"
-            event_file = temp_dir / f"{stem}.events.jsonl"
-            result_file = temp_dir / f"{stem}.result.json"
-            cfg = {
-                "level": account.level,
-                "bookmark_no": account.bookmark_no,
-                "game_window_no": account.game_window_no,
-                "url": account.url,
-                "settings_path": str(self.settings_path.get() or default_settings_path()),
-                "action": action,
-                "event_path": str(event_file),
-                "result_path": str(result_file),
-            }
-            cfg_file.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
-            proc = _sp.Popen(
-                [_sys.executable, "--run-account-action", str(cfg_file)],
-                cwd=str(app_root()),
-                creationflags=_sp.CREATE_NO_WINDOW,
-            )
-            self._track_process(proc)
-            timing = 0.0
-            verify_state = ""
-            submit_result = ""
-            event_offset = 0
-
-            def drain_events() -> None:
-                nonlocal event_offset, timing, verify_state, submit_result
-                if not event_file.exists():
-                    return
-                with event_file.open("r", encoding="utf-8", errors="replace") as file:
-                    file.seek(event_offset)
-                    for raw_line in file:
-                        line = raw_line.strip()
-                        if not line:
-                            continue
-                        try:
-                            event = json.loads(line)
-                        except Exception:
-                            self._write_file_log(line)
-                            continue
-                        kind = event.get("type")
-                        value = str(event.get("value", ""))
-                        if kind == "log":
-                            self._queue_log(value)
-                            self._write_file_log(value)
-                        elif kind == "status":
-                            self._queue_status(account, value)
-                            self._queue_log(f"[{account.display_name}] → {value}")
-                            self._write_file_log(f"STATUS:{value}")
-                        elif kind == "passport":
-                            self._queue_passport(account, value)
-                            self._write_file_log(f"PASSPORT:{value}")
-                        elif kind == "timing":
-                            try:
-                                timing = float(value)
-                                self._queue_timing(account, timing)
-                            except ValueError:
-                                pass
-                            self._write_file_log(f"TIMING:{value}")
-                        elif kind == "verify":
-                            verify_state = value
-                            self._write_file_log(f"VERIFY:{value}")
-                        elif kind == "submit_result":
-                            submit_result = value
-                            self._write_file_log(f"SUBMIT_RESULT:{value}")
-                    event_offset = file.tell()
-
-            try:
-                while proc.poll() is None:
-                    if self.stop_event.is_set():
-                        proc.terminate()
-                        self._queue_log(f"[{account.display_name}] 已停止，当前账号 exe 子进程正在终止。")
-                        break
-                    drain_events()
-                    time.sleep(0.1)
-                drain_events()
-                try:
-                    proc.wait(timeout=3 if self.stop_event.is_set() else 30)
-                except Exception:
-                    proc.kill()
-                    try:
-                        proc.wait(timeout=3)
-                    except Exception:
-                        pass
-                    self._queue_log(f"[{account.display_name}] 已强制 kill 账号 exe 子进程 pid={proc.pid}。")
-            finally:
-                self._untrack_process(proc)
-
-            result_data: dict[str, object] = {
-                "result": False,
-                "verify_state": verify_state,
-                "submit_result": submit_result,
-                "timing": timing,
-            }
-            if result_file.exists():
-                try:
-                    loaded = json.loads(result_file.read_text(encoding="utf-8"))
-                    if isinstance(loaded, dict):
-                        result_data.update(loaded)
-                except Exception as exc:
-                    self._write_file_log(f"[exe-child-result-error] {exc}")
-            if result_data.get("timing"):
-                try:
-                    self._queue_timing(account, float(result_data["timing"]))
-                except Exception:
-                    pass
-            for path in (cfg_file, event_file, result_file):
-                try:
-                    path.unlink()
-                except Exception:
-                    pass
-            return result_data
-
-        cfg = {
-            "level": account.level,
-            "bookmark_no": account.bookmark_no,
-            "game_window_no": account.game_window_no,
-            "url": account.url,
-            "settings_path": str(self.settings_path.get() or default_settings_path()),
-            "action": action,
-        }
-        cfg_file = Path(tempfile.gettempdir()) / f"douluo_acc_{account.game_window_no}_{action}.json"
-        cfg_file.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
-
-        project_root = str(app_root())
-        proc = _sp.Popen(
-            ["python", "-X", "utf8", "-c", f"""
-import sys, json, threading
-sys.path.insert(0, r"{project_root}")
-from douluo_launcher.automation import AccountRunner
-from douluo_launcher.config import AccountConfig, load_settings
-from pathlib import Path
-
-cfg = json.loads(Path(r"{cfg_file}").read_text(encoding='utf-8'))
-settings = load_settings(Path(cfg["settings_path"]))
-account = AccountConfig(
-    level=cfg["level"], bookmark_no=cfg["bookmark_no"],
-    game_window_no=cfg["game_window_no"], url=cfg["url"]
-)
-stop = threading.Event()
-def log(msg):
-    try:
-        print("[W" + str(cfg["game_window_no"]) + "] " + str(msg), flush=True)
-    except Exception:
-        pass
-
-def status(acct, s):
-    try:
-        print("STATUS:" + str(s), flush=True)
-    except Exception:
-        pass
-
-def passport_found(acct, p):
-    try:
-        print("PASSPORT:" + str(p), flush=True)
-    except Exception:
-        pass
-
-runner = AccountRunner(account, settings, stop, log, status, passport_found=passport_found)
-action = cfg.get("action", "full")
-if action == "fast_submit":
-    flow_result = runner.run_game_flow_fast_submit()
-    print("SUBMIT_RESULT:" + str(runner.last_fast_submit_result), flush=True)
-    print("RESULT:" + str(flow_result), flush=True)
-    print("TIMING:" + str(runner.last_timings.get("总计", 0)), flush=True)
-elif action == "verify":
-    verify_state = runner.verify_login_result()
-    print("VERIFY:" + str(verify_state), flush=True)
-    print("RESULT:" + str(verify_state == "logged_in"), flush=True)
-else:
-    flow_result = runner.run_game_flow()
-    print("RESULT:" + str(flow_result), flush=True)
-    print("TIMING:" + str(runner.last_timings.get("总计", 0)), flush=True)
-"""],
-            stdout=_sp.PIPE, stderr=_sp.PIPE,
-            text=True, encoding="utf-8", errors="replace",
-            cwd=project_root,
-            creationflags=_sp.CREATE_NO_WINDOW,
-        )
-        self._track_process(proc)
-        result_seen = False
-        verify_state = ""
-        submit_result = ""
-        timing = 0.0
-        try:
-            for line in proc.stdout:
-                if self.stop_event.is_set():
-                    if proc.poll() is None:
-                        proc.terminate()
-                    self._queue_log(f"[{account.display_name}] 已停止，当前账号子进程正在终止。")
-                    break
-                line = line.strip()
-                if not line:
-                    continue
-                if line.startswith("PASSPORT:"):
-                    self._queue_passport(account, line[9:])
-                    self._write_file_log(line)
-                elif line.startswith("TIMING:"):
-                    try:
-                        timing = float(line[7:])
-                        self._queue_timing(account, timing)
-                    except ValueError:
-                        pass
-                    self._write_file_log(line)
-                elif line.startswith("STATUS:"):
-                    self._queue_status(account, line[7:])
-                    self._queue_log(f"[{account.display_name}] → {line[7:]}")
-                    self._write_file_log(line)
-                elif line.startswith("VERIFY:"):
-                    verify_state = line[7:]
-                    self._write_file_log(line)
-                elif line.startswith("SUBMIT_RESULT:"):
-                    submit_result = line[14:]
-                    self._write_file_log(line)
-                elif line.startswith("RESULT:True"):
-                    result_seen = True
-                    self._write_file_log(line)
-                elif line.startswith("RESULT:"):
-                    self._write_file_log(line)
-                else:
-                    self._write_file_log(line)
-            if self.stop_event.is_set() and proc.poll() is None:
-                proc.terminate()
-            try:
-                proc.wait(timeout=3 if self.stop_event.is_set() else 300)
-            except Exception:
-                proc.kill()
-                try:
-                    proc.wait(timeout=3)
-                except Exception:
-                    pass
-                self._queue_log(f"[{account.display_name}] 已强制 kill 账号运行子进程 pid={proc.pid}。")
-        finally:
-            self._untrack_process(proc)
-
-        stderr_output = proc.stderr.read()
-        for line in stderr_output.splitlines():
-            line = line.strip()
-            if line:
-                self._write_file_log(f"[stderr] {line[:500]}")
-        try:
-            cfg_file.unlink()
-        except Exception:
-            pass
-
-        return {
-            "result": result_seen,
-            "verify_state": verify_state,
-            "submit_result": submit_result,
-            "timing": timing,
-        }
-
-    def _run_account_action(self, account: AccountConfig, settings, action: str, frozen: bool) -> dict[str, object]:
-        if frozen:
-            return self._run_account_child_process(account, action)
-        return self._run_account_child_process(account, action)
-
-    def _serial_worker_batch_fast(self, accounts: list[AccountConfig], settings, frozen: bool, verify_rounds: int, start_time: float) -> None:
-        import subprocess as _sp, time as _time
-
-        self._queue_log("批量快速登录模式：先提交全部账号，再统一校验，失败账号才重登。")
-        self._queue_log(f"重新次数：{verify_rounds}。只要全部成功就提前结束。")
-        self._queue_log(f"第一轮登录账号数量：{len(accounts)}")
-
-        pending = list(accounts)
-        success_by_key: dict[str, AccountConfig] = {}
-        final_failed: list[AccountConfig] = []
-
-        for round_index in range(1, verify_rounds + 1):
-            if self.stop_event.is_set():
-                break
-            if round_index == 1:
-                self._queue_log(f"第 {round_index} 轮：批量快速登录 {len(pending)} 个账号。")
-            else:
-                self._queue_log(f"第 {round_index} 轮：只重登失败账号 {len(pending)} 个。")
-
-            submit_failed: list[AccountConfig] = []
-            submitted: list[AccountConfig] = []
-            already_logged_in: list[AccountConfig] = []
-            for i, account in enumerate(pending, start=1):
-                if self.stop_event.is_set():
-                    break
-                self._queue_status(account, "登录中" if round_index == 1 else "重登中")
-                self._queue_log(
-                    f"[第{round_index}轮 {i}/{len(pending)}] "
-                    f"{'登录中' if round_index == 1 else '重登中'}: {account.display_name}"
-                )
-                result = self._run_account_action(account, settings, "fast_submit", frozen)
-                if self.stop_event.is_set():
-                    self._queue_status(account, "已停止")
-                    break
-                submit_result = str(result.get("submit_result") or "")
-                if submit_result == "already_logged_in":
-                    already_logged_in.append(account)
-                    success_by_key[account.key] = account
-                    self._queue_status(account, "已登录")
-                    self._queue_log(f"{account.display_name} 已登录，跳过提交，直接计入成功。")
-                elif result.get("result") and submit_result == "submitted":
-                    submitted.append(account)
-                    self._queue_status(account, "待复核")
-                    self._queue_log(f"{account.display_name} 已输入确认，加入待复核。")
-                elif result.get("result"):
-                    submitted.append(account)
-                    self._queue_status(account, "待复核")
-                    self._queue_log(
-                        f"{account.display_name} 快速登录结果缺少分类，按 submitted 加入待复核。"
-                    )
-                else:
-                    submit_failed.append(account)
-                    self._queue_status(account, "失败")
-                    self._queue_log(f"{account.display_name} 快速登录提交失败，加入重登列表。")
-                _sp.run(["taskkill", "/f", "/im", "chromium.exe"], capture_output=True, creationflags=_sp.CREATE_NO_WINDOW)
-
-            if self.stop_event.is_set():
-                break
-
-            verify_targets = submitted
-            failed_this_round = list(submit_failed)
-            self._queue_log(
-                f"第 {round_index} 次统一校验开始：本轮总数 {len(pending)}，"
-                f"已登录跳过 {len(already_logged_in)}，待复核 {len(verify_targets)}，"
-                f"提交失败 {len(submit_failed)}。"
-            )
-            verify_success_count = 0
-            for i, account in enumerate(verify_targets, start=1):
-                if self.stop_event.is_set():
-                    break
-                self._queue_status(account, "校验中")
-                self._queue_log(f"[第{round_index}次校验 {i}/{len(verify_targets)}] {account.display_name}")
-                verify_result = self._run_account_action(account, settings, "verify", frozen)
-                state = str(verify_result.get("verify_state") or "unknown")
-                if state == "logged_in":
-                    success_by_key[account.key] = account
-                    verify_success_count += 1
-                    self._queue_status(account, "成功")
-                    self._queue_log(f"{account.display_name} 统一校验成功。")
-                else:
-                    failed_this_round.append(account)
-                    self._queue_status(account, "失败")
-                    self._queue_log(f"{account.display_name} 统一校验失败：{state}，需要重登。")
-
-            if self.stop_event.is_set():
-                break
-
-            success_count = len(success_by_key)
-            failed_count = len(failed_this_round)
-            self._queue_log(
-                f"第 {round_index} 次统一校验完成：总数 {len(pending)}，"
-                f"已登录跳过 {len(already_logged_in)}，校验成功 {verify_success_count}，"
-                f"失败 {failed_count}。"
-            )
-            if failed_this_round:
-                self._queue_log("失败账号列表：" + "、".join(a.display_name for a in failed_this_round))
-            if len(success_by_key) >= len(accounts):
-                final_failed = []
-                self._queue_log("全部成功，提前结束，不再执行后续校验。")
-                break
-            if round_index >= verify_rounds:
-                final_failed = failed_this_round
-                self._queue_log("达到重新次数仍失败，最终失败账号列表：" + "、".join(a.display_name for a in final_failed))
-                break
-            pending = failed_this_round
-            self._queue_log(f"下一轮只重登失败账号数量：{len(pending)}")
-
-        elapsed = _time.time() - start_time
-        if self.stop_event.is_set():
-            self._queue_log("--------- 任务已停止 ---------")
-            self._update_status_bar("已停止")
-        else:
-            for account in final_failed:
-                self._queue_status(account, "失败")
-            self._queue_log("--------- 任务完成 ---------")
-            self._update_status_bar(f"任务完成：成功{len(success_by_key)}，失败{len(final_failed)}")
-        self._queue_log(f"总账号: {len(accounts)}  成功: {len(success_by_key)}  失败: {len(final_failed)}  耗时: {elapsed:.0f}秒")
-        log_path = str(self._log_file_path) if self._log_file_path else ""
-        self._queue_log(f"详细日志: {log_path}")
-        if self._log_file is not None:
-            summary_label = "任务已停止" if self.stop_event.is_set() else "任务完成"
-            self._write_file_log(f"{summary_label}：总{len(accounts)} 成功{len(success_by_key)} 失败{len(final_failed)} 耗时{elapsed:.0f}秒")
-            self._log_file.close()
-            self._log_file = None
-
     def _stop_tasks(self) -> None:
         self.stop_event.set()
         self._log("已请求停止任务，正在强制清理子进程。")
@@ -7584,6 +7877,9 @@ else:
             return
         self.is_closing = True
         try:
+            listener = getattr(self, "_speed_hotkey_listener", None)
+            if listener is not None:
+                listener.unregister()
             self._save_window_manager_settings()
             self._log("程序关闭：开始停止任务和清理子进程。")
             self.stop_event.set()

@@ -303,7 +303,9 @@ class BackgroundOperatorProbeTests(unittest.TestCase):
         original_launch = probe.launch_game_process
         original_wait = probe.wait_for_new_test_window
         original_close = probe.close_test_window
+        original_scan = probe.scan_probe_windows
         try:
+            probe.scan_probe_windows = lambda *_args, **_kwargs: []
             probe.launch_game_process = lambda _path: SimpleNamespace(success=True, shell_result=42, error="")
             probe.wait_for_new_test_window = lambda **_kwargs: (
                 SimpleNamespace(hwnd=4004, title="斗罗大陆H5"),
@@ -324,6 +326,7 @@ class BackgroundOperatorProbeTests(unittest.TestCase):
             probe.launch_game_process = original_launch
             probe.wait_for_new_test_window = original_wait
             probe.close_test_window = original_close
+            probe.scan_probe_windows = original_scan
 
         self.assertEqual(exit_code, 0)
         self.assertFalse(result["background_input"])

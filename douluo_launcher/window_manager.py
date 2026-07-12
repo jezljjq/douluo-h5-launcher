@@ -1879,6 +1879,8 @@ def tile_game_windows(
     game_exe_path: str | Path | None = None,
     title_template: str | None = None,
     windows: Optional[List[GameWindow]] = None,
+    slot_indexes: Optional[Iterable[int]] = None,
+    layout_window_count: int | None = None,
     retries: int = 3,
     retry_delay: float = 0.5,
 ) -> List[TileResult]:
@@ -1897,6 +1899,7 @@ def tile_game_windows(
             expected_window_size=(config.width, config.height),
         )
     )
+    positions = _normalize_tile_slot_indexes(arranged_windows, slot_indexes, layout_window_count)
     results: List[TileResult] = []
     if arranged_windows:
         probe = arranged_windows[0]
@@ -1923,8 +1926,8 @@ def tile_game_windows(
                 )
             ]
 
-    for index, window in enumerate(arranged_windows):
-        x, y = calculate_tile_position(index, config)
+    for slot_index, window in zip(positions, arranged_windows):
+        x, y = calculate_tile_position(slot_index, config)
 
         ok, error = _set_window_pos_with_retries(
             window,
@@ -1970,6 +1973,8 @@ def tile_game_windows_by_row_count(
     game_exe_path: str | Path | None = None,
     title_template: str | None = None,
     windows: Optional[List[GameWindow]] = None,
+    slot_indexes: Optional[Iterable[int]] = None,
+    layout_window_count: int | None = None,
     retries: int = 3,
     retry_delay: float = 0.5,
 ) -> List[TileResult]:
@@ -1990,7 +1995,13 @@ def tile_game_windows_by_row_count(
             else None,
         )
     )
-    plan = calculate_row_tile_plan(len(arranged_windows), config)
+    positions = _normalize_tile_slot_indexes(arranged_windows, slot_indexes, layout_window_count)
+    planned_count = max(
+        int(layout_window_count or 0),
+        max(positions, default=-1) + 1,
+        len(arranged_windows),
+    )
+    plan = calculate_row_tile_plan(planned_count, config)
     results: List[TileResult] = []
     if arranged_windows:
         probe = arranged_windows[0]
@@ -2017,9 +2028,9 @@ def tile_game_windows_by_row_count(
                 )
             ]
 
-    for index, window in enumerate(arranged_windows):
-        row = index // plan.cols
-        col = index % plan.cols
+    for slot_index, window in zip(positions, arranged_windows):
+        row = slot_index // plan.cols
+        col = slot_index % plan.cols
         x = config.start_x + col * (plan.target_width + plan.gap_x)
         y = config.start_y + row * (plan.target_height + plan.gap_y)
         wrapped_by_screen = col == 0 and row > 0
@@ -2049,6 +2060,26 @@ def tile_game_windows_by_row_count(
         results.append(result)
 
     return results
+
+
+def _normalize_tile_slot_indexes(
+    windows: Iterable[GameWindow],
+    slot_indexes: Optional[Iterable[int]],
+    layout_window_count: int | None,
+) -> list[int]:
+    arranged_windows = list(windows)
+    positions = list(range(len(arranged_windows))) if slot_indexes is None else [int(value) for value in slot_indexes]
+    if len(positions) != len(arranged_windows):
+        raise ValueError("槽位索引数量必须与窗口数量一致")
+    if any(value < 0 for value in positions):
+        raise ValueError("槽位索引不能小于 0")
+    if layout_window_count is not None:
+        clean_count = int(layout_window_count)
+        if clean_count < 0:
+            raise ValueError("布局窗口数量不能小于 0")
+        if positions and max(positions) >= clean_count:
+            raise ValueError("槽位索引超出布局窗口数量")
+    return positions
 
 
 def calculate_row_tile_plan(window_count: int, config: RowTileConfig) -> RowTilePlan:

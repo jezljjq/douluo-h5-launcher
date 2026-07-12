@@ -16,6 +16,8 @@ logs/
 *.log
 
 # 运行时数据
+上号器数据/
+output/
 client_direct_sessions.json
 debug_client_direct/
 debug_background/
